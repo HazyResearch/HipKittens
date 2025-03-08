@@ -64,17 +64,17 @@ namespace ducks {
  */
 namespace base_types {
 
-// #ifdef KITTENS_HOPPER
-// template<typename T>
-// concept T2 = std::is_same_v<T, float2> || std::is_same_v<T, bf16_2> || std::is_same_v<T, half_2> || std::is_same_v<T, fp8e4m3_4> || std::is_same_v<T, fp8e5m2_4>; // could add half_2 later if implemented.
-// template<typename T>
-// concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3> || std::is_same_v<T, fp8e5m2>; // could add half_2 later if implemented.
-// #else
-// template<typename T>
-// concept T2 = std::is_same_v<T, float2> || std::is_same_v<T, bf16_2> || std::is_same_v<T, half_2>;
-// template<typename T>
-// concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half>;
-// #endif
+#ifdef KITTENS_HOPPER
+template<typename T>
+concept T2 = std::is_same_v<T, float2> || std::is_same_v<T, bf16_2> || std::is_same_v<T, half_2> || std::is_same_v<T, fp8e4m3_4> || std::is_same_v<T, fp8e5m2_4>; // could add half_2 later if implemented.
+template<typename T>
+concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3> || std::is_same_v<T, fp8e5m2>; // could add half_2 later if implemented.
+#else
+template<typename T>
+concept T2 = std::is_same_v<T, float2> || std::is_same_v<T, bf16_2> || std::is_same_v<T, half_2>;
+template<typename T>
+concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half>;
+#endif
 
 } // namespace base_types
 } // namespace ducks
@@ -131,18 +131,18 @@ template<> struct constants<bf16_2> {
     static __device__ inline constexpr bf16_2 pos_infty() { return bf16_2{constants<bf16>::pos_infty(), constants<bf16>::pos_infty()}; }
     static __device__ inline constexpr bf16_2 neg_infty() { return bf16_2{constants<bf16>::neg_infty(), constants<bf16>::neg_infty()}; }
 };
-// template<> struct constants<half> {
-//     static __device__ inline constexpr half zero()      { return std::bit_cast<__half>(uint16_t(0x0000)); }
-//     static __device__ inline constexpr half one()       { return std::bit_cast<__half>(uint16_t(0x3C00)); }
-//     static __device__ inline constexpr half pos_infty() { return std::bit_cast<__half>(uint16_t(0x7C00)); }
-//     static __device__ inline constexpr half neg_infty() { return std::bit_cast<__half>(uint16_t(0xFC00)); }
-// };
-// template<> struct constants<half_2> {
-//     static __device__ inline constexpr half_2 zero()      { return half_2{constants<half>::zero(),      constants<half>::zero()};      }
-//     static __device__ inline constexpr half_2 one()       { return half_2{constants<half>::one(),       constants<half>::one()};       }
-//     static __device__ inline constexpr half_2 pos_infty() { return half_2{constants<half>::pos_infty(), constants<half>::pos_infty()}; }
-//     static __device__ inline constexpr half_2 neg_infty() { return half_2{constants<half>::neg_infty(), constants<half>::neg_infty()}; }
-// };
+template<> struct constants<half> {
+    static __device__ inline constexpr half zero()      { return std::bit_cast<half>(uint16_t(0x0000)); }
+    static __device__ inline constexpr half one()       { return std::bit_cast<half>(uint16_t(0x3C00)); }
+    static __device__ inline constexpr half pos_infty() { return std::bit_cast<half>(uint16_t(0x7C00)); }
+    static __device__ inline constexpr half neg_infty() { return std::bit_cast<half>(uint16_t(0xFC00)); }
+};
+template<> struct constants<half_2> {
+    static __device__ inline constexpr half_2 zero()      { return std::bit_cast<half_2>(uint32_t(0x00000000)); }
+    static __device__ inline constexpr half_2 one()       { return std::bit_cast<half_2>(uint32_t(0x3C003C00)); }
+    static __device__ inline constexpr half_2 pos_infty() { return std::bit_cast<half_2>(uint32_t(0x7C007C00)); }
+    static __device__ inline constexpr half_2 neg_infty() { return std::bit_cast<half_2>(uint32_t(0xFC00FC00)); }
+};
 #ifdef KITTENS_HOPPER
 template<> struct constants<fp8e4m3> {
     static __device__ inline constexpr fp8e4m3 zero() { return std::bit_cast<__hip_fp8_e4m3>(uint8_t(0x00)); }
@@ -211,18 +211,18 @@ template<> struct packing<bf16_2> {
     using packed_type = bf16_2;
     static __device__ inline constexpr bf16_2 pack(const bf16 &i) { return bf16_2{i, i}; } // this replication makes code cleaner later.
 };
-// template<> struct packing<half> {
-//     static __device__ inline constexpr int num() { return 1; }
-//     using unpacked_type = half;
-//     using packed_type = half_2;
-//     static __device__ inline constexpr half_2 pack(const half &i) { return half_2{i, i}; }
-// };
-// template<> struct packing<half_2> {
-//     static __device__ inline constexpr int num() { return 2; }
-//     using unpacked_type = half;
-//     using packed_type = half_2;
-//     static __device__ inline constexpr half_2 pack(const half &i) { return half_2{i, i}; } // this replication makes code cleaner later.
-// };
+template<> struct packing<half> {
+    static __device__ inline constexpr int num() { return 1; }
+    using unpacked_type = half;
+    using packed_type = half_2;
+    static __device__ inline constexpr half_2 pack(const half &i) { return std::bit_cast<half_2>(static_cast<uint32_t>(i) << 16 | static_cast<uint32_t>(i)); }
+};
+template<> struct packing<half_2> {
+    static __device__ inline constexpr int num() { return 2; }
+    using unpacked_type = half;
+    using packed_type = half_2;
+    static __device__ inline constexpr half_2 pack(const half &i) { return std::bit_cast<half_2>(static_cast<uint32_t>(i) << 16 | static_cast<uint32_t>(i)); } // this replication makes code cleaner later.
+};
 template<> struct packing<float> {
     static __device__ inline constexpr int num() { return 1; }
     using unpacked_type = float;
@@ -314,46 +314,46 @@ template<> struct convertor<bf16_2, float2> {
         return 	__float22bfloat162_rn(u);
     }
 };
-// template<> struct convertor<float, half> {
-//     static __host__ __device__ inline float convert(const half & u) {
-//         return __half2float(u);
-//     }
-// };
-// template<> struct convertor<half, float> {
-//     static __host__ __device__ inline half convert(const float & u) {
-//         return __float2half(u);
-//     }
-// };
-// template<> struct convertor<float2, half_2> {
-//     static __host__ __device__ inline float2 convert(const half_2 & u) {
-//         return __half22float2(u);
-//     }
-// };
-// template<> struct convertor<half_2, float2> {
-//     static __host__ __device__ inline half_2 convert(const float2 & u) {
-//         return __float22half2_rn(u);
-//     }
-// };
-// template<> struct convertor<bf16, half> {
-//     static __host__ __device__ inline bf16 convert(const half & u) {
-//         return __float22bfloat162_rn(__half2float(u));
-//     }
-// };
-// template<> struct convertor<half, bf16> {
-//     static __host__ __device__ inline half convert(const bf16 & u) {
-//         return __float2half(__bfloat162float(u));
-//     }
-// };
-// template<> struct convertor<bf16_2, half_2> {
-//     static __host__ __device__ inline bf16_2 convert(const half_2 & u) {
-//         return __float22bfloat162_rn(__half22float2(u));
-//     }
-// };
-// template<> struct convertor<half_2, bf16_2> {
-//     static __host__ __device__ inline half_2 convert(const bf16_2 & u) {
-//         return __float22half2_rn(__bfloat1622float2(u));
-//     }
-// };
+template<> struct convertor<float, half> {
+    static __host__ __device__ inline float convert(const half & u) {
+        return __half2float(u);
+    }
+};
+template<> struct convertor<half, float> {
+    static __host__ __device__ inline half convert(const float & u) {
+        return __float2half(u);
+    }
+};
+template<> struct convertor<float2, half_2> {
+    static __host__ __device__ inline float2 convert(const half_2 & u) {
+        return __half22float2(u);
+    }
+};
+template<> struct convertor<half_2, float2> {
+    static __host__ __device__ inline half_2 convert(const float2 & u) {
+        return __float22half2_rn(u);
+    }
+};
+template<> struct convertor<bf16, half> {
+    static __host__ __device__ inline bf16 convert(const half & u) {
+        return __hip_bfloat16(__half2float(u));
+    }
+};
+template<> struct convertor<half, bf16> {
+    static __host__ __device__ inline half convert(const bf16 & u) {
+        return __float2half(__bfloat162float(u));
+    }
+};
+template<> struct convertor<bf16_2, half_2> {
+    static __host__ __device__ inline bf16_2 convert(const half_2 & u) {
+        return __float22bfloat162_rn(__half22float2(u));
+    }
+};
+template<> struct convertor<half_2, bf16_2> {
+    static __host__ __device__ inline half_2 convert(const bf16_2 & u) {
+        return __float22half2_rn(__bfloat1622float2(u));
+    }
+};
 #ifdef KITTENS_HOPPER
 // fp8e4m3
 template<> struct convertor<fp8e4m3_4, float4> {

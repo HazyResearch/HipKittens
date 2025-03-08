@@ -25,7 +25,7 @@ HIPFLAGS+= -DTEST_INTENSITY=1
 # -DTEST_ALL means run all tests.
 # You can also specify subsections, e.g. -DTEST_WARP_MEMORY
 # Or individual tests, like -DTEST_WARP_MEMORY_VEC_DSMEM. Useful for debugging!
-HIPFLAGS+= -DTEST_WARP_MEMORY_TILE_DSMEM
+HIPFLAGS+= -DTEST_WARP_MEMORY_TILE_SHARED_TO_REGISTER
 
 ifeq ($(COMP_LEVEL),safe)
 HIPFLAGS+= -O0

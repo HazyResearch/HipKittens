@@ -55,7 +55,7 @@ template<typename _T, int _rows, int _cols, ducks::rt_layout::all _layout=ducks:
 struct rt {
     using identifier = ducks::rt::identifier; ///< Type identifier for the rt structure.
     using layout = _layout; ///< Layout of the matrix tile.
-    // static_assert(kittens::ducks::base_types::T1<_T>); // confirm it's a supported type
+    static_assert(kittens::ducks::base_types::T1<_T>); // confirm it's a supported type
     using T = kittens::base_types::packing<_T>::unpacked_type;
     using T2 = kittens::base_types::packing<_T>::packed_type;
     using dtype = T2; ///< Data type of the matrix elements

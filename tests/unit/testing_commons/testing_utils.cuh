@@ -5,8 +5,6 @@
 #include <fstream>
 #include <random>
 #include <type_traits>
-#include <hip/hip_runtime.h>
-#include <hip/hip_bfloat16.h>
 #include "kittens.cuh"
 
 /* --------------------  hip ERROR UTILS  -------------------- */
@@ -120,8 +118,8 @@ void initialize(T **d_i, T **d_o, std::vector<float> &i_ref, std::vector<float> 
             f = i_ref[idx];
         }
         if constexpr (std::is_same_v<T, bf16>) {
-            i_t[idx] = hip_bfloat16(f); // fill in for transfer to device
-            i_ref[idx] = static_cast<float>(i_t[idx]); // ensure lossiness of fp16 is captured on cpu
+            i_t[idx] = __hip_bfloat16(f); // fill in for transfer to device
+            i_ref[idx] = __bfloat162float(i_t[idx]); // ensure lossiness of fp16 is captured on cpu
         }
         else if constexpr (std::is_same_v<T, float>) {
             i_t[idx] = f;
@@ -140,7 +138,7 @@ void initialize(T **d_i, T **d_o, std::vector<float> &i_ref, std::vector<float> 
     hipMalloc(d_o, output_size * sizeof(T));
     HipCheckError();
 
-    chipMemcpy(*d_i, i_t.data(), input_size * sizeof(T), hipMemcpyHostToDevice);
+    hipMemcpy(*d_i, i_t.data(), input_size * sizeof(T), hipMemcpyHostToDevice);
     HipCheckError();
 }
 extern int should_write_outputs;
@@ -158,8 +156,8 @@ test_result validate(T *d_i, T *d_o, const std::vector<float> &i_ref, std::vecto
     HipCheckError();
     for(int idx = 0; idx < output_size; idx++) {
         if constexpr (std::is_same_v<T, bf16>) {
-            o[idx] = static_cast<float>(o_t[idx]);
-            o_ref[idx] = static_cast<float>(hip_bfloat16(o_ref[idx]));
+            o[idx] = __bfloat162float(o_t[idx]);
+            o_ref[idx] = __bfloat162float(__hip_bfloat16(o_ref[idx]));
         }
         else if constexpr (std::is_same_v<T, half>) {
             o[idx] = __half2float(o_t[idx]);

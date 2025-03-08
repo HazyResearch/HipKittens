@@ -70,6 +70,8 @@ constexpr int MAX_SHARED_MEMORY = 227000;
 constexpr int MAX_SHARED_MEMORY = 164000;
 #elif defined(KITTENS_4090)
 constexpr int MAX_SHARED_MEMORY = 100000;
+#elif defined(KITTENS_CDNA3)
+constexpr int MAX_SHARED_MEMORY = 65000;
 #endif
 
 /* ----------  TYPE HELPERS  ---------- */

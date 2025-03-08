@@ -148,9 +148,9 @@ struct wrapper_1d {
             GL input(d_i, nullptr, nullptr, nullptr, nullptr);
             GL output(d_o, nullptr, nullptr, nullptr, nullptr);
             // run kernel
-            cudaFuncSetAttribute(
+            hipFuncSetAttribute(
                 global_wrapper_1d<test, dtype, S, NUM_WORKERS, GL, args...>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                hipFuncAttributeMaxDynamicSharedMemorySize,
                 kittens::MAX_SHARED_MEMORY
             );
             global_wrapper_1d<test, dtype, S, NUM_WORKERS, GL, args...><<<1, NUM_WORKERS*32, kittens::MAX_SHARED_MEMORY>>>(input, output);
@@ -190,7 +190,7 @@ template<template<typename> typename test, int MAX_S=8, typename... args> using 
 // ----- 2D Wrappers -----
 
 template<typename Ker, typename T, int H, int W, int NW, typename G, typename... args>
-static __global__ void global_wrapper_2d(const __grid_constant__ G input, const __grid_constant__ G output) {
+static __global__ void global_wrapper_2d(const G input, const G output) {
     Ker::template device_func<H, W, NW, G, args...>(input, output);
 }
 template<typename test, int H, int W, int NUM_WORKERS, typename... args>
@@ -211,9 +211,9 @@ struct wrapper_2d {
             GL input(d_i, nullptr, nullptr, nullptr, nullptr);
             GL output(d_o, nullptr, nullptr, nullptr, nullptr);
             // run kernel
-            cudaFuncSetAttribute(
-                global_wrapper_2d<test, dtype, H, W, NUM_WORKERS, GL, args...>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
+            hipFuncSetAttribute(
+                reinterpret_cast<const void*>(global_wrapper_2d<test, dtype, H, W, NUM_WORKERS, GL, args...>),
+                hipFuncAttributeMaxDynamicSharedMemorySize,
                 kittens::MAX_SHARED_MEMORY
             );
             global_wrapper_2d<test, dtype, H, W, NUM_WORKERS, GL, args...><<<1, NUM_WORKERS*32, kittens::MAX_SHARED_MEMORY>>>(input, output);

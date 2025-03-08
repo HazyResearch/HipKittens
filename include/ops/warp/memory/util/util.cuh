@@ -2,11 +2,11 @@
  * @file
  * @brief General memory utilities not specialized for either tiles or vectors.
  */
+#pragma once
+
 #include <hip/hip_runtime.h>
 #include <hip/amd_detail/amd_hip_runtime.h>
 #include <hip/amd_detail/hip_ldg.h>
-
-#pragma once
 
 namespace kittens {
 

@@ -5,7 +5,6 @@
 
 #pragma once
 
-// #include <hip_bf16.h>
 #include <limits>
 #include "base_types.cuh"
 
