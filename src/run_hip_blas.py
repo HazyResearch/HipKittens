@@ -41,7 +41,7 @@ def test_hip_blas_matmul(config: pydra.Config, M: int, N: int, K: int, A_d, B_d,
     C_out = np.zeros((M, N), dtype=np.float32, order="F")
     num_bytes_C = C_out.nbytes
     hip_check(hip.hipMemcpy(C_out, C_d, num_bytes_C, hip.hipMemcpyKind.hipMemcpyDeviceToHost))
-    compare(C_out, C_expected)
+    compare(C_out, C_expected, config.debug)
 
     # Destroy events and module
     hip_check(hip.hipEventDestroy(start_event))

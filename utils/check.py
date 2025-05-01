@@ -14,15 +14,33 @@ def hip_check(call_result):
         raise RuntimeError(str(err))
     return result
 
-def compare(C_h: np.ndarray, C_expected: np.ndarray):
+def compare(C_h: np.ndarray, C_expected: np.ndarray, debug: bool):
     """
-    Compare the output of the kernel with the expected result
+    Compare the output of the kernel with the expected result.
+    If mismatched, print full tensors and write them to a file.
     """
 
-    # Compare with expected result
+    if debug:
+        output_path="compare_output.txt"
+        np.set_printoptions(threshold=np.inf, linewidth=np.inf, suppress=True)
+
     if np.allclose(C_expected, C_h, atol=1e-3):
         print("✅ Matrix multiplication successful")
     else:
         print("❌ Matrix multiplication FAILED")
-        print(f"Output: {C_h}")
-        print(f"Golden: {C_expected}")
+        print("=== Computed Output ===")
+        print(C_h)
+        print("\n=== Expected Output ===")
+        print(C_expected)
+
+        if debug:
+            with open(output_path, "w") as f:
+                f.write("❌ Matrix multiplication FAILED\n")
+                f.write("=== Computed Output ===\n")
+                f.write(f"{C_h}\n\n")
+                f.write("=== Expected Output ===\n")
+                f.write(f"{C_expected}\n\n")
+                f.write("=== Difference ===\n")
+                f.write(f"{C_h - C_expected}\n")
+
+            print(f"\n📝 Results written to '{output_path}'")

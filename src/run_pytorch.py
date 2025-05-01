@@ -51,7 +51,7 @@ def test_pytorch_matmul(config: pydra.Config, M: int, N: int, K: int, A_h: np.nd
 
     # Copy result back to CPU for validation
     C_result_cpu = C_result.cpu().numpy()
-    compare(C_result_cpu, C_expected)
+    compare(C_result_cpu, C_expected, config.debug)
 
     return elapsed_time
 

@@ -79,9 +79,9 @@ class EvalConfig(Config):
     def correctness(self):
         self.num_warmup = 0
         self.num_iterations = 1
-        self.M = 256
-        self.K = 256
-        self.N = 256
+        self.M = 128
+        self.K = 128
+        self.N = 128
         self.debug = True
 
     def matmul_shape(self):

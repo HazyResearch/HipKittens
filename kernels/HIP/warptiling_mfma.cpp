@@ -1,4 +1,6 @@
 namespace wt {
+using float16 = __attribute__( (__vector_size__(16 * sizeof(float)) )) float;
+using float_vec4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 template <const int BM, const int BN, const int BK, const int rowStrideA,
           const int rowStrideB>
 __device__ void loadFromGmem(int N, int K, const float *A, const float *B,
@@ -38,35 +40,48 @@ __device__ void
 processFromSmem(float *regM, float *regN, float *threadResults, const float *As,
                 const float *Bs, const uint warpRow, const uint warpCol,
                 const uint threadRowInWarp, const uint threadColInWarp) {
-  for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
+  for (uint dotIdx = 0; dotIdx < BK; dotIdx += 4) {
     // populate registers for whole warptile
-    for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
-      for (uint i = 0; i < TM; ++i) {
-        regM[wSubRowIdx * TM + i] =
-            As[(dotIdx * BM) + warpRow * WM + wSubRowIdx * WSUBM +
-               threadRowInWarp * TM + i];
-      }
-    }
-    for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
-      for (uint i = 0; i < TN; ++i) {
-        regN[wSubColIdx * TN + i] =
-            Bs[(dotIdx * BN) + warpCol * WN + wSubColIdx * WSUBN +
-               threadColInWarp * TN + i];
-      }
-    }
+    // for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+    //   for (uint i = 0; i < TM; ++i) {
+    //     regM[wSubRowIdx * TM + i] =
+    //         As[(dotIdx * BM) + warpRow * WM + wSubRowIdx * WSUBM +
+    //            threadRowInWarp * TM + i];
+    //   }
+    // }
+    // for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+    //   for (uint i = 0; i < TN; ++i) {
+    //     regN[wSubColIdx * TN + i] =
+    //         Bs[(dotIdx * BN) + warpCol * WN + wSubColIdx * WSUBN +
+    //            threadColInWarp * TN + i];
+    //   }
+    // }
 
     // execute warptile matmul
     for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
       for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+
+        // Should try to call the mfma_f32_16x16x1f32 intrinsic 
         // calculate per-thread results
-        for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-          for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-            threadResults[(wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
-                          (wSubColIdx * TN) + resIdxN] +=
-                regM[wSubRowIdx * TM + resIdxM] *
-                regN[wSubColIdx * TN + resIdxN];
-          }
-        }
+        // for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+        //   for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+        //     threadResults[(wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
+        //                   (wSubColIdx * TN) + resIdxN] +=
+        //         regM[wSubRowIdx * TM + resIdxM] *
+        //         regN[wSubColIdx * TN + resIdxN];
+        //   }
+        // }
+
+        float A_elem = As[(dotIdx * BM) + (warpRow * WM) + (wSubRowIdx * WSUBM) + (threadRowInWarp * BN) + threadColInWarp];
+        float B_elem = Bs[(dotIdx * BN) + (warpCol * WN) + (wSubColIdx * WSUBN) + (threadRowInWarp * BN) + threadColInWarp];
+        
+        float_vec4 acc = {0.0f};
+        acc = __builtin_amdgcn_mfma_f32_16x16x4f32(A_elem, B_elem, acc, 0, 0, 0);
+
+        threadResults[(wSubRowIdx) * (WNITER * TM) + (wSubColIdx * TM)] += acc[0];
+        threadResults[(wSubRowIdx) * (WNITER * TM) + (wSubColIdx * TM) + 1] += acc[1];
+        threadResults[(wSubRowIdx) * (WNITER * TM) + (wSubColIdx * TM) + 2] += acc[2];
+        threadResults[(wSubRowIdx) * (WNITER * TM) + (wSubColIdx * TM) + 3] += acc[3];
       }
     }
   }
@@ -94,8 +109,8 @@ extern "C" __global__ void matmul_kernel(int M, int N, int K, float *A, float *B
     const int WM = 64;
     const int WN = 64;
     const int WNITER = 4;
-    const int TM = 1;
-    const int TN = 4;
+    const int TM = 4;
+    const int TN = 1;
 
     const int NUM_THREADS = 256;
 
@@ -112,8 +127,8 @@ extern "C" __global__ void matmul_kernel(int M, int N, int K, float *A, float *B
 
     // size of the warp subtile
     constexpr uint WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER);
-    constexpr uint WSUBM = WM / WMITER; // 64/1=64
-    constexpr uint WSUBN = WN / WNITER; // 64/1=64
+    constexpr uint WSUBM = WM / WMITER; // 32/2=16
+    constexpr uint WSUBN = WN / WNITER; // 32/2=16
 
     // Placement of the thread in the warp subtile
     const uint threadIdxInWarp = threadIdx.x % WARPSIZE;         // [0, 63]
@@ -159,25 +174,37 @@ extern "C" __global__ void matmul_kernel(int M, int N, int K, float *A, float *B
         for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
         // move C pointer to current warp subtile
         float *C_interim = C + (wSubRowIdx * WSUBM) * N + wSubColIdx * WSUBN;
-        for (uint resIdxM = 0; resIdxM < TM; resIdxM += 1) {
-            for (uint resIdxN = 0; resIdxN < TN; resIdxN += 4) {
-            // load C vector into registers
-            float4 tmp = reinterpret_cast<float4 *>(
-                &C_interim[(threadRowInWarp * TM + resIdxM) * N +
-                            threadColInWarp * TN + resIdxN])[0];
-            // perform GEMM update in reg
-            const int i = (wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
-                            wSubColIdx * TN + resIdxN;
-            tmp.x = alpha * threadResults[i + 0] + beta * tmp.x;
-            tmp.y = alpha * threadResults[i + 1] + beta * tmp.y;
-            tmp.z = alpha * threadResults[i + 2] + beta * tmp.z;
-            tmp.w = alpha * threadResults[i + 3] + beta * tmp.w;
-            // write back
-            reinterpret_cast<float4 *>(
-                &C_interim[(threadRowInWarp * TM + resIdxM) * N +
-                            threadColInWarp * TN + resIdxN])[0] = tmp;
-            }
-        }
+            // // load C vector into registers
+            // float4 tmp = reinterpret_cast<float4 *>(
+            //     &C_interim[(threadRowInWarp * TM + resIdxM) * N +
+            //                 threadColInWarp * TN + resIdxN])[0];
+            // // perform GEMM update in reg
+            const int i = (wSubRowIdx) * (WNITER * TM) + (wSubColIdx * TM);
+            // tmp.x = alpha * threadResults[i + 0] + beta * tmp.x;
+            // tmp.y = alpha * threadResults[i + 1] + beta * tmp.y;
+            // tmp.z = alpha * threadResults[i + 2] + beta * tmp.z;
+            // tmp.w = alpha * threadResults[i + 3] + beta * tmp.w;
+            // // write back
+            // reinterpret_cast<float4 *>(
+            //     &C_interim[(threadRowInWarp * TM + resIdxM) * N +
+            //                 threadColInWarp * TN + resIdxN])[0] = tmp;
+
+              C_interim[(threadRowInWarp * TM) * N + threadColInWarp * TN] = 
+              alpha * threadResults[i + 0] + beta * 
+              C_interim[(threadRowInWarp * TM) * N + threadColInWarp * TN];
+
+              C_interim[(threadRowInWarp * TM + 1) * N + threadColInWarp * TN] = 
+              alpha * threadResults[i + 1] + beta * 
+              C_interim[(threadRowInWarp * TM + 1) * N + threadColInWarp * TN];
+
+              C_interim[(threadRowInWarp * TM+ 2) * N + threadColInWarp * TN] = 
+              alpha * threadResults[i + 2] + beta * 
+              C_interim[(threadRowInWarp * TM + 2) * N + threadColInWarp * TN];
+
+              C_interim[(threadRowInWarp * TM + 3) * N + threadColInWarp * TN] = 
+              alpha * threadResults[i + 3] + beta * 
+              C_interim[(threadRowInWarp * TM + 3) * N + threadColInWarp * TN];
+            
         }
     }
 }
