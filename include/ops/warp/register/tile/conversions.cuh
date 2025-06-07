@@ -220,160 +220,7 @@ __device__ static inline void copy(rt_base<T, layout> &dst, const rt_base<U, lay
         dst.data[k] = base_types::convertor<T2, U2>::convert(src.data[k]);
     }
 }
-#ifdef KITTENS_HOPPER
-/**
- * @brief Copies a register tile, converting the underlying type if necessary.
- *
- * @tparam T2 The data type of the destination register elements.
- * @tparam U2 The data type of the source register elements.
- * @tparam _height The height (in units of 16) of the register tiles.
- * @tparam _width The width (in units of 16) of the register tiles.
- * @tparam layout The current layout of the register tile.
- * @param[out] dst A reference to the destination register tile.
- * @param[in] src A reference to the source register tile.
- */
-template<typename T2, typename U2, int _height, int _width, ducks::rt_layout::all layout>
-__device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const rt<U2, _height, _width, layout> &src) {
 
-    if constexpr (
-        (std::is_same_v<U2, float> && std::is_same_v<T2, fp8e4m3>) ||
-        (std::is_same_v<U2, float> && std::is_same_v<T2, fp8e5m2>) ||
-        (std::is_same_v<U2, kittens::bf16> && std::is_same_v<T2, fp8e4m3>) ||
-        (std::is_same_v<U2, kittens::bf16> && std::is_same_v<T2, fp8e5m2>) ||
-        (std::is_same_v<U2, half> && std::is_same_v<T2, fp8e4m3>) ||
-        (std::is_same_v<U2, half> && std::is_same_v<T2, fp8e5m2>)
-    ) {
-        // FLOAT (SRC -- 1H x 2W) to FP8 (DST -- 1H x 1W)
-        int laneid = threadIdx.x % 32;
-
-        #pragma unroll
-        for(int i = 0; i < dst.height; i++) {
-            #pragma unroll
-            for(int j = 0; j < dst.width; j++) {
-                #pragma unroll
-                for(int k = 0; k < dst.tiles[0][0].packed_per_thread; k++) {
-                    
-                    // check for half, float, bf16
-                    using src_t = std::conditional_t<std::is_same_v<U2, float>, float2, std::conditional_t<std::is_same_v<U2, kittens::bf16>, bf16_2, half2>>;
-                    src_t val1, val2;
-
-                    // Put something up for adoption
-                    if (laneid % 2 == 0) { 
-                        // put up src left core matrix first as 0, 2
-                        val1 = src.tiles[i][2*j + k/2].data[(k%2)+0];
-                        val2 = src.tiles[i][2*j + k/2].data[(k%2)+2];
-                    } else { 
-                        // put up src right core matrix first as 1, 3
-                        val1 = src.tiles[i][2*j + k/2].data[(k%2)+2];
-                        val2 = src.tiles[i][2*j + k/2].data[(k%2)+0];
-                    }
-
-                    // Shuffle first 4 floats
-                    int row_mask = 4 * ( laneid / 4 );
-                    int row_offset = row_mask + ( (laneid-row_mask) / 2 ) + ( laneid % 2 );
-                    int src_offset = (laneid % 2 == 0 ) ? row_offset + 0 : ( row_offset + 1 );
-                    src_t val01 = packed_shfl_sync(MASK_ALL, val1, src_offset);  // Get from even thread
-
-                    int src_offset2 = (laneid % 4 < 2 ) ? src_offset + 1 : (src_offset - 1);
-                    src_t val23 = packed_shfl_sync(MASK_ALL, val2, src_offset2);  // Get from odd thread
-                    
-                    // Convert to fp8e4m3_4
-                    float4 f4;
-                    using fp8_4_t = std::conditional_t<std::is_same_v<T2, fp8e4m3>, fp8e4m3_4, fp8e5m2_4>;
-                    fp8_4_t f4_fp8;
-                    if ( laneid % 4 < 2 ) { 
-                        f4.x = val01.x;  // Thread 2N's first value
-                        f4.y = val01.y;  // Thread 2N's second value
-                        f4.z = val23.x;  // Thread 2N+1's first value
-                        f4.w = val23.y;  // Thread 2N+1's second value
-                        f4_fp8 = base_types::convertor<fp8_4_t, float4>::convert(f4);
-                        dst.tiles[i][j].data[k] = f4_fp8;
-                    } else {
-                        f4.x = val23.x;  // Thread 2N+1's first value
-                        f4.y = val23.y;  // Thread 2N+1's second value
-                        f4.z = val01.x;  // Thread 2N's first value
-                        f4.w = val01.y;  // Thread 2N's second value
-                        f4_fp8 = base_types::convertor<fp8_4_t, float4>::convert(f4);
-                        dst.tiles[i][j].data[k] = f4_fp8;
-                    }
-                }
-            }
-        }
-    }
-    else if constexpr (
-        (std::is_same_v<U2, fp8e4m3> && std::is_same_v<T2, float>) ||
-        (std::is_same_v<U2, fp8e5m2> && std::is_same_v<T2, float>) ||
-        (std::is_same_v<U2, fp8e4m3> && std::is_same_v<T2, kittens::bf16>) ||
-        (std::is_same_v<U2, fp8e5m2> && std::is_same_v<T2, kittens::bf16>) ||
-        (std::is_same_v<U2, fp8e4m3> && std::is_same_v<T2, half>) ||
-        (std::is_same_v<U2, fp8e5m2> && std::is_same_v<T2, half>)
-    ) {
-        // FP8 (SRC -- 1H x 1W) to FLOAT (DST -- 1H x 2W)
-        int laneid = threadIdx.x % 32;
-
-        #pragma unroll
-        for(int i = 0; i < src.height; i++) {
-            #pragma unroll
-            for(int j = 0; j < src.width; j++) {
-                #pragma unroll
-                for(int k = 0; k < src.tiles[0][0].packed_per_thread; k++) {
-                    int dst_j = 2*j + k/2;
-
-                    // Put something up for adoption
-                    using fp8_4_t = std::conditional_t<std::is_same_v<U2, fp8e4m3>, fp8e4m3_4, fp8e5m2_4>;
-                    fp8_4_t val = src.tiles[i][j].data[k];
-                    float4 f4 = base_types::convertor<float4, fp8_4_t>::convert(val);
-                    float2 f2_0, f2_1;
-                    if ( laneid % 4 < 2 ) { // src 0 and 1 should put up .x and .y first
-                        f2_0 = make_float2(f4.x, f4.y);
-                        f2_1 = make_float2(f4.z, f4.w);
-                    }
-                    else { // src 2 and 3 should put up .z and .w first
-                        f2_0 = make_float2(f4.z, f4.w);
-                        f2_1 = make_float2(f4.x, f4.y);
-                    }
-
-                    int row_offset = 4 * (laneid/4) + (laneid%2) * 2 + (laneid%4) / 2;
-                    float2 f2_0_shfl = packed_shfl_sync(MASK_ALL, f2_0, row_offset);
-                    float2 f2_1_shfl = packed_shfl_sync(MASK_ALL, f2_1, row_offset^2);
-
-                    // convert to dst type if needed
-                    using dst_t = std::conditional_t<std::is_same_v<T2, float>, float2, std::conditional_t<std::is_same_v<T2, kittens::bf16>, bf16_2, half2>>;
-                    if constexpr (!(std::is_same_v<T2, float>)) {
-                        dst_t f2_0_shfl_t = base_types::convertor<dst_t, float2>::convert(f2_0_shfl);
-                        dst_t f2_1_shfl_t = base_types::convertor<dst_t, float2>::convert(f2_1_shfl);
-                        if (laneid % 2 == 0) {  
-                            dst.tiles[i][dst_j].data[(k%2)+0] = f2_0_shfl_t;
-                            dst.tiles[i][dst_j].data[(k%2)+2] = f2_1_shfl_t;
-                        } else {
-                            dst.tiles[i][dst_j].data[(k%2)+0] = f2_1_shfl_t;
-                            dst.tiles[i][dst_j].data[(k%2)+2] = f2_0_shfl_t;
-                        }
-                    } else {
-                        if (laneid % 2 == 0) {  
-                            dst.tiles[i][dst_j].data[(k%2)+0] = f2_0_shfl;
-                            dst.tiles[i][dst_j].data[(k%2)+2] = f2_1_shfl;
-                        } else {
-                            dst.tiles[i][dst_j].data[(k%2)+0] = f2_1_shfl;
-                            dst.tiles[i][dst_j].data[(k%2)+2] = f2_0_shfl;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // default case where the layouts map 1:1 in thread ownership logic
-    else {
-        #pragma unroll
-        for(int i = 0; i < dst.height; i++) {
-            #pragma unroll
-            for(int j = 0; j < dst.width; j++) {
-                copy(dst.tiles[i][j], src.tiles[i][j]);
-            }
-        }
-    }
-}
-#else
 /**
  * @brief Copies a register tile, converting the underlying type if necessary.
  *
@@ -395,7 +242,6 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
         }
     }
 }
-#endif
 
 /* ----------  CAUSAL  ---------- */
 
@@ -414,9 +260,6 @@ __device__ static inline void copy(rt<T2, _height, _width, layout> &dst, const r
 template<ducks::rt::row_layout RT>
 __device__ static inline void make_causal(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
-    #ifdef KITTENS_HOPPER
-    static_assert(!std::is_same_v<typename RT::dtype, fp8e4m3_4> && !std::is_same_v<typename RT::dtype, fp8e5m2_4>, "Unsupported type for make_causal");
-    #endif
     #pragma unroll
     for(int i = 0; i < dst.height; i++) {
         #pragma unroll
@@ -474,9 +317,6 @@ __device__ static inline void make_causal(RT &dst, const RT &src, const typename
 template<ducks::rt::row_layout RT>
 __device__ static inline void make_causal_t(RT &dst, const RT &src, const typename base_types::packing<typename RT::dtype>::unpacked_type &val=0) {
     const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(val);
-    #ifdef KITTENS_HOPPER
-    static_assert(!std::is_same_v<typename RT::dtype, fp8e4m3_4> && !std::is_same_v<typename RT::dtype, fp8e5m2_4>, "Unsupported type for make_causal");
-    #endif
     #pragma unroll
     for(int i = 0; i < dst.height; i++) {
         #pragma unroll

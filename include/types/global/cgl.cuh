@@ -9,9 +9,6 @@
 #include "../shared/cst.cuh"
 #include "gl.cuh"
 #include "util.cuh"
-#ifdef KITTENS_HOPPER
-#include "tma.cuh"
-#endif
 
 namespace kittens {
 

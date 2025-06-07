@@ -60,16 +60,9 @@ struct st_load_store {
     using dtype = T;
     template<int H, int W, int NW, typename axis> using valid = std::bool_constant<
         (NW == 1 && W*H<=64) 
-        #ifdef KITTENS_HOPPER
-        && ( ( !std::is_same_v<kittens::fp8e4m3, T> && !std::is_same_v<kittens::fp8e5m2, T> ) || W%2 == 0 )
-        #endif
     >;
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "shared_loadstore_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "shared_loadstore_gmem=half" :
-                                                      #ifdef KITTENS_HOPPER
-                                                      std::is_same_v<T, kittens::fp8e4m3> ? "shared_loadstore_gmem=fp8e4m3":
-                                                      std::is_same_v<T, kittens::fp8e5m2> ? "shared_loadstore_gmem=fp8e5m2":
-                                                      #endif
                                                                                          "shared_loadstore_gmem=float";
     template<int H, int W, int NW, kittens::ducks::gl::all GL, typename axis> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
 
@@ -93,45 +86,6 @@ struct st_load_store {
         }
     }
 };
-
-// template<typename T>
-// struct st_load_store_async {
-//     using dtype = T;
-//     template<int H, int W, int NW, typename axis> using valid = std::bool_constant<
-//         (NW == 1 && W*H<=64) 
-//         #ifdef KITTENS_HOPPER
-//         && ( ( !std::is_same_v<kittens::fp8e4m3, T> && !std::is_same_v<kittens::fp8e5m2, T> ) || W%2 == 0 )
-//         #endif
-//     >;
-//     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "shared_loadstore_async_gmem=bf16" :
-//                                                       std::is_same_v<T, kittens::half> ? "shared_loadstore_async_gmem=half" :
-//                                                       #ifdef KITTENS_HOPPER
-//                                                       std::is_same_v<T, kittens::fp8e4m3> ? "shared_loadstore_async_gmem=fp8e4m3":
-//                                                       std::is_same_v<T, kittens::fp8e5m2> ? "shared_loadstore_async_gmem=fp8e5m2":
-//                                                       #endif
-//                                                                                          "shared_loadstore_async_gmem=float";
-//     template<int H, int W, int NW, kittens::ducks::gl::all GL, typename axis> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
-
-//         o_ref = i_ref; // overwrite the whole thing
-//     }
-//     template<int H, int W, int NW, kittens::ducks::gl::all GL, typename axis> __device__ static void device_func(const GL input, const GL output) {
-//         extern __shared__ kittens::alignment_dummy __shm[]; // this is the CUDA shared memory
-//         kittens::shared_allocator<16> al((int*)&__shm[0]); 
-//         using ST = kittens::st<T, 16*H, 16*W>;
-//         ST &shared_tile = al.allocate<ST>();
-//         int num_batches = axis::value==0?((int)input.batch/shared_tile.rows):(int)input.batch;
-//         int num_depths = axis::value==1?((int)input.depth/shared_tile.rows):(int)input.depth;
-//         int num_rows = axis::value==2?((int)input.rows/shared_tile.rows):(int)input.rows;
-//         for(int i = 0; i < num_batches; i++)
-//             for(int j = 0; j < num_depths; j++)
-//                 for(int k = 0; k < num_rows; k++)
-//                     for(int l = 0; l < (input.cols/shared_tile.cols); l++) {
-//             kittens::load_async<axis::value, false, ST, GL, kittens::coord<ST>>(shared_tile, input, {i, j, k, l});
-//             kittens::load_async_wait();
-//             kittens::store<axis::value, false, ST, GL, kittens::coord<ST>>(output, shared_tile, {i, j, k, l});
-//         }
-//     }
-// };
 
 using I0_t = std::integral_constant<int, 0>;
 using I1_t = std::integral_constant<int, 1>;

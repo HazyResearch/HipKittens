@@ -3,13 +3,13 @@
 # to spend a *long* time compiling. (like, HOURS single-threaded.)
 
 # GPU Selection: Set to MI300X
-GPU_TARGET=CDNA2
+GPU_TARGET=CDNA3
 COMP_LEVEL=profile
 
 GPU_RUNTIME := HIP
 
 # HIP variables
-ROCM_INSTALL_DIR := /opt/rocm-6.3.1
+ROCM_INSTALL_DIR := $(ROCM_PATH)
 HIP_INCLUDE_DIR  := $(ROCM_INSTALL_DIR)/include/hip
 
 HIPCXX ?= $(ROCM_INSTALL_DIR)/bin/hipcc

@@ -5,9 +5,6 @@
 
 #pragma once
 
-// #ifdef KITTENS_HOPPER
-// #include "tma.cuh"
-// #endif
 #include "util.cuh"
 #include "gl.cuh"
 #include "cgl.cuh"

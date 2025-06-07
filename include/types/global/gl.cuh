@@ -8,46 +8,10 @@
 #include "../../common/common.cuh"
 #include "../shared/shared.cuh"
 #include "util.cuh"
-#ifdef KITTENS_HOPPER
-#include <utility>
-#include "tma.cuh"
-#endif
 
 namespace kittens {
 
 /* ----------   Associative dictionary for global layouts  ---------- */
-
-#ifdef KITTENS_HOPPER
-namespace ducks {
-namespace tma {
-namespace descriptor {
-struct identifier {};
-template<typename T> concept all = requires {
-    typename T::identifier;
-} && std::is_same_v<typename T::identifier, identifier>;
-} // namespace descriptor
-} // namespace tma
-} // namespace ducks
-namespace tma {
-namespace detail {
-template<typename T> struct descriptor_copy_helper {};
-template<kittens::ducks::tma::descriptor::all _T> struct descriptor_copy_helper<_T> { static constexpr int value = _T::axis; using T = _T::T; };
-template<kittens::ducks::st::all _T> struct descriptor_copy_helper<_T> { static constexpr int value = 2; using T = _T; };
-template<kittens::ducks::sv::all _T> struct descriptor_copy_helper<_T> { static constexpr int value = -1; using T = _T; };
-template<typename T> using descriptor_copy_helper_t = descriptor_copy_helper<T>::T;
-template<typename T> static constexpr int descriptor_copy_helper_v = descriptor_copy_helper<T>::value;
-} // namespace detail
-template<typename _T, int _axis=-9999> struct descriptor {
-    using identifier = ducks::tma::descriptor::identifier;
-    using T = detail::descriptor_copy_helper_t<_T>;
-    static_assert(ducks::st::all<T> || ducks::sv::all<T> || ducks::tma::descriptor::all<T>, "Must be a shared TK type to generate a TMA descriptor.");
-    static constexpr int axis = (
-        ducks::tma::descriptor::all<_T> ? detail::descriptor_copy_helper_v<_T> : // if a copy, inherit the axis from the original descriptor. 
-        (_axis != -9999) ? _axis : detail::descriptor_copy_helper_v<_T>); // if a default value was provided, use it.
-    static_assert((kittens::ducks::st::all<T> && axis >= 0 && axis <= 2) || (kittens::ducks::sv::all<T> && axis == -1), "Internal template error detected.");
-};
-} // namespace tma
-#endif
 
 namespace detail {
 template<typename... Args>
@@ -55,35 +19,7 @@ struct descriptor_dict {
     __host__ descriptor_dict() {}
     template<typename T> __host__ descriptor_dict(T _, int b, int d, int r, int c) {}
     __host__ __device__ descriptor_dict(const descriptor_dict &other) {}
-#ifdef KITTENS_HOPPER
-    template<typename T, int U> __device__ const CUtensorMap* get() const {
-        static_assert(
-            std::is_same_v<T, std::true_type> && std::is_same_v<T, std::false_type>,
-            "SKILL ISSUE: Requested a TMA descriptor for a type not initialized in the global layout."
-        );
-    }
-#endif
 };
-
-#ifdef KITTENS_HOPPER
-template<typename _T, typename... Args>
-struct descriptor_dict<_T, Args...> {
-    static_assert(ducks::sv::all<_T> || ducks::st::all<_T> || ducks::tma::descriptor::all<_T>, "Must be a shared TK type to generate a TMA descriptor.");
-    using DESC = tma::descriptor<_T>; // copy or initialize with a default value
-    CUtensorMap tma_desc;
-    descriptor_dict<Args...> other_descs;
-    __host__ descriptor_dict() {}
-    __host__ descriptor_dict(typename DESC::T::dtype *data, int b, int d, int r, int c): other_descs(data, b, d, r, c) {
-        tma::detail::create_tensor_map<typename DESC::T, DESC::axis>(&tma_desc, data, b, d, r, c);
-    }
-    __host__ __device__ inline descriptor_dict(const descriptor_dict &other) :
-        tma_desc(other.tma_desc), other_descs(other.other_descs) {}
-    template<typename U, int axis> __device__ inline const CUtensorMap* get() const {
-        if constexpr (std::is_same_v<typename DESC::T, U> && DESC::axis == axis) { return &tma_desc; }
-        else                                                                     { return other_descs.template get<U, axis>(); }
-    }
-};
-#endif
 }
 
 /* ----------  Global layout descriptor  ---------- */
@@ -123,11 +59,6 @@ struct gl {
     }
     __host__ __device__ inline gl(const gl &other) :
             raw_ptr(other.raw_ptr), batch(other.batch), depth(other.depth), rows(other.rows), cols(other.cols), tma_descs(other.tma_descs) {}
-#ifdef KITTENS_HOPPER
-    template<typename U, int axis> __device__ inline const CUtensorMap* get_tma() const {
-        return tma_descs.template get<U, axis>();
-    }
-#endif
     __device__ inline T& operator[](const coord<ducks::default_type> &idx) const { // yes I am abusing the const qualifier here a bit.
         return raw_ptr[((idx.b*depth + idx.d)*rows + idx.r)*cols + idx.c];
     }

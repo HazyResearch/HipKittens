@@ -17,10 +17,6 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     using T2 = RT::dtype;
     using U = typename GL::dtype;
 
-    #ifdef KITTENS_HOPPER
-    static_assert(!std::is_same_v<T2, fp8e4m3_4> && !std::is_same_v<T2, fp8e5m2_4>, "Unsupported type for load/store");
-    #endif
-
     U *src_ptr = (U*)&src[(idx.template unit_coord<axis, 3>())];
     const int row_stride = src.template stride<axis>();
     using U2 = base_types::packing<U>::packed_type;
@@ -56,10 +52,6 @@ template<int axis, ducks::rt::col_layout RT, ducks::gl::all GL, ducks::coord::ti
 __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     using T = typename RT::T;
     using U = typename GL::dtype;
-
-    #ifdef KITTENS_HOPPER
-    static_assert(!std::is_same_v<T, fp8e4m3> && !std::is_same_v<T, fp8e5m2>, "Unsupported type for load/store");
-    #endif
 
     U *src_ptr = (U*)&src[(idx.template unit_coord<axis, 3>())];
     const int row_stride = src.template stride<axis>();
@@ -112,10 +104,6 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
     using T2 = RT::dtype;
     using U = typename GL::dtype;
 
-    #ifdef KITTENS_HOPPER
-    static_assert(!std::is_same_v<T2, fp8e4m3_4> && !std::is_same_v<T2, fp8e5m2_4>, "Unsupported type for load/store");
-    #endif
-
     U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
     const int row_stride = dst.template stride<axis>();
     using U2 = base_types::packing<U>::packed_type;
@@ -151,10 +139,6 @@ template<int axis, ducks::rt::col_layout RT, ducks::gl::all GL, ducks::coord::ti
 __device__ inline static void store(const GL &dst, const RT &src, const COORD &idx) {
     using T = base_types::packing<typename RT::dtype>::unpacked_type;
     using U = typename GL::dtype;
-
-    #ifdef KITTENS_HOPPER
-    static_assert(!std::is_same_v<T, fp8e4m3_4> && !std::is_same_v<T, fp8e5m2_4>, "Unsupported type for load/store");
-    #endif
     
     U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
     const int row_stride = dst.template stride<axis>();
