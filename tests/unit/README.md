@@ -4,8 +4,8 @@ This directory contains unit tests for ThunderKittens.
 
 ### Requirements
 
-- NVIDIA GPU
-- CUDA Toolkit (12.3 or 12.4 preferred.)
+- AMD GPU
+- ROCM Toolkit (e.g., 6.4.3)
 - C++20 compatible compiler
 
 ### Compiling the Tests
@@ -13,12 +13,13 @@ This directory contains unit tests for ThunderKittens.
 To compile the unit tests, use the provided Makefile in this directory. It is highly recommended to run the compilation with multiple threads to speed up the process. For example, if your machine has 32 threads, run:
 
 ```bash
+module load rocm
 make -j32
 ```
 
 ### Compilation Options
 The Makefile provides several options to customize the compilation:
-- `GPU_TARGET`: Set to either `4090`, `A100`, or `H100` to specify the target GPU architecture (default: H100).
+- `GPU_TARGET`: Set to `CDNA3` to specify the target GPU architecture.
 - `COMP_LEVEL`: Set the compiler optimization level. Available options are `fast`, `debug`, and `profile` (default: fast).
 - `TEST_INTENSITY`: Set the level of test intensity. Higher levels compile more tests but take longer. Available options are 1, 2, 3, and 4 (default: 2).
 - `TEST_ALL`: Compile and run all available tests. You can also specify individual test sections or tests using flags like -DTEST_WARP_MEMORY or -DTEST_WARP_MEMORY_VEC_DSMEM.

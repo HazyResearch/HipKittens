@@ -181,7 +181,7 @@ struct st_subtile {
         col_offset = rowcol.y * cols;
     }
 
-    __device__ inline T* idx(T *ptr, const int2 coord) { // naive row-major coord default
+    __device__ inline T* idx(T *ptr, const int2 coord)  const { // naive row-major coord default
         int r = coord.x+row_offset, c = coord.y+col_offset; // alias
         static constexpr int swizzle_repeat = swizzle_bytes * 8;
         static constexpr int subtile_cols   = swizzle_bytes / sizeof(T);

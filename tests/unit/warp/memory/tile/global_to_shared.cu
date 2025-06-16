@@ -99,8 +99,5 @@ void warp::memory::tile::global_to_shared::tests(test_data &results) {
     g2s_sweep_gmem_type_2d_warp<st_load_store, SIZE, SIZE, I2_t>::run(results);
     g2s_sweep_gmem_type_2d_warp<st_load_store, SIZE, SIZE, I1_t>::run(results);
     g2s_sweep_gmem_type_2d_warp<st_load_store, SIZE, SIZE, I0_t>::run(results);
-    // g2s_sweep_gmem_type_2d_warp<st_load_store_async, SIZE, SIZE, I2_t>::run(results);
-    // g2s_sweep_gmem_type_2d_warp<st_load_store_async, SIZE, SIZE, I1_t>::run(results);
-    // g2s_sweep_gmem_type_2d_warp<st_load_store_async, SIZE, SIZE, I0_t>::run(results);
 }
 #endif

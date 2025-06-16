@@ -13,15 +13,6 @@ void warp::memory::vec::tests(test_data &results) {
 #ifdef TEST_WARP_MEMORY_VEC_SHARED_TO_REGISTER
     warp::memory::vec::shared_to_register::tests(results);
 #endif
-#ifdef TEST_WARP_MEMORY_VEC_TMA
-    warp::memory::vec::tma::tests(results);
-#endif
-#ifdef TEST_WARP_MEMORY_VEC_TMA_MULTICAST
-    warp::memory::vec::tma_multicast::tests(results);
-#endif
-#ifdef TEST_WARP_MEMORY_VEC_DSMEM
-    warp::memory::vec::dsmem::tests(results);
-#endif
 }
 
 #endif

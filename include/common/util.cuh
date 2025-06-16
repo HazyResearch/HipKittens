@@ -68,7 +68,7 @@ __device__ __forceinline__ int warpgroupid() { return threadIdx.x >> 8; }
 __device__ __forceinline__ int laneid() { return threadIdx.x & 0x3f; }
 
 
-constexpr int MAX_SHARED_MEMORY = 32768;
+constexpr int MAX_SHARED_MEMORY = 65536; 
 
 /* ----------  TYPE HELPERS  ---------- */
 

@@ -6,7 +6,6 @@
 
 #include "memory/memory.cuh"
 #include "shared/shared.cuh"
-#include "wgmma/wgmma.cuh"
 
 namespace group {
 

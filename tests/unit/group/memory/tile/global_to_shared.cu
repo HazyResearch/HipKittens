@@ -83,37 +83,6 @@ struct group_shared_load_store {
         }
     }
 };
-template<typename T>
-struct group_shared_load_store_async {
-    using dtype = T;
-    template<int H, int W, int NW, typename axis> using valid = std::bool_constant<
-        (H%NW==0 && H*W<=64) && (!(sizeof(T) == 1) || W%2 == 0)
-    >;
-    static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "group_shared_loadstore_async_gmem=bf16" :
-                                                      std::is_same_v<T, kittens::half> ? "group_shared_loadstore_async_gmem=half" :
-                                                                                         "group_shared_loadstore_async_gmem=float";
-    template<int H, int W, int NW, gl_t GL, typename axis> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
-        o_ref = i_ref; // overwrite the whole thing
-    }
-    template<int H, int W, int NW, gl_t GL, typename axis> __device__ static void device_func(const GL &input, const GL &output) {
-        using G = kittens::group<NW>;
-        extern __shared__ kittens::alignment_dummy __shm[]; // this is the CUDA shared memory
-        kittens::shared_allocator<16> al((int*)&__shm[0]);
-        using ST = kittens::st<dtype, 16*H, 16*W>;
-        ST &shared_tile = al.allocate<ST>();
-        int num_batches = axis::value==0?((int)input.batch/shared_tile.rows):(int)input.batch;
-        int num_depths = axis::value==1?((int)input.depth/shared_tile.rows):(int)input.depth;
-        int num_rows = axis::value==2?((int)input.rows/shared_tile.rows):(int)input.rows;
-        for(int i = 0; i < num_batches; i++)
-            for(int j = 0; j < num_depths; j++)
-                for(int k = 0; k < num_rows; k++)
-                    for(int l = 0; l < (input.cols/shared_tile.cols); l++) {
-            G::template load_async<axis::value, false, ST, GL>(shared_tile, input, {i, j, k, l});
-            G::load_async_wait(0);
-            G::template store<axis::value, false, ST, GL>(output, shared_tile, {i, j, k, l});
-        }
-    }
-};
 
 using I0_t = std::integral_constant<int, 0>;
 using I1_t = std::integral_constant<int, 1>;
@@ -128,23 +97,14 @@ void group::memory::tile::global_to_shared::tests(test_data &results) {
     g2s_sweep_gmem_type_2d<group_shared_load_store, SIZE, SIZE, 2, I0_t>::run(results);
     g2s_sweep_gmem_type_2d<group_shared_load_store, SIZE, SIZE, 4, I0_t>::run(results);
     g2s_sweep_gmem_type_2d<group_shared_load_store, SIZE, 4, 12, I0_t>::run(results);
-    // g2s_sweep_gmem_type_2d<group_shared_load_store_async, SIZE, SIZE, 2, I0_t>::run(results);
-    // g2s_sweep_gmem_type_2d<group_shared_load_store_async, SIZE, SIZE, 4, I0_t>::run(results);
-    // g2s_sweep_gmem_type_2d<group_shared_load_store_async, SIZE, 4, 12, I0_t>::run(results);
 
     g2s_sweep_gmem_type_2d<group_shared_load_store, SIZE, SIZE, 2, I1_t>::run(results);
     g2s_sweep_gmem_type_2d<group_shared_load_store, SIZE, SIZE, 4, I1_t>::run(results);
     g2s_sweep_gmem_type_2d<group_shared_load_store, SIZE, 4, 12, I1_t>::run(results);
-    // g2s_sweep_gmem_type_2d<group_shared_load_store_async, SIZE, SIZE, 2, I1_t>::run(results);
-    // g2s_sweep_gmem_type_2d<group_shared_load_store_async, SIZE, SIZE, 4, I1_t>::run(results);
-    // g2s_sweep_gmem_type_2d<group_shared_load_store_async, SIZE, 4, 12, I1_t>::run(results);
 
     g2s_sweep_gmem_type_2d<group_shared_load_store, SIZE, SIZE, 2, I2_t>::run(results);
     g2s_sweep_gmem_type_2d<group_shared_load_store, SIZE, SIZE, 4, I2_t>::run(results);
     g2s_sweep_gmem_type_2d<group_shared_load_store, SIZE, 4, 12, I2_t>::run(results);
-    // g2s_sweep_gmem_type_2d<group_shared_load_store_async, SIZE, SIZE, 2, I2_t>::run(results);
-    // g2s_sweep_gmem_type_2d<group_shared_load_store_async, SIZE, SIZE, 4, I2_t>::run(results);
-    // g2s_sweep_gmem_type_2d<group_shared_load_store_async, SIZE, 4, 12, I2_t>::run(results);
 }
 
 #endif
