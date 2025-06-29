@@ -44,12 +44,13 @@ void micro_tk(const micro_globals g) {
     for (int i = 0; i < 8; i++) { zero(C_accum[i]); }
 
     // Reduced buffer size to minimize register pressure
-    constexpr int BUFFER_SIZE = 128; 
+    constexpr int BUFFER_SIZE = 256; 
     float4 a_buffer_next[BUFFER_SIZE];
     float4 b_buffer_next[BUFFER_SIZE];
 
     const int row = blockIdx.y;
     const int col = blockIdx.x;
+
 
     const int warp_id = kittens::warpid();
     const int warp_row = warp_id / 2;
@@ -69,8 +70,7 @@ void micro_tk(const micro_globals g) {
 
         const int next_k_offset = tile * num_shared_slices  + 1;
         const bool should_load = (tile != num_tiles - 1);
-        rt_bf<REG_BLOCK, DOT_SLICE> a_reg_0, a_reg_1;
-        rt_bf<REG_BLOCK, DOT_SLICE> b_reg_0, b_reg_1, b_reg_2, b_reg_3;
+        
         
         // Compute on CURRENT data in shared memory with optimized MMA scheduling
         #pragma unroll 
@@ -78,6 +78,9 @@ void micro_tk(const micro_globals g) {
             if (slice == 0 && wavegroup == 0) {
                 asm volatile("s_barrier");
             }
+
+            rt_bf<REG_BLOCK, DOT_SLICE> a_reg_0, a_reg_1;
+            rt_bf<REG_BLOCK, DOT_SLICE> b_reg_0, b_reg_1, b_reg_2, b_reg_3;
 
             if (slice == 0 && should_load) {
                 load_global_to_registers<2, false, st_bf<BLOCK_SIZE, DOT_SLICE_SHARED>, _gl_A, coord<st_bf<BLOCK_SIZE, DOT_SLICE_SHARED>>, NUM_THREADS>(
@@ -87,6 +90,7 @@ void micro_tk(const micro_globals g) {
                 load_global_to_registers<2, false, st_bf<BLOCK_SIZE, DOT_SLICE_SHARED>, _gl_B, coord<st_bf<BLOCK_SIZE, DOT_SLICE_SHARED>>, NUM_THREADS>(
                 b_buffer_next, BUFFER_SIZE, g.b, {0, 0, col, next_k_offset}, Bs);
             }
+
             load_async_shared_to_register(a_reg_0, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row, slice}));
             asm volatile("s_waitcnt lgkmcnt(0)\n");
             load_async_shared_to_register(a_reg_1, subtile_inplace<REG_BLOCK, DOT_SLICE>(As, {warp_row + 4, slice}));
@@ -122,7 +126,6 @@ void micro_tk(const micro_globals g) {
                 a_buffer_next, As);
             store_registers_to_shared<st_bf<BLOCK_SIZE, DOT_SLICE_SHARED>, NUM_THREADS>(
                 b_buffer_next, Bs);
-            asm volatile("s_barrier"); 
         }
     }
 
