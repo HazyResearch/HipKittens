@@ -2,6 +2,29 @@
 #include "pyutils/pyutils.cuh"
 using namespace kittens;
 
+// Maps a 1D (workgroup) tile index to a 2D spatial tiling for better L2 reuse.
+// The returned index is a new 1D tile index.
+// `l1_y_dim` is the height of the grid (in L1/WG tiles). This can usually just be gridDim.y.
+// `l1_x_dim` is the width of the grid (in L1/WG tiles). This can usually just be gridDim.x
+// `l2_y_dim` is the height (in L1/WG tiles) of the L2 tiles to construct.
+// `l2_x_dim` is the width (in L1/WG tiles) of the L2 tiles to construct.
+// NOTE: This expects l1_{x,y}_dim to be evenly divisible by l2_{x,y}_dim
+//       e.g the output grid can be evenly divided by L2 tiles.
+__device__ inline int swizzle_l2_tile(int idx, int l1_y_dim, int l1_x_dim, int l2_y_dim, int l2_x_dim) {
+	// WG tile indices within L2 tile.
+    const int l2_x_idx = idx % l2_x_dim;  
+	int cumulative_denominator = l2_x_dim;
+    const int l2_y_idx = (idx / cumulative_denominator) % l2_y_dim;
+    cumulative_denominator *= l2_y_dim;
+
+	// L2 tile indices within grid.
+	const int temporal_x = (idx / cumulative_denominator) % (l1_x_dim / l2_x_dim);
+    cumulative_denominator *= (l1_x_dim / l2_x_dim);
+    const int temporal_y = (idx / cumulative_denominator) % (l1_y_dim / l2_y_dim);
+
+	return (temporal_y * l2_y_dim + l2_y_idx) * l1_x_dim + (temporal_x * l2_x_dim + l2_x_idx);
+}
+
 __device__ inline int swizzle_chiplet(int idx, int num_workgroups, int num_xcds = 8) {
     return (idx % num_xcds) * (num_workgroups / num_xcds) + (idx / num_xcds);
 }
