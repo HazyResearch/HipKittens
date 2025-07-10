@@ -207,7 +207,8 @@ __device__ inline static void load_async_shared_to_register(RT &dst, const ST &s
                     dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(loaded1);
                 } else {
                     // handle fp16 and bf16
-                    float2 loaded = load_shared_vec_async_offset(addr, i * RT::cols * RT::tile_size_row * sizeof(U2));
+                    // float2 loaded = load_shared_vec_async_offset(addr, i * RT::cols * RT::tile_size_row * sizeof(U2));
+                    float2 loaded = load_shared_vec_async(src.idx(src_ptr, {row, col}));
                     U2* tmp = reinterpret_cast<U2*>(&loaded);
                     dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(tmp[0]);
                     dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(tmp[1]);
