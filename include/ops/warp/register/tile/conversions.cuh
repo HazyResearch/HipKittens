@@ -133,8 +133,6 @@ __device__ inline void transpose(rt_base<T, layout> &dst, const rt_base<T, layou
     int block_src_trans = 16*((lane%16)/4) + 4*(lane/16);
     int block_offset = lane%4;
 
-    // printf("lane: %d, block_src_trans: %d, block_offset: %d\n", lane, block_src_trans, block_offset);
-
     T src_tmp[4] = {
         src.data[0].x, src.data[0].y,
         src.data[1].x, src.data[1].y
