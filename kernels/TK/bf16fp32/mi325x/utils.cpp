@@ -145,6 +145,18 @@ __device__ inline float2 load_shared_vec_async_offset(uint32_t lds_off, uint32_t
     return result;
 }
 
+__device__ inline float2 load_shared_vec_sync_offset(uint32_t lds_off, uint32_t offset) {
+    float2 result;
+    asm volatile(
+        "ds_read_b64 %0, %1 offset:%2\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        : "=v"(result)              // Output: store result in float2
+        : "v"(lds_off), "i"(offset)              // Input: LDS offset to read from
+        : "memory"
+    );
+    return result;
+}
+
 __device__ inline float2 load_shared_vec_async(uint32_t lds_off) {
     float2 result;
     asm volatile(
@@ -207,6 +219,61 @@ __device__ inline static void load_async_shared_to_register(RT &dst, const ST &s
                 } else {
                     // handle fp16 and bf16
                     float2 loaded = load_shared_vec_async_offset(addr, i * ST::underlying_cols * kittens::TILE_ROW_DIM<U> * sizeof(U));
+                    U2* tmp = reinterpret_cast<U2*>(&loaded);
+                    dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(tmp[0]);
+                    dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(tmp[1]);
+                }
+            }
+            else { // handle the column-major layout
+                dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(U2{src[{row, col}], src[{row+1, col}]});
+                dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(U2{src[{row+2, col}], src[{row+3, col}]});
+            }
+        }
+    }
+}
+
+template<ducks::rt::all RT, ducks::st::all ST>
+__device__ inline static void load_sync_shared_to_register(RT &dst, const ST &src) {
+
+    static_assert(RT::height == ST::height, "register tile and shared tile must match height");
+    static_assert(RT::width  == ST::width,  "register tile and shared tile must match width");
+
+    using T2 = RT::dtype;
+    using T  = base_types::packing<T2>::unpacked_type;
+    using U  = ST::dtype;
+    using U2 = base_types::packing<U >::packed_type;
+
+    const int laneid = kittens::laneid();
+    const uint32_t src_ptr = reinterpret_cast<uintptr_t>(&src.data[0]);
+
+    int row_offset, col_offset;
+    if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {
+        row_offset = laneid%16;
+        col_offset = 4*(laneid/16);
+    }
+    else {
+        row_offset = 4*(laneid/16);
+        col_offset = laneid%16;
+    }
+
+    #pragma unroll
+    for(int j = 0; j < dst.width; j++) {
+        const int col = j*dst.tile_size_col + col_offset;
+        uint32_t addr = src.idx(src_ptr, {row_offset, col});
+        #pragma unroll
+        for(int i = 0; i < dst.height; i++) {
+            const int row = i*dst.tile_size_row + row_offset;
+
+            if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) { // handle the row-major layout
+                if constexpr (sizeof(typename ST::dtype) == 4) {
+                    // handle float32
+                    float2 loaded0 = load_shared_vec_async(src.idx(src_ptr, {row, col}));
+                    float2 loaded1 = load_shared_vec_async(src.idx(src_ptr, {row, col+2}));
+                    dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(loaded0);
+                    dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(loaded1);
+                } else {
+                    // handle fp16 and bf16
+                    float2 loaded = load_shared_vec_sync_offset(addr, i * ST::underlying_cols * kittens::TILE_ROW_DIM<U> * sizeof(U));
                     U2* tmp = reinterpret_cast<U2*>(&loaded);
                     dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(tmp[0]);
                     dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(tmp[1]);
