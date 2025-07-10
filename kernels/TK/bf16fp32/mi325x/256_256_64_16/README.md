@@ -1,7 +1,7 @@
 ```
 root@gpu-10:/workdir/AMD-benchmarking-harness/kernels/TK/bf16fp32/mi325x/256_256_64_16# make
 /opt/rocm/bin/hipcc 256_256_64_16.cpp -DKITTENS_CDNA3 --offload-arch=gfx942 -std=c++20 -w --save-temps -I/workdir/AMD-benchmarking-harness/ThunderKittens-HIP/include -I/workdir/AMD-benchmarking-harness/ThunderKittens-HIP/prototype -I/opt/conda/envs/py_3.12/include/python3.12 -I/opt/conda/envs/py_3.12/lib/python3.12/site-packages/pybind11/include -L/opt/conda/envs/py_3.12/lib/python3.12/config-3.12-x86_64-linux-gnu -L/opt/conda/envs/py_3.12/lib  -lpthread -ldl  -lutil -lm  -shared -fPIC -Rpass-analysis=kernel-resource-usage -I/workdir/AMD-benchmarking-harness/ThunderKittens-HIP/include -I/opt/rocm/include/hip  \
-    -o tk_kernel.cpython-312-x86_64-linux-gnu.so 2>&1 | tee /shared/amdgpu/home/tech_ops_amd_xqh/simran/data_logs/0710_1840_outputs/make_build.log
+    -o tk_kernel.cpython-312-x86_64-linux-gnu.so 2>&1 | tee /shared/amdgpu/home/tech_ops_amd_xqh/simran/data_logs/0710_2149_outputs/make_build.log
 remark: 256_256_64_16.cpp:38:0: Function Name: _Z8micro_tk13micro_globals [-Rpass-analysis=kernel-resource-usage]
 remark: 256_256_64_16.cpp:38:0:     SGPRs: 32 [-Rpass-analysis=kernel-resource-usage]
 remark: 256_256_64_16.cpp:38:0:     VGPRs: 250 [-Rpass-analysis=kernel-resource-usage]
@@ -16,12 +16,12 @@ root@gpu-10:/workdir/AMD-benchmarking-harness/kernels/TK/bf16fp32/mi325x/256_256
 src: 256_256_64_16.cpp
 Warning: tk_kernel.cpython-313-x86_64-linux-gnu.so not found at /workdir/AMD-benchmarking-harness/kernels/TK/bf16fp32/mi325x/256_256_64_16/tk_kernel.cpython-313-x86_64-linux-gnu.so, skipping.
 C_ref.dtype=torch.bfloat16
-PyTorch reference average execution time: 1.3758 ms
-PyTorch reference performance: 799.18 TFLOPS for 8192x8192 matrix multiplication.
+PyTorch reference average execution time: 1.3736 ms
+PyTorch reference performance: 800.44 TFLOPS for 8192x8192 matrix multiplication.
 
 C.dtype=torch.bfloat16
-Average execution time: 1.5597 ms
-Performance: 704.93 TFLOPS for 8192x8192 matrix multiplication.
+Average execution time: 1.4844 ms
+Performance: 740.72 TFLOPS for 8192x8192 matrix multiplication.
 
 Max error between kernel and reference: 0.03125
 Max error: 0.03125
