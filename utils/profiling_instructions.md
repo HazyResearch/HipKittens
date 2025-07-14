@@ -1,6 +1,9 @@
+
 ## ROCProfiler
 
-One-time setup:
+This is a profiler that we've used to observe statistics like bank conflicts, cache usage, pipeline utilization statistics, etc. 
+
+One-time setup depending on the machine that you are using:
 ```bash
 sudo locale-gen en_US.UTF-8
 sudo update-locale LANG=en_US.UTF-8
@@ -14,21 +17,26 @@ localedef -i en_US -f UTF-8 en_US.UTF-8 || true
 
 Installation:
 ```bash
-ROCProfiler
-`sudo apt install rocprofiler-compute`
+sudo apt install rocprofiler-compute
 pip install -r /opt/rocm-6.4.1/libexec/rocprofiler-compute/requirements.txt
 apt-get install locales
 locale-gen en_US.UTF-8
 
+# collect profile
 rocprof-compute profile -n transpose_matmul --no-roof -- python test_python.py
-rocprof-compute profile -n transpose_matmul --no-roof -- /shared/amdgpu/home/tech_ops_amd_xqh/simran/miniconda3/bin/python test_python.py
 
-LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 rocprof-compute analyze -p ./ --gui
+# view statistics
 rocprof-compute analyze -p workloads/transpose_matmul/MI300/ --gui
 ```
 
+Potential failure mode:
+- If you see an error with ```run_server``` being an invalid function, then edit the problematic file to use ```run()```.
+
 
 ## ROCProfiler V3
+
+This profiler lets you see finer grained execution traces from your program. 
+
 
 ```bash
 mkdir -p rocprofiler-setup
@@ -78,6 +86,8 @@ Check detailed information about what is going wrong.
 
 ## Commands
 
+Use these commands to collect traces for your kernel. This will produce a new trace directory for every kernel called inside of ```test_python.py```.
+
 On MI325:
 ```bash
 rocprofv3 --att=true \
@@ -87,7 +97,7 @@ rocprofv3 --att=true \
 ```
 
 On MI350:
-```
+```bash
 rocprofv3 --att=true \
           --att-library-path /opt/rocm/lib \
           -d transpose_matmul \
@@ -97,8 +107,20 @@ rocprofv3 --att=true \
 
 ## Inspect results
 
-Clone below and build from source:
+Next we want to be able to visualize the trace. Clone below and build from source on your local filesystem:
 
-https://github.com/ROCm/rocprof-compute-viewer
+```bash
+git clone https://github.com/ROCm/rocprof-compute-viewer
+cd rocprof-compute-viewer/
 
+# on your local mac computer (for other platforms: https://github.com/ROCm/rocprof-compute-viewer?tab=readme-ov-file#building-from-source)
+brew install qt@6
+mkdir build
+cd build
+cmake .. -DCMAKE_PREFIX_PATH=$(brew --prefix qt@6)
+```
+
+Take the output folder produced in ```transpose_matmul``` above, which corresponds to your desired kernel and download it to your local laptop filesystem. Then import it into the viewer. 
+
+Details on how to use the profiler once it's set up and your trace is loaded in can be found here: https://rocm.docs.amd.com/projects/rocprof-compute-viewer/en/latest/how-to/using_compute_viewer.html#using-compute-viewer. 
 
