@@ -26,16 +26,42 @@ namespace kittens {
 template<typename T, ducks::rt_layout::all layout>
 __device__ inline void swap_layout(rt_base<T, typename ducks::rt_layout::transpose<layout>::type> &dst, const rt_base<T, layout> &src) {
     int lane = laneid();
-    int block_src_trans = 16*((lane%16)/4) + 4*(lane/16);
-    int block_offset = lane%4;
 
+    #ifdef KITTENS_CDNA4
+    int block_src_trans = 32*((lane%16)/8) + 8*(lane/16); 
+    int block_offset = lane%8; 
+    #else
+    int block_src_trans = 16 * ((lane % 16) / 4) + 4 * (lane / 16);
+    int block_offset    = lane % 4;
+    #endif
+
+    #ifdef KITTENS_CDNA4
+    T src_tmp[8] = {
+        src.data[0].x, src.data[0].y,
+        src.data[1].x, src.data[1].y,
+        src.data[2].x, src.data[2].y,
+        src.data[3].x, src.data[3].y
+    };
+    #else
     T src_tmp[4] = {
         src.data[0].x, src.data[0].y,
         src.data[1].x, src.data[1].y
     };
+    #endif
 
+    #ifdef KITTENS_CDNA4
+    T dst_tmp[8];
+    #pragma unroll
+    for(int k = 0; k < 8; k++) {
+        if constexpr (std::is_same_v<T, bf16>) {
+            dst_tmp[block_offset^k] = __float2bfloat16(__shfl(__bfloat162float(src_tmp[block_offset^k]), block_src_trans + block_offset^k));
+        }
+        else {
+            dst_tmp[block_offset^k] = __shfl(src_tmp[block_offset^k], block_src_trans + block_offset^k);
+        }
+    }
+    #else
     T dst_tmp[4];
-
     #pragma unroll
     for(int k = 0; k < 4; k++) {
         if constexpr (std::is_same_v<T, bf16>) {
@@ -45,11 +71,19 @@ __device__ inline void swap_layout(rt_base<T, typename ducks::rt_layout::transpo
             dst_tmp[block_offset^k] = __shfl(src_tmp[block_offset^k], block_src_trans + block_offset^k);
         }
     }
+    #endif
 
     dst.data[0].x = dst_tmp[0];
     dst.data[0].y = dst_tmp[1];
     dst.data[1].x = dst_tmp[2];
     dst.data[1].y = dst_tmp[3];
+
+    #ifdef KITTENS_CDNA4
+    dst.data[2].x = dst_tmp[4];
+    dst.data[2].y = dst_tmp[5];
+    dst.data[3].x = dst_tmp[6];
+    dst.data[3].y = dst_tmp[7];
+    #endif
 }
 /**
  * @brief Swaps the layout of a register tile.
@@ -132,6 +166,10 @@ __device__ inline void transpose(rt_base<T, layout> &dst, const rt_base<T, layou
     int lane = laneid();
     int block_src_trans = 16*((lane%16)/4) + 4*(lane/16);
     int block_offset = lane%4;
+
+    #ifdef KITTENS_CDNA4
+    static_assert(0, "transpose is not supported on CDNA4");
+    #endif
 
     T src_tmp[4] = {
         src.data[0].x, src.data[0].y,
