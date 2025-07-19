@@ -56,8 +56,13 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
         "rt_base was provided an unsupported type."
     );
 
+    #ifdef KITTENS_CDNA4
+    static constexpr int tile_size_row        = std::is_same_v<layout, ducks::rt_layout::accumulator> ? kittens::ACCUMULATOR_TILE_ROW_DIM<T> : kittens::TILE_ROW_DIM<T>; // < Tile size is a constant 16 for everyone
+    static constexpr int tile_size_col        = std::is_same_v<layout, ducks::rt_layout::accumulator> ? kittens::ACCUMULATOR_TILE_COL_DIM<T> : kittens::TILE_COL_DIM<T>;
+    #else
     static constexpr int tile_size_row        = kittens::TILE_ROW_DIM<T>; // < Tile size is a constant 16 for everyone
     static constexpr int tile_size_col        = kittens::TILE_COL_DIM<T>;
+    #endif
     static constexpr int rows                 = tile_size_row; ///< Number of rows.
     static constexpr int cols                 = tile_size_col; ///< Number of cols.
     static constexpr int num_elements         = rows*cols; // 256

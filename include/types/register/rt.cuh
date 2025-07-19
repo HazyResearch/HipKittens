@@ -114,6 +114,12 @@ concept row_layout = all<T> && std::is_same_v<typename T::layout, ducks::rt_layo
 template<typename T>
 concept col_layout = all<T> && std::is_same_v<typename T::layout, ducks::rt_layout::col>;
 
+#ifdef KITTENS_CDNA4
+template<typename T>
+concept accumulator_layout = all<T> && std::is_same_v<typename T::layout, ducks::rt_layout::accumulator>;
+#endif
+
+
 } // namespace rt
 } // namespace ducks
 
