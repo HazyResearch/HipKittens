@@ -23,18 +23,17 @@ B = torch.randn(ROWS, COLS, dtype=torch.bfloat16, device='cuda') / 10.0
 Bt = B.t().contiguous()
 
 C = torch.zeros(ROWS, ROWS, dtype=torch.bfloat16, device='cuda')
-D = torch.zeros(ROWS, ROWS, dtype=torch.bfloat16, device='cuda')
 
-tk_kernel.dispatch_micro(A, B, C, D)
+tk_kernel.dispatch_micro(A, B, C)
 
-D_ref = torch.matmul(A.float(), Bt.float()).float() + C.float()
+C_ref = torch.matmul(A.float(), Bt.float()).float()
 
 print("Out")
-print(D[0:16, 0:8])
+print(C[0:16, 0:8])
 print("Ref")
-print(D_ref[0:16, 0:8])
+print(C_ref[0:16, 0:8])
 
-diff = D.float() - D_ref.float()
+diff = C.float() - C_ref.float()
 # print(f"diff[0:4]")
 # print(diff[0:4])
 

@@ -31,9 +31,8 @@ void micro_tk(const micro_globals g) {
     st_bf<BLOCK_SIZE_ROWS, BLOCK_SIZE_COLS> (&A) = al.allocate<st_bf<BLOCK_SIZE_ROWS, BLOCK_SIZE_COLS>>();
     st_bf<BLOCK_SIZE_ROWS, BLOCK_SIZE_COLS> (&B) = al.allocate<st_bf<BLOCK_SIZE_ROWS, BLOCK_SIZE_COLS>>();
 
-
     rt_bf<BLOCK_SIZE_ROWS, BLOCK_SIZE_COLS> A_tile, B_tile;
-    rt_fl<BLOCK_SIZE_ROWS, BLOCK_SIZE_ROWS, ducks::rt_layout::col> C_accum;
+    rt_fl<BLOCK_SIZE_ROWS, BLOCK_SIZE_ROWS, ducks::rt_layout::accumulator> C_accum;
     zero(C_accum);
 
     // global to shared
