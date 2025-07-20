@@ -246,31 +246,37 @@ __device__ inline void load_global_to_shared_direct(
     const GL& src, const COORD& idx, ST& dst)
 {
     using T = typename ST::dtype;
-    constexpr int vec_len = 16 / sizeof(T);  // e.g., 8 for bf16, 4 for fp32
-    constexpr int vecs_per_row = ST::cols / vec_len; 
-    constexpr int total_vecs = ST::rows * vecs_per_row;
+    constexpr int bytes_per_thread = 16;
+    constexpr int bytes_per_memcpy = 16 * N_THREADS;
+    constexpr int memcpy_per_tile = ST::rows * ST::cols * sizeof(T) / bytes_per_memcpy;
+    
+    constexpr int elem_per_thread = bytes_per_thread / sizeof(T);  // e.g., 8 for bf16, 4 for fp32
+    constexpr int elem_per_warp = elem_per_thread * kittens::WARP_THREADS;
+    constexpr int threads_per_row = ST::cols / elem_per_thread; 
 
     const int row_stride = src.template stride<axis>();
     coord<> unit_coord = idx.template unit_coord<axis, 3>();
     T* global_ptr = (T*)&src[unit_coord];
     i32x4 srsrc = make_srsrc(global_ptr, row_stride * ST::rows * sizeof(T));
 
+    uint32_t dst_ptr = reinterpret_cast<uintptr_t>(&dst.data[0]);
     int thread_id = threadIdx.x % N_THREADS;
-
-    const int swizzle_bytes = ST::swizzle_bytes;
-    static constexpr int swizzle_repeat = swizzle_bytes << 4; // 8 threads max out the banks
+    int warp_id = kittens::warpid();
 
     #pragma unroll
-    for (int i = thread_id; i < total_vecs; i += N_THREADS) {
-        const int row = i / vecs_per_row;
-        const int col = (i % vecs_per_row) * vec_len;
-        const int global_elem_offset = (row * row_stride + col) * sizeof(T);
+    for (int i = 0; i < memcpy_per_tile; i++) {
+        const int row_in_lds = (i * N_THREADS + thread_id) / threads_per_row;
+        const int col_in_lds = ((i * N_THREADS + thread_id) % threads_per_row) * elem_per_thread;
+        const int addr_in_lds = dst.idx(dst_ptr, {row_in_lds, col_in_lds});
 
-        const int swizzle = ((global_elem_offset % swizzle_repeat) >> 8) << 4;
-        const int final_global_elem_offset = (global_elem_offset ^ swizzle);
+        const int offset_in_lds = addr_in_lds - dst_ptr;
+        const int swizzled_row_in_lds = (offset_in_lds / sizeof(T)) / ST::cols;
+        const int swizzled_col_in_lds = (offset_in_lds / sizeof(T)) % ST::cols;
+
+        const int offset_in_global = (swizzled_row_in_lds * row_stride + swizzled_col_in_lds) * sizeof(T);
 
         const T* lds_base = &dst.data[0];
-        const T* lds_elem_ptr = lds_base + row * ST::cols + col;
+        const T* lds_elem_ptr = lds_base + (i * N_THREADS * elem_per_thread) + (warp_id * elem_per_warp);
         uintptr_t lds_addr = reinterpret_cast<uintptr_t>(lds_elem_ptr);
         as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
 
@@ -278,7 +284,7 @@ __device__ inline void load_global_to_shared_direct(
             srsrc, // buffer resource
             lds_ptr,
             16, // 16 bytes
-            final_global_elem_offset,
+            offset_in_global,
             0, 
             0, // instruction offset
             static_cast<index_t>(coherency::cache_all)); // cache coherency
