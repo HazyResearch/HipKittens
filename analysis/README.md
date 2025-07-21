@@ -6,17 +6,19 @@
 
 Mi300x:
 <div align="center" >
-    <img src="bf16_gemm/mi300x_bf16_gemm_plot.png" height=400 alt="mi300x" style="margin-bottom:px"/>
+    <img src="mi300x_bf16_gemm_plot.png" height=400 alt="mi300x" style="margin-bottom:px"/>
 </div>
 
 
 Mi325x:
 <div align="center" >
-    <img src="bf16_gemm/mi325x_bf16_gemm_plot.png" height=400 alt="mi300x" style="margin-bottom:px"/> 
+    <img src="mi325x_bf16_gemm_plot.png" height=400 alt="mi300x" style="margin-bottom:px"/> 
 </div>
 
 Mi350x:
-TODO.
+<div align="center" >
+    <img src="mi350x_bf16_gemm_plot.png" height=400 alt="mi300x" style="margin-bottom:px"/> 
+</div>
 
 
 ### Attention
