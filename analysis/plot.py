@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-for device in ['mi300x', 'mi325x']:
+for device in ['mi300x', 'mi325x', 'mi350x']:
 
     # Read data
     try:
