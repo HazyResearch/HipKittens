@@ -5,7 +5,7 @@ constexpr int ATTN_B = 16; // batch size
 constexpr int ATTN_H = 16; // number of heads
 constexpr int ATTN_N = 1024; // sequence length
 constexpr int ATTN_D = 64; // dimension
-constexpr int BLOCK_SIZE = 16; // block size
+constexpr int BLOCK_SIZE = 32; // block size
 
 #define NUM_WARPS 1
 #define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
@@ -17,23 +17,23 @@ Flash Attention: (B = H = 1)
 Input: Q (B, H, N, D), K (B, H, N, D), V (B, H, N, D)
 Output: O (B, H, N, D)
 
-Each warp is responsible for a 16x64 tile of the output. i.e. Given an output of (1024, 64), there are 1024*64/16/64 = 64 tiles.
+Each warp is responsible for a 32x64 tile of the output. i.e. Given an output of (1024, 64), there are 1024*64/32/64 = 32 tiles.
 
-1. Set block sizes Bc = Br = 16
+1. Set block sizes Bc = Br = 32
 2. Initialize O = (o) (B, H, N, D), L = (0) (B, H, N), m = (-inf) (B, H, N) in HBM
-3. Divide Q into N/16 = 1024/16 = 64 tiles of 16x64 each. Divide K, V into N/16 = 1024/16 = 64 tiles of 16x64 each.
-4. Divide O into 64 tiles of 16x64 each. Divide L into 64 vectors of 16 elements each, divide m into 64 vectors of 16 elements each.
+3. Divide Q into N/32 = 1024/32 = 32 tiles of 32x64 each. Divide K, V into N/32 = 1024/32 = 32 tiles of 32x64 each.
+4. Divide O into 32 tiles of 32x64 each. Divide L into 32 vectors of 32 elements each, divide m into 32 vectors of 32 elements each.
 
 5. Given i = blockIdx.x, load Q_i from global to registers. Set O_i = 0, l_i = 0, m_i = -inf.
-6. For 1 <= j <= 64 do
-7.     Load K_j, V_j from global to registers (16x64)
-8.     Compute S_ij = Q_i @ K_j.T (16x16)
-9.     Compute m'_ij = row_max(S_ij) (16x1)
-10.            p'_ij = exp(S_ij - m'_ij) (16x16)
-11.            l'_ij = row_sum(p'_ij) (16x1)
-12.    Compute m_i_new = max(m_i, m'_ij) (16x1)
-13.            l_i_new = exp(m_i - m_i_new) * l_i + exp(m'_ij - m_i_new) * l'_ij (16x1)
-14.    O_i = diag(l_i_new)^-1 @ (diag(l_i) @ exp(m_i - m_i_new) * O_i + exp(m'_ij - m_i_new) * P'_ij @ V_j) (16x64)
+6. For 1 <= j <= 32 do
+7.     Load K_j, V_j from global to registers (32x64)
+8.     Compute S_ij = Q_i @ K_j.T (32x32)
+9.     Compute m'_ij = row_max(S_ij) (32x1)
+10.            p'_ij = exp(S_ij - m'_ij) (32x32)
+11.            l'_ij = row_sum(p'_ij) (32x1)
+12.    Compute m_i_new = max(m_i, m'_ij) (32x1)
+13.            l_i_new = exp(m_i - m_i_new) * l_i + exp(m'_ij - m_i_new) * l'_ij (32x1)
+14.    O_i = diag(l_i_new)^-1 @ (diag(l_i) @ exp(m_i - m_i_new) * O_i + exp(m'_ij - m_i_new) * P'_ij @ V_j) (32x64)
 15.    l_i = l_i_new, m_i = m_i_new
 16. Store O_i back to global memory.
 */
@@ -62,10 +62,12 @@ __global__ void attend_ker(const attn_globals<D> g) {
     qkvo_tile<D, bf16> q_reg, k_reg; // Q and K are both row layout, as we use mma_ABt.
     qkvo_tile<D, bf16, col_l> v_reg; // V is column layout, as we use mma_AB.
     qkvo_tile<D, float, col_l> o_reg; // Output tile.
-    qkvo_tile<D, float, col_l> o_reg_next; // attention tile, in float, for the mma_AB.
-    attn_tile<D, float, col_l> att_block; // attention tile, in float. (We want to use float wherever possible.)
-    attn_tile<D, bf16, col_l> att_block_bf16; // bf16 attention tile for the second mma_AB. We cast right before that op.
-    attn_tile<D, bf16> att_block_mma; // bf16 attention tile in row layout for the second mma_AB.
+    qkvo_tile<D, float, accum_l> o_reg_next; // attention tile, in float, for the mma_AB.
+    qkvo_tile<D, float, col_l> o_reg_next_col; // attention tile, in float, for the mma_AB.
+    attn_tile<D, float, accum_l> att_block; // attention tile, in float. (We want to use float wherever possible.)
+    attn_tile<D, float, col_l> att_block_col; 
+    attn_tile<D, bf16, col_l> att_block_col_bf16; // bf16 attention tile for the second mma_AB. We cast right before that op.
+    attn_tile<D, bf16, row_l> att_block_row_bf16; // bf16 attention tile in row layout for the second mma_AB.
     typename attn_tile<D, float, col_l>::col_vec max_vec_last, max_vec, max_vec_new, norm_vec_last, norm_vec, norm_vec_new; // these are column vectors for the online softmax.
 
     // 5. Given i = blockIdx.x, load Q_i from global to registers. Set O_i = 0, l_i = 0, m_i = -inf.
@@ -90,17 +92,18 @@ __global__ void attend_ker(const attn_globals<D> g) {
 
         // 8.     Compute S_ij = Q_i @ K_j.T (16x16)
         mma_ABt(att_block, q_reg, k_reg, att_block);
-        mul(att_block, att_block, scale_factor);
+        swap_layout(att_block_col, att_block);
+        mul(att_block_col, att_block_col, scale_factor);
 
         // 9.     Compute m'_ij = row_max(S_ij) (16x1)
-        row_max(max_vec, att_block);
+        row_max(max_vec, att_block_col);
 
         // 10.            p'_ij = exp(S_ij - m'_ij) (16x16)
-        sub_row(att_block, att_block, max_vec);
-        exp(att_block, att_block);
+        sub_row(att_block_col, att_block_col, max_vec);
+        exp(att_block_col, att_block_col);
 
         // 11.            l'_ij = row_sum(p'_ij) (16x1)
-        row_sum(norm_vec, att_block);
+        row_sum(norm_vec, att_block_col);
 
         // 12.    Compute m_i_new = max(m_i, m'_ij) (16x1)
         max(max_vec_new, max_vec_last, max_vec);
@@ -118,11 +121,12 @@ __global__ void attend_ker(const attn_globals<D> g) {
 
         // 14.    O_i = exp(m_i - m_i_new) @ O_i + exp(m'_ij - m_i_new) * P'_ij @ V_j (16x64)
         mul_row(o_reg, o_reg, max_vec_last);
-        copy(att_block_bf16, att_block);
-        swap_layout(att_block_mma, att_block_bf16);
-        mma_AB(o_reg_next, att_block_mma, v_reg, o_reg_next);
-        mul_row(o_reg_next, o_reg_next, max_vec);
-        add(o_reg, o_reg, o_reg_next);
+        copy(att_block_col_bf16, att_block_col);
+        swap_layout(att_block_row_bf16, att_block_col_bf16);
+        mma_AB(o_reg_next, att_block_row_bf16, v_reg, o_reg_next);
+        swap_layout(o_reg_next_col, o_reg_next);
+        mul_row(o_reg_next_col, o_reg_next_col, max_vec);
+        add(o_reg, o_reg, o_reg_next_col);
 
         // 15.    l_i = l_i_new, m_i = m_i_new
         copy(max_vec_last, max_vec_new);
@@ -134,7 +138,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
 
     // 17. Store O_i back to global memory.
     store(g.Og, o_reg, {batch_idx, head_idx, tile_idx, 0});
-
 }
 
 template<int D>
