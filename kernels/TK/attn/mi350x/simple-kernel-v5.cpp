@@ -1,16 +1,20 @@
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
+#include "utils.cpp"
+using namespace kittens;
 
 constexpr int ATTN_B = 16; // batch size
 constexpr int ATTN_H = 16; // number of heads
 constexpr int ATTN_N = 4096; // sequence length
 constexpr int ATTN_D = 64; // dimension
+constexpr int N_STEP = 128;
+constexpr int SUB_N_STEP = 32;
 constexpr int BLOCK_SIZE = 32; // block size
 
 #define NUM_WARPS 8
 #define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
 
-using namespace kittens;
+using _gl_QKVO = gl<bf16, -1, -1, -1, -1>;
 
 /*
 Flash Attention: (B = H = 1)
@@ -43,7 +47,7 @@ template<int D, typename T=float, typename L=row_l> using attn_tile = rt<T, BLOC
 
 template<int D> using global_layout = gl<bf16, -1, -1, -1, D>; // B, N, H, specified at runtime, D known at compile time for this kernel
 template<int D> struct attn_globals { 
-    gl<bf16, -1, -1, -1, D> Qg, Kg, Vg, Og; 
+    _gl_QKVO Qg, Kg, Vg, Og; 
     dim3 grid() { return dim3(ATTN_B, ATTN_H, ((ATTN_N / BLOCK_SIZE + NUM_WARPS - 1) / NUM_WARPS)); }
     dim3 block() { return dim3(NUM_THREADS); }
     size_t dynamic_shared_memory() { return MAX_SHARED_MEMORY - 32768; }
@@ -51,6 +55,11 @@ template<int D> struct attn_globals {
 
 template<int D> __launch_bounds__(NUM_THREADS, 0)
 __global__ void attend_ker(const attn_globals<D> g) {
+    
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    st_bf<N_STEP, ATTN_D> (&k_smem) = al.allocate<st_bf<N_STEP, ATTN_D>>();
+    st_bf<N_STEP, ATTN_D> (&v_smem) = al.allocate<st_bf<N_STEP, ATTN_D>>();
     
     const int batch_idx = blockIdx.x;
     const int head_idx = blockIdx.y;
@@ -65,7 +74,8 @@ __global__ void attend_ker(const attn_globals<D> g) {
     qkvo_tile<D, float, accum_l> o_reg; // Output tile.
     qkvo_tile<D, float, accum_l> o_reg_next; // attention tile, in float, for the mma_AB.
     attn_tile<D, float, accum_l> att_block; // attention tile, in float. (We want to use float wherever possible.)
-    attn_tile<D, bf16, accum_l> att_block_bf16;
+    attn_tile<D, float> att_block_row;
+    attn_tile<D, bf16> att_block_row_bf16;
     typename attn_tile<D, float, accum_l>::col_vec max_vec_last, max_vec, max_vec_new, norm_vec_last, norm_vec, norm_vec_new; // these are column vectors for the online softmax.
 
     // 5. Given i = blockIdx.x, load Q_i from global to registers. Set O_i = 0, l_i = 0, m_i = -inf.
@@ -79,57 +89,70 @@ __global__ void attend_ker(const attn_globals<D> g) {
     load(q_reg, g.Qg, {batch_idx, head_idx, tile_idx, 0});
 
 
-    int num_tiles = ATTN_N / BLOCK_SIZE;
+    int num_tiles = ATTN_N / N_STEP;
+    int num_sub_tiles = N_STEP / SUB_N_STEP;
 
     // 6. For 1 <= j <= 64 do
     for (int j = 0; j < num_tiles; j++) {
-        // zero out the accumulators
-        zero(att_block);
-        zero(o_reg_next);
 
-        // 7. Load K_j, V_j from global to registers (16x64)
-        load(k_reg, g.Kg, {batch_idx, head_idx, j, 0});
-        load(v_reg, g.Vg, {batch_idx, head_idx, j, 0});
+        // load the k and v tiles from global to shared memory
+        load_global_to_shared_direct<2, false, st_bf<N_STEP, ATTN_D>, _gl_QKVO, coord<st_bf<N_STEP,ATTN_D>>, NUM_THREADS>(
+            g.Kg, {batch_idx, head_idx, j, 0}, k_smem);
+        load_global_to_shared_direct<2, false, st_bf<N_STEP, ATTN_D>, _gl_QKVO, coord<st_bf<N_STEP,ATTN_D>>, NUM_THREADS>(
+            g.Vg, {batch_idx, head_idx, j, 0}, v_smem);
+        __builtin_amdgcn_s_waitcnt(0);
+        __builtin_amdgcn_s_barrier();
 
-        // 8. Compute S_ij = Q_i @ K_j.T (16x16)
-        mma_ABt(att_block, q_reg, k_reg, att_block);
-        mul(att_block, att_block, scale_factor);
+        for (int i = 0; i < num_sub_tiles; i++) {
 
-        // 9. Compute m'_ij = row_max(S_ij) (16x1)
-        row_max(max_vec, att_block);
+            // zero out the accumulators
+            zero(att_block);
+            zero(o_reg_next);
 
-        // 10. p'_ij = exp(S_ij - m'_ij) (16x16)
-        sub_row(att_block, att_block, max_vec);
-        exp(att_block, att_block);
+            // 7. Load K_j, V_j from shared to registers
+            load_lds_reg(k_reg, subtile_inplace<SUB_N_STEP, ATTN_D>(k_smem, {i, 0}));
+            load_lds_reg(v_reg, subtile_inplace<SUB_N_STEP, ATTN_D>(v_smem, {i, 0}));
 
-        // 11. l'_ij = row_sum(p'_ij) (16x1)
-        row_sum(norm_vec, att_block);
+            // 8. Compute S_ij = Q_i @ K_j.T (16x16)
+            mma_ABt(att_block, q_reg, k_reg, att_block);
+            mul(att_block, att_block, scale_factor);
 
-        // 12. Compute m_i_new = max(m_i, m'_ij) (16x1)
-        max(max_vec_new, max_vec_last, max_vec);
+            // 9. Compute m'_ij = row_max(S_ij) (16x1)
+            row_max(max_vec, att_block);
 
-        // 13. l_i_new = exp(m_i - m_i_new) * l_i + exp(m'_ij - m_i_new) * l'_ij (16x1)
-        sub(max_vec_last, max_vec_last, max_vec_new);
-        exp(max_vec_last, max_vec_last);
+            // 10. p'_ij = exp(S_ij - m'_ij) (16x16)
+            sub_row(att_block, att_block, max_vec);
+            exp(att_block, att_block);
 
-        sub(max_vec, max_vec, max_vec_new);
-        exp(max_vec, max_vec);
+            // 11. l'_ij = row_sum(p'_ij) (16x1)
+            row_sum(norm_vec, att_block);
 
-        mul(norm_vec_last, max_vec_last, norm_vec_last);
-        mul(norm_vec, max_vec, norm_vec);
-        add(norm_vec_new, norm_vec_last, norm_vec);
+            // 12. Compute m_i_new = max(m_i, m'_ij) (16x1)
+            max(max_vec_new, max_vec_last, max_vec);
 
-        // 14.  O_i = exp(m_i - m_i_new) @ O_i + exp(m'_ij - m_i_new) * P'_ij @ V_j (16x64)
-        mul_row(o_reg, o_reg, max_vec_last);
-        copy(att_block_bf16, att_block);
-        attn_tile<D, bf16> att_block_row_bf16 = swap_layout_inplace<row_l>(att_block_bf16);    
-        mma_AB(o_reg_next, att_block_row_bf16, v_reg, o_reg_next);
-        mul_row(o_reg_next, o_reg_next, max_vec);
-        add(o_reg, o_reg, o_reg_next);
+            // 13. l_i_new = exp(m_i - m_i_new) * l_i + exp(m'_ij - m_i_new) * l'_ij (16x1)
+            sub(max_vec_last, max_vec_last, max_vec_new);
+            exp(max_vec_last, max_vec_last);
 
-        // 15. l_i = l_i_new, m_i = m_i_new
-        copy(max_vec_last, max_vec_new);
-        copy(norm_vec_last, norm_vec_new);
+            sub(max_vec, max_vec, max_vec_new);
+            exp(max_vec, max_vec);
+
+            mul(norm_vec_last, max_vec_last, norm_vec_last);
+            mul(norm_vec, max_vec, norm_vec);
+            add(norm_vec_new, norm_vec_last, norm_vec);
+
+            // 14.  O_i = exp(m_i - m_i_new) @ O_i + exp(m'_ij - m_i_new) * P'_ij @ V_j (16x64)
+            mul_row(o_reg, o_reg, max_vec_last);
+            att_block_row = swap_layout_inplace<row_l>(att_block); 
+            copy(att_block_row_bf16, att_block_row);
+            mma_AB(o_reg_next, att_block_row_bf16, v_reg, o_reg_next);
+            mul_row(o_reg_next, o_reg_next, max_vec);
+            add(o_reg, o_reg, o_reg_next);
+
+            // 15. l_i = l_i_new, m_i = m_i_new
+            copy(max_vec_last, max_vec_new);
+            copy(norm_vec_last, norm_vec_new);
+        }
     }
 
     // 16. O_i = diag(l_i)^-1 @ O_i

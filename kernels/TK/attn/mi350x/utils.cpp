@@ -74,17 +74,13 @@ llvm_amdgcn_raw_buffer_load_lds(int32x4_t rsrc, // does not change (buffer resou
 template<int axis, bool assume_aligned,
          ducks::st::all ST, ducks::gl::all GL,
          ducks::coord::tile COORD = coord<ST>,
-         int N_THREADS = WARP_THREADS, int offset_thread = 0>
+         int N_THREADS = WARP_THREADS, int NUM_WARPS = 1>
 __device__ inline void load_global_to_shared_direct(
     const GL& src, const COORD& idx, ST& dst)
 {
 
-    if ((threadIdx.x-offset_thread) >= N_THREADS) {
-        return;
-    }
-
     using T = typename ST::dtype;
-    constexpr int memcpy_per_tile = ST::rows * ST::cols * sizeof(T) / (16 * N_THREADS); 
+    constexpr int memcpy_per_tile = ST::rows * ST::cols * sizeof(T) / (16 * N_THREADS); // 2
     static_assert(memcpy_per_tile > 0, "memcpy_per_tile must be greater than 0. Please decrease the number of threads.");
     
     constexpr int elem_per_thread = 16 / sizeof(T);  // 8
@@ -98,15 +94,15 @@ __device__ inline void load_global_to_shared_direct(
 
     uint32_t dst_ptr = reinterpret_cast<uintptr_t>(&dst.data[0]);
     
-    int thread_id = threadIdx.x - offset_thread;
+    int thread_id = threadIdx.x % N_THREADS;
     int warp_id = thread_id >> 6;
     
-    const T* lds_base = &dst.data[0] + (warp_id * elem_per_warp);
+    const T* lds_base = &dst.data[0] + (kittens::warpid() * elem_per_warp);
 
     #pragma unroll
     for (int i = 0; i < memcpy_per_tile; i++) {
 
-        int offset_threads = (i * N_THREADS + thread_id % N_THREADS);
+        int offset_threads = (i * N_THREADS + threadIdx.x % N_THREADS);
         const int row_in_lds = offset_threads / threads_per_row;
         const int col_in_lds = (offset_threads % threads_per_row) * elem_per_thread;
         const int addr_in_lds = dst.idx(dst_ptr, {row_in_lds, col_in_lds});
