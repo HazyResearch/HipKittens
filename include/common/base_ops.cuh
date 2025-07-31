@@ -105,45 +105,40 @@ template<> __device__ inline half_2 exp::op<half_2>(const half_2 &x) { return h2
 // template<> __device__ inline half   exp2::op<half>  (const half &x  ) { return hexp2(x);                          }
 // template<> __device__ inline half_2 exp2::op<half_2>(const half_2 &x) { return h2exp2(x);                         }
 
+
 /**
- * @brief Base-2 exponential operation using native hardware `v_exp_f32` (via expf)
+ * @brief Base-2 exponential operation using `__builtin_amdgcn_exp2_f32`
  *
- * This implementation computes 2^x using the identity:
- *    2^x = exp(x * ln(2))
- * It maps directly to `v_exp_f32_e32` and avoids bit-level hacks,
- * while providing smooth numerical behavior in softmax.
- *
- * @tparam T The data type of the input and output values.
+ * Maps directly to `v_exp_f32_e32` on AMD, for highest performance.
+ * Expects `x` to be in a safe numerical range (e.g., [-64, 88]).
  */
  struct exp2 {
     template <typename T>
     static __device__ inline T op(const T &x) {
-        return exp2f(x);  // fallback (will be specialized below)
+        return exp2f(x);  // fallback
     }
 };
-// Native `float` version using __expf(x * ln2) (emits v_exp_f32_e32!!!)
+
+// Force hardware v_exp_f32 for float
 template<>
 __device__ inline float exp2::op<float>(const float &x) {
-    constexpr float LN2 = 0.69314718056f;
-    float clamped = fminf(fmaxf(x, -64.0f), 88.0f);  // safe range for exp()
-    return __expf(clamped * LN2);  // maps to v_exp_f32
+    return __builtin_amdgcn_exp2f(x);  // Emits v_exp_f32_e32
 }
-// Native `float2` version (emits v_exp_f32_e32!!!)
+
+// Force hardware v_exp_f32 for float2
 template<>
 __device__ inline float2 exp2::op<float2>(const float2 &x) {
-    constexpr float LN2 = 0.69314718056f;
-    float2 out;
-    float x0 = fminf(fmaxf(x.x, -64.0f), 88.0f);
-    float x1 = fminf(fmaxf(x.y, -64.0f), 88.0f);
-    out.x = __expf(x0 * LN2);
-    out.y = __expf(x1 * LN2);
-    return out;
+    return {
+        __builtin_amdgcn_exp2f(x.x),
+        __builtin_amdgcn_exp2f(x.y)
+    };
 }
-// Low-precision types use existing backend implementations
-template<> __device__ inline bf16   exp2::op<bf16>  (const bf16 &x)   { return hexp2(x);  }
-template<> __device__ inline bf16_2 exp2::op<bf16_2>(const bf16_2 &x) { return h2exp2(x); }
-template<> __device__ inline half   exp2::op<half>  (const half &x)   { return hexp2(x);  }
-template<> __device__ inline half_2 exp2::op<half_2>(const half_2 &x) { return h2exp2(x); }
+
+// Delegate to low-precision approximations
+template<> __device__ inline half    exp2::op<half>(const half &x)     { return hexp2(x);  }
+template<> __device__ inline half_2  exp2::op<half_2>(const half_2 &x) { return h2exp2(x); }
+template<> __device__ inline bf16    exp2::op<bf16>(const bf16 &x)     { return hexp2(x);  }
+template<> __device__ inline bf16_2  exp2::op<bf16_2>(const bf16_2 &x) { return h2exp2(x); }
 
 
 
