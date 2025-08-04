@@ -68,7 +68,7 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
                 int col = dst.tile_size_col*j + col_offset + z*16;
 
                 U2* tmp;
-                if constexpr (sizeof(U2) == 4) { // bf16_2
+                if constexpr (sizeof(U2) == 4) { // bf16_2 or fp8e4m3_4
 
                     #ifdef KITTENS_CDNA4
                     float4 loaded = std::bit_cast<float4>(llvm_amdgcn_raw_buffer_load_b128(
@@ -137,6 +137,8 @@ template<int axis, ducks::rt::col_layout RT, ducks::gl::all GL, ducks::coord::ti
 __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     using T = base_types::packing<typename RT::dtype>::unpacked_type;
     using U = typename GL::dtype;
+
+    static_assert(!std::is_same_v<T, fp8e4m3>, "Unsupported type for load/store");
     
     U *src_ptr = (U*)&src[(idx.template unit_coord<axis, 3>())];
     const int row_stride = src.template stride<axis>();
@@ -258,11 +260,12 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
                 int col = src.tile_size_col*j + col_offset + z*16;
                 #ifdef KITTENS_CDNA4
 
-                U2 tmp[4];
-                #pragma unroll
-                for(int k = 0; k < 4; k++) {
-                    tmp[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k + z*4]);
-                }
+                U2 tmp[4] = {
+                    base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[0 + z*4]),
+                    base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[1 + z*4]),
+                    base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[2 + z*4]),
+                    base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[3 + z*4])
+                };
                 if constexpr (sizeof(U2) == 4) { // bf16_2
                     *(bytes_16*)&dst_ptr[row*row_stride + col] = *(bytes_16*)tmp;
                 }
@@ -273,12 +276,11 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
 
                 #else
 
-                U2 tmp[2];
-                #pragma unroll
-                for(int k = 0; k < 2; k++) {
-                    tmp[k] = base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[k]);
-                }
-                if constexpr (sizeof(U2) == 4) { // bf16_2
+                U2 tmp[2] = {
+                    base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[0]),
+                    base_types::convertor<U2, T2>::convert(src.tiles[i][j].data[1])
+                };
+                if constexpr (sizeof(U2) == 4) { // bf16_2 or fp8e4m3_4
                     *(bytes_8*)&dst_ptr[row*row_stride + col] = *(bytes_8*)tmp;
                 }
                 else { // float2
@@ -303,6 +305,8 @@ template<int axis, ducks::rt::col_layout RT, ducks::gl::all GL, ducks::coord::ti
 __device__ inline static void store(const GL &dst, const RT &src, const COORD &idx) {
     using T = base_types::packing<typename RT::dtype>::unpacked_type;
     using U = typename GL::dtype;
+
+    static_assert(!std::is_same_v<T, fp8e4m3>, "Unsupported type for load/store");
 
     U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
     const int row_stride = dst.template stride<axis>();

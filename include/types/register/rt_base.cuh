@@ -52,7 +52,7 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
     using dtype = T2; ///< Data type of the matrix elements
 
     static_assert(
-        std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2>,
+        std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2> || std::is_same_v<dtype, fp8e4m3_4>,
         "rt_base was provided an unsupported type."
     );
 
@@ -60,8 +60,8 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
     static constexpr int tile_size_col        = kittens::TILE_COL_DIM<T>;
     static constexpr int rows                 = tile_size_row; ///< Number of rows.
     static constexpr int cols                 = tile_size_col; ///< Number of cols.
-    static constexpr int num_elements         = rows*cols; // 1024
-    static constexpr int elements_per_thread  = num_elements / kittens::WARP_THREADS; // 16
+    static constexpr int num_elements         = rows*cols; // 1024 (512 for fp8e4m3 on CDNA3)
+    static constexpr int elements_per_thread  = num_elements / kittens::WARP_THREADS; // 16 (8 for fp8e4m3 on CDNA3)
 
     static constexpr int packed_per_thread    = (elements_per_thread / base_types::packing<dtype>::num()) ; // 2
     static constexpr int registers_per_thread = packed_per_thread * sizeof(dtype) / 4; // 2 or 4, registers are 32-bit words
@@ -98,4 +98,5 @@ template<typename T> concept all = requires {
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_fl = rt_base<float, L>;
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_bf = rt_base<bf16, L>;
 template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_hf = rt_base<half, L>;
+template<ducks::rt_layout::all L=ducks::rt_layout::row> using rt_base_fl8_e4m3 = rt_base<fp8e4m3, L>;
 }
