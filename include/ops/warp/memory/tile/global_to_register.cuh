@@ -253,7 +253,7 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
     int row_offset = laneid%32, col_offset = 8*(laneid/32);
     int REPEAT = 2;
     #else
-    int row_offset = laneid%16, col_offset = 4*(laneid/16);
+    int row_offset = laneid%16, col_offset = 8*(laneid/16);
     int REPEAT = 1;
     #endif
 
