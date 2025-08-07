@@ -57,6 +57,30 @@ __device__ static inline void mfma323216(      float2 (&D)[8],
         0, 0, 0
     );
 }
+
+__device__ static inline void mfma323264_fp6(      float2 (&D)[8],
+                                             const fp6_e2m3_4 (&A)[8], 
+                                             const fp6_e2m3_4 (&B)[8],
+                                             const float2 (&C)[8]) {
+
+    typedef __attribute__((__vector_size__(32))) uint8_t uint8x32_t;
+    typedef __attribute__((__vector_size__(16 * sizeof(float)))) float floatx16_t;
+    typedef __attribute__((__vector_size__(8 * sizeof(int32_t)))) int32_t int32x8_t;
+    
+    // Option 1: Try direct cast (simplest approach)
+    *(floatx16_t*)D = __builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
+        *(uint8x32_t*)A,
+        *(uint8x32_t*)B,
+        *(floatx16_t*)C,
+        2, // cbsz for FP6 E2M3
+        2, // blgp for FP6 E2M3  
+        0, // OpselA
+        0, // scale_a (0 means no scaling)
+        0, // OpselB
+        0  // scale_b (0 means no scaling)
+    );
+}
+
 #else
 __device__ static inline void mfma161616(      float2 (&D)[2],
                                          const half_2 (&A)[2],
@@ -145,6 +169,12 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::accu
                                      const rt_base<bf16, ducks::rt_layout::row> &b, // in row-major mode
                                      const rt_base<float, ducks::rt_layout::accumulator> &c) {
     mfma323216(d.data, a.data, b.data, c.data);
+}
+__device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::accumulator> &d,
+                                    const rt_base<fp6_e2m3, ducks::rt_layout::row> &a,
+                                    const rt_base<fp6_e2m3, ducks::rt_layout::row> &b,
+                                    const rt_base<float, ducks::rt_layout::accumulator> &c) {
+    mfma323264_fp6(d.data, a.data, b.data, c.data);
 }
 #else
 __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col> &d,
@@ -320,12 +350,23 @@ __device__ static inline void mma_ABt(D &d,
     static_assert(A::cols == B::cols); // Check reduction dim is same
     static_assert(D::rows == C::rows && D::cols == C::cols); // Check D matches C
 
+    #ifdef KITTENS_CDNA4
+    static_assert(
+        (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, bf16> &&
+            std::is_same_v<typename B::T, bf16> && std::is_same_v<typename C::T, float>) ||
+        (std::is_same_v<typename D::T, half> && std::is_same_v<typename A::T, half> &&
+            std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, half>) ||
+        (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, fp6_e2m3> &&
+            std::is_same_v<typename B::T, fp6_e2m3> && std::is_same_v<typename C::T, float>)
+    );
+    #else
     static_assert(
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, bf16> &&
             std::is_same_v<typename B::T, bf16> && std::is_same_v<typename C::T, float>) ||
         (std::is_same_v<typename D::T, half> && std::is_same_v<typename A::T, half> &&
             std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, half>)
     );
+    #endif
 
     #pragma unroll
     for(int n = 0; n < D::height; n++) {
