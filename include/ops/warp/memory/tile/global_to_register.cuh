@@ -67,9 +67,9 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
             for(int j = 0; j < dst.width; j++) {
                 int col = dst.tile_size_col*j + col_offset + z*16;
 
-                U2* tmp;
                 if constexpr (sizeof(U2) == 4) { // bf16_2
 
+                    U2* tmp;
                     #ifdef KITTENS_CDNA4
                     float4 loaded = std::bit_cast<float4>(llvm_amdgcn_raw_buffer_load_b128(
                         std::bit_cast<i32x4>(br),
@@ -86,12 +86,39 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
                     ));
                     #endif
                     tmp = reinterpret_cast<U2*>(&loaded);
+
+                    #ifdef KITTENS_CDNA4
+                    #pragma unroll
+                    for(int k = 0; k < 4; k++) {
+                        dst.tiles[i][j].data[k + z*4] = base_types::convertor<T2, U2>::convert(tmp[k]);
+                    }
+                    #else
+                    #pragma unroll
+                    for(int k = 0; k < 2; k++) {
+                        dst.tiles[i][j].data[k] = base_types::convertor<T2, U2>::convert(tmp[k]);
+                    }
+                    #endif
+
                 }
                 else { // float2
 
                     #ifdef KITTENS_CDNA4
-                    static_assert(0, "float2 is not supported on CDNA4");
+                    float4 loaded1 = std::bit_cast<float4>(llvm_amdgcn_raw_buffer_load_b128(
+                        std::bit_cast<i32x4>(br),
+                        (row*row_stride + col) * sizeof(U),
+                        0,
+                        0
+                    ));
+                    float4 loaded2 = std::bit_cast<float4>(llvm_amdgcn_raw_buffer_load_b128(
+                        std::bit_cast<i32x4>(br),
+                        (row*row_stride + col + 4) * sizeof(U),
+                        0,
+                        0
+                    ));
+                    U2* tmp1 = reinterpret_cast<U2*>(&loaded1);
+                    U2* tmp2 = reinterpret_cast<U2*>(&loaded2);
                     #else
+                    U2* tmp;
                     float4 loaded = std::bit_cast<float4>(llvm_amdgcn_raw_buffer_load_b128(
                         std::bit_cast<i32x4>(br),
                         (row*row_stride + col) * sizeof(U),
@@ -101,20 +128,24 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
                     tmp = reinterpret_cast<U2*>(&loaded);
                     #endif
 
-                }
+                    #ifdef KITTENS_CDNA4
+                    #pragma unroll
+                    for(int k = 0; k < 2; k++) {
+                        dst.tiles[i][j].data[k + z*4] = base_types::convertor<T2, U2>::convert(tmp1[k]);
+                    }
+                    #pragma unroll
+                    for(int k = 0; k < 2; k++) {
+                        dst.tiles[i][j].data[k + 2 + z*4] = base_types::convertor<T2, U2>::convert(tmp2[k]);
+                    }
+                    #else
+                    #pragma unroll
+                    for(int k = 0; k < 2; k++) {
+                        dst.tiles[i][j].data[k] = base_types::convertor<T2, U2>::convert(tmp[k]);
+                    }
+                    #endif
 
-                #ifdef KITTENS_CDNA4
-                #pragma unroll
-                for(int k = 0; k < 4; k++) {
-                    dst.tiles[i][j].data[k + z*4] = base_types::convertor<T2, U2>::convert(tmp[k]);
-                }
-                #else
-                #pragma unroll
-                for(int k = 0; k < 2; k++) {
-                    dst.tiles[i][j].data[k] = base_types::convertor<T2, U2>::convert(tmp[k]);
-                }
-                #endif
 
+                }
             }
         }
 
