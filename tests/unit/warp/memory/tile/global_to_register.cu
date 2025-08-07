@@ -14,27 +14,27 @@ struct g2r_wrapper_2d {
         this_result.label = generate_test_name<H,W,NUM_WORKERS,args...>(test::test_identifier);
         if constexpr (test::template valid<H, W, NUM_WORKERS, args...>::value) {
             constexpr int B = 3, D = 1, R = 4, C = 5;
-            constexpr int SIZE = H*W*256 * B * D * R * C;
+            constexpr int SIZE = H*W*kittens::TILE_COL_DIM<dtype>*kittens::TILE_ROW_DIM<dtype> * B * D * R * C;
             // initialize
             dtype *d_i, *d_o;
             std::vector<float> i_ref(SIZE);
             std::vector<float> o_ref(SIZE);
             initialize(&d_i, &d_o, i_ref, o_ref);
             // make descriptors
-            using GL = typename kittens::gl<dtype, -1, D, -1, 16*C*W>;
-            GL input (d_i, B, nullptr, 16*R*H, nullptr);
-            GL output(d_o, B, nullptr, 16*R*H, nullptr);
+            using GL = typename kittens::gl<dtype, -1, D, -1, kittens::TILE_COL_DIM<dtype>*C*W>;
+            GL input (d_i, B, nullptr, kittens::TILE_ROW_DIM<dtype>*R*H, nullptr);
+            GL output(d_o, B, nullptr, kittens::TILE_ROW_DIM<dtype>*R*H, nullptr);
             // run kernel
             hipFuncSetAttribute(
                 reinterpret_cast<void *>(global_wrapper_2d<test, dtype, H, W, NUM_WORKERS, GL, args...>),
                 hipFuncAttributeMaxDynamicSharedMemorySize,
                 kittens::MAX_SHARED_MEMORY
             );
-            global_wrapper_2d<test, dtype, H, W, NUM_WORKERS, GL, args...><<<1, NUM_WORKERS*64, kittens::MAX_SHARED_MEMORY>>>(input, output);
+            global_wrapper_2d<test, dtype, H, W, NUM_WORKERS, GL, args...><<<1, NUM_WORKERS*kittens::WARP_THREADS, kittens::MAX_SHARED_MEMORY>>>(input, output);
             // fill in correct results on cpu
             test::template host_func<H, W, NUM_WORKERS, GL, args...>(i_ref, o_ref);
             // check and cleanup
-            this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, W*16);
+            this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, W*kittens::TILE_COL_DIM<dtype>);
         }
         else {
             this_result.result = test_result::INVALID;
@@ -57,8 +57,8 @@ struct load_store {
         o_ref = i_ref; // overwrite the whole thing
     }
     template<int H, int W, int NW, kittens::ducks::gl::all GL, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt_bf<16*H, 16*W, L> reg_tile;
-        for(int i = 0; i < input.batch; i++) for(int j = 0; j < input.depth; j++) for(int k = 0; k < input.rows/reg_tile.rows; k++) for(int l = 0; l < input.cols/reg_tile.cols; l++) {
+        kittens::rt_bf<kittens::TILE_ROW_DIM<dtype>*H, kittens::TILE_COL_DIM<dtype>*W, L> reg_tile;
+        for(int i = 0; i < input.batch(); i++) for(int j = 0; j < input.depth(); j++) for(int k = 0; k < input.rows()/reg_tile.rows; k++) for(int l = 0; l < input.cols()/reg_tile.cols; l++) {
             kittens::load(reg_tile, input, {i, j, k, l});
             kittens::store(output, reg_tile, {i, j, k, l});
         }
@@ -67,7 +67,8 @@ struct load_store {
 
 void warp::memory::tile::global_to_register::tests(test_data &results) {
     std::cout << "\n ----- Starting ops/warp/memory/tile/global_to_register tests! -----\n" << std::endl;
-    constexpr int SIZE = INTENSITY_1 ? 2  :
+    constexpr int SIZE = INTENSITY_0 ? 1  :
+                         INTENSITY_1 ? 2  :
                          INTENSITY_2 ? 4  : 
                          INTENSITY_3 ? 8  :
                          INTENSITY_4 ? 16 : -1;
@@ -78,6 +79,12 @@ void warp::memory::tile::global_to_register::tests(test_data &results) {
     g2r_sweep_size_2d_warp<load_store<kittens::bf16>, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
     g2r_sweep_size_2d_warp<load_store<kittens::half>, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     g2r_sweep_size_2d_warp<load_store<kittens::half>, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
+
+    #ifdef KITTENS_CDNA4
+    g2r_sweep_size_2d_warp<load_store<float>, SIZE, SIZE, kittens::ducks::rt_layout::accumulator>::run(results);
+    g2r_sweep_size_2d_warp<load_store<kittens::bf16>, SIZE, SIZE, kittens::ducks::rt_layout::accumulator>::run(results);
+    g2r_sweep_size_2d_warp<load_store<kittens::half>, SIZE, SIZE, kittens::ducks::rt_layout::accumulator>::run(results);
+    #endif
 }
 
 #endif

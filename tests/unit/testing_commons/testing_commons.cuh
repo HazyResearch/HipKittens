@@ -31,12 +31,18 @@ template<int S, int NW> std::string generate_test_name(std::string test_id) {
 template<int S, int NW, kittens::ducks::rt_layout::all L> std::string generate_test_name(std::string test_id) {
     std::string label = generate_test_name<S,NW>(test_id);
     if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
+    #ifdef KITTENS_CDNA4
+    else if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::accumulator>) label += "_[rt_accumulator_layout]";
+    #endif
     else label += "_[rt_col_layout]";
     return label;
 }
 template<int S, int NW, kittens::ducks::rt_layout::all L1, kittens::ducks::rt_layout::all L2> std::string generate_test_name(std::string test_id) {
     std::string label = generate_test_name<S,NW,L1>(test_id);
     if constexpr (std::is_same_v<L2, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
+    #ifdef KITTENS_CDNA4
+    else if constexpr (std::is_same_v<L2, kittens::ducks::rt_layout::accumulator>) label += "_[rt_accumulator_layout]";
+    #endif
     else label += "_[rt_col_layout]";
     return label;
 }
@@ -76,6 +82,9 @@ template<int H, int W, int NW, integral_wrapper _K> std::string generate_test_na
 template<int H, int W, int NW, kittens::ducks::rt_layout::all L> std::string generate_test_name(std::string test_id) {
     std::string label = generate_test_name<H,W,NW>(test_id);
     if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
+    #ifdef KITTENS_CDNA4
+    else if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::accumulator>) label += "_[rt_accumulator_layout]";
+    #endif
     else label += "_[rt_col_layout]";
     return label;
 }
