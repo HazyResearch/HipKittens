@@ -48,9 +48,14 @@ template<typename test, int MAX_H=8, int MAX_W=8, typename... args> using g2s_sw
 template<template<typename> typename test, int MAX_H=8, int MAX_W=8, typename... args>
 struct g2s_sweep_gmem_type_2d_warp {
     static void run(test_data &results) {
+        #ifdef KITTENS_CDNA4
+        g2s_sweep_size_2d_warp<test<kittens::bf16>, MAX_H, MAX_W, args...>::run(results);
+        g2s_sweep_size_2d_warp<test<kittens::half>, MAX_H, MAX_W, args...>::run(results);
+        #else
         g2s_sweep_size_2d_warp<test<float>, MAX_H, MAX_W, args...>::run(results);
         g2s_sweep_size_2d_warp<test<kittens::bf16>, MAX_H, MAX_W, args...>::run(results);
         g2s_sweep_size_2d_warp<test<kittens::half>, MAX_H, MAX_W, args...>::run(results);
+        #endif
     }
 };
 
@@ -79,8 +84,13 @@ struct st_load_store {
             for(int j = 0; j < num_depths; j++)
                 for(int k = 0; k < num_rows; k++)
                     for(int l = 0; l < (input.cols()/shared_tile.cols); l++) {
+            #ifdef KITTENS_CDNA4
+            kittens::load <axis::value, false, kittens::ducks::rt_layout::row, ST, GL, kittens::coord<ST>>(shared_tile,  input, {i, j, k, l});
+            kittens::store<axis::value, false, kittens::ducks::rt_layout::row, ST, GL, kittens::coord<ST>>(output, shared_tile, {i, j, k, l});
+            #else
             kittens::load <axis::value, false, ST, GL, kittens::coord<ST>>(shared_tile,  input, {i, j, k, l});
             kittens::store<axis::value, false, ST, GL, kittens::coord<ST>>(output, shared_tile, {i, j, k, l});
+            #endif
         }
     }
 };
