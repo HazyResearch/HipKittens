@@ -7,7 +7,7 @@ ROCM_INSTALL_DIR := $(ROCM_PATH)
 HIP_INCLUDE_DIR  := $(ROCM_INSTALL_DIR)/include/hip
 
 HIPCXX ?= $(ROCM_INSTALL_DIR)/bin/hipcc
-HIPFLAGS=-std=c++20 -I$(HIP_INCLUDE_DIR) -I../../../include -Wall -Wextra -Wl,--allow-multiple-definition -DKITTENS_CDNA4 --offload-arch=gfx950
+HIPFLAGS=-std=c++20 -I$(HIP_INCLUDE_DIR) -I../../../include -Wall -Wextra -Wl,--allow-multiple-definition -DKITTENS_CDNA4 --offload-arch=gfx950 -fopenmp
 
 ifeq ($(COMP_LEVEL),safe)
 HIPFLAGS+= -O0

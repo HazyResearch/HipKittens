@@ -1,5 +1,6 @@
 #include "kittens.cuh"
 #include <random>
+#include <omp.h>
 
 using namespace kittens;
 
@@ -80,9 +81,9 @@ __global__ void matmul(const kittens::gl<fp8e4m3, 1, 1, M, K> A, const kittens::
 
 int main() {
     // Allow different M and N dimensions
-    constexpr int M = 256;  // Can be any multiple of 64
-    constexpr int N = 128;  // Can be any multiple of 64
-    constexpr int K = 64;
+    constexpr int M = 8192;  // Can be any multiple of 64
+    constexpr int N = 8192;  // Can be any multiple of 64
+    constexpr int K = 8192;
     constexpr int threads_per_warp = 64;
     constexpr int warps_per_cu = 4;
     constexpr int threads_per_block = threads_per_warp * warps_per_cu;
@@ -123,6 +124,7 @@ int main() {
     // Compute reference result: C = A * B^T
     // A is M x K (identity in first min(M,K) diagonal), B is N x K
     // C should be M x N
+    #pragma omp parallel for collapse(2)
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
             float sum = 0.0f;
