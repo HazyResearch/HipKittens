@@ -201,9 +201,9 @@ struct st_subtile {
 
     __device__ st_subtile(ST &src, int2 rowcol) {
         #ifdef KITTENS_CDNA4
-        row_offset = rowcol.x;
-        col_offset = rowcol.y;
-        data = &src.data[(row_offset * ST::underlying_width + col_offset) * kittens::TILE_COL_DIM<T> * kittens::TILE_ROW_DIM<T> * sizeof(T)];
+        row_offset = rowcol.x * height * underlying_width;
+        col_offset = rowcol.y * width;
+        data = &src.data[(row_offset + col_offset) * kittens::TILE_COL_DIM<T> * kittens::TILE_ROW_DIM<T> * sizeof(T)];
         #else
         row_offset = rowcol.x * rows;
         col_offset = rowcol.y * cols;
