@@ -74,7 +74,7 @@ __device__ uint32_t llvm_amdgcn_raw_buffer_load_b32(i32x4 srsrc, uint32_t voffse
 __device__ uint64_t llvm_amdgcn_raw_buffer_load_b64(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
     __asm("llvm.amdgcn.raw.buffer.load.i64");
 
-__device__ bytes_12 llvm_amdgcn_raw_buffer_load_b96(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+__device__ __uint96_t llvm_amdgcn_raw_buffer_load_b96(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
     __asm("llvm.amdgcn.raw.buffer.load.i96");
 
 __device__ __uint128_t llvm_amdgcn_raw_buffer_load_b128(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
@@ -92,8 +92,8 @@ __device__ void llvm_amdgcn_raw_buffer_store_b32(uint32_t vdata, i32x4 srsrc, ui
 __device__ void llvm_amdgcn_raw_buffer_store_b64(uint64_t vdata, i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
     __asm("llvm.amdgcn.raw.buffer.store.i64");
 
-__device__ void llvm_amdgcn_raw_buffer_store_b96(bytes_12 vdata, i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
-    __asm("llvm.amdgcn.raw.buffer.store.i96");
+__device__ void llvm_amdgcn_raw_buffer_store_b96(__uint96_t vdata, i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+    __asm("llvm.amdgcn.raw.buffer.store.v3i32");
 
 __device__ void llvm_amdgcn_raw_buffer_store_b128(__uint128_t vdata, i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
     __asm("llvm.amdgcn.raw.buffer.store.i128");
