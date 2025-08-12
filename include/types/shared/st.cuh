@@ -200,9 +200,13 @@ struct st_subtile {
     int row_offset, col_offset;
 
     __device__ st_subtile(ST &src, int2 rowcol) {
-        data = &src.data[0];
         row_offset = rowcol.x * rows;
         col_offset = rowcol.y * cols;
+        #ifdef KITTENS_CDNA4
+        data = &src.data[row_offset * ST::underlying_cols + col_offset];
+        #else
+        data = &src.data[0];
+        #endif
     }
 
     __device__ inline T* idx(T *ptr, const int2 coord) { // naive row-major coord default

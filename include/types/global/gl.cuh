@@ -69,7 +69,11 @@ struct gl {
     __host__ __device__ inline gl(const gl &other) :
             raw_ptr(other.raw_ptr), batch_internal(other.batch_internal), depth_internal(other.depth_internal), rows_internal(other.rows_internal), cols_internal(other.cols_internal), tma_descs(other.tma_descs) {}
     __device__ inline T& operator[](const coord<ducks::default_type> &idx) const { // yes I am abusing the const qualifier here a bit.
-        return raw_ptr[((idx.b*depth() + idx.d)*rows() + idx.r)*cols() + idx.c];
+        if constexpr (std::is_same_v<T, fp6_e2m3>) {
+            return raw_ptr[(((idx.b*depth() + idx.d)*rows() + idx.r)*cols() + idx.c) * 6 / 8];
+        } else {
+            return raw_ptr[((idx.b*depth() + idx.d)*rows() + idx.r)*cols() + idx.c];
+        }
     }
     template<int axis> __device__ inline size_t shape() const {
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
