@@ -204,7 +204,7 @@ struct st_subtile {
         if constexpr (std::is_same_v<T, fp6_e2m3>) {
             row_offset = rowcol.x * height * underlying_width;
             col_offset = rowcol.y * width;
-            data = &src.data[(row_offset + col_offset) * kittens::TILE_COL_DIM<T> * kittens::TILE_ROW_DIM<T> * sizeof(T)];
+            data = &src.data[(row_offset + col_offset) * kittens::TILE_COL_DIM<T> * kittens::TILE_ROW_DIM<T> * 6 / 8];
         } else {
             row_offset = rowcol.x * rows;
             col_offset = rowcol.y * cols;
