@@ -189,7 +189,7 @@ test_result validate(T1 *d_i, T2 *d_o, const std::vector<float> &i_ref, std::vec
     std::cout << "test `" << test_name << "` ";
     bool good = true;
     float max_diff = 0;
-    float max_diff_idx = 0;
+    int max_diff_idx = 0;
     for(int i = 0; i < output_size; i++) {
         if(abs(o_ref[i] - o[i]) > eps) {
             good = false;

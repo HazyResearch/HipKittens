@@ -212,7 +212,7 @@ struct mma_type_wrapper {
                 // fill in correct results on cpu
                 test::template host_func<H, W, NUM_WORKERS, GTL_A, GTL_B, GTL_C, _K, args...>(i_ref, o_ref);
                 // check and cleanup
-                this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, W*rt_rows, 0.0625); // mma's sometimes produce small (sometimes fairly large) errors. this appears to be hardware.
+                this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, W*rt_rows, std::is_same_v<I_T, kittens::fp8e4m3> ? 0.125 : 0.0625); 
             }
             else {
                 this_result.result = test_result::INVALID;
@@ -266,6 +266,9 @@ void warp::reg::tile::mma::tests(test_data &results) {
     mma_sweep_size_warp<test_mma_AtBt, SIZE, SIZE, std::integral_constant<int, 4>>::run(results);
     // fp8e4m3
     mma_sweep_size_warp_fp8<test_mma_ABt_fp8, SIZE, SIZE, std::integral_constant<int, 1>>::run(results);
+    mma_sweep_size_warp_fp8<test_mma_ABt_fp8, SIZE, SIZE, std::integral_constant<int, 2>>::run(results);
+    mma_sweep_size_warp_fp8<test_mma_ABt_fp8, SIZE, SIZE, std::integral_constant<int, 3>>::run(results);
+    mma_sweep_size_warp_fp8<test_mma_ABt_fp8, SIZE, SIZE, std::integral_constant<int, 4>>::run(results);
 }
 
 #endif
