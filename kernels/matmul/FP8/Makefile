@@ -26,5 +26,13 @@ $(TARGET): $(SRC)
 	$(HIPCXX) $(HIPFLAGS) -c $(SRC) -o $(BUILD_DIR)/matmul.o
 	$(HIPCXX) $(HIPFLAGS) $(BUILD_DIR)/matmul.o -o $(TARGET)
 
+LOAD=load
+LOAD_SRC=load.cu
+
+$(LOAD): $(LOAD_SRC)
+	mkdir -p $(BUILD_DIR)
+	$(HIPCXX) $(HIPFLAGS) -c $(LOAD_SRC) -o $(BUILD_DIR)/load.o
+	$(HIPCXX) $(HIPFLAGS) $(BUILD_DIR)/load.o -o $(LOAD)
+
 clean:
-	rm -rf $(BUILD_DIR) $(TARGET)
+	rm -rf $(BUILD_DIR) $(TARGET) $(LOAD)

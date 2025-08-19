@@ -104,9 +104,9 @@ __global__ __launch_bounds__(512, 2) void matmul_device_ref(const kittens::gl<fp
         // Inner loop over K dimension
         for (int k = 0; k < k_iters; k++) {
             // Cooperatively load 128x64 tiles into shared memory
-            // All 4 warps participate in loading
-            load<2, false, kittens::ducks::rt_layout::row>(As, A, {0, 0, block_row, k});
-            load<2, false, kittens::ducks::rt_layout::row>(Bs, B, {0, 0, block_col, k});
+            // All 8 warps participate in loading
+            load<2, false, kittens::ducks::rt_layout::row, st<fp8e4m3, BLOCK_SIZE_ROW, BLOCK_K>, kittens::gl<fp8e4m3, 1, 1, M, K>, coord<st<fp8e4m3, BLOCK_SIZE_ROW, BLOCK_K>>, 8*WARP_THREADS>(As, A, {0, 0, block_row, k});
+            load<2, false, kittens::ducks::rt_layout::row, st<fp8e4m3, BLOCK_SIZE_COL, BLOCK_K>, kittens::gl<fp8e4m3, 1, 1, N, K>, coord<st<fp8e4m3, BLOCK_SIZE_COL, BLOCK_K>>, 8*WARP_THREADS>(Bs, B, {0, 0, block_col, k});
 
             // CRITICAL: Ensure all warps complete loading before any reads from shared memory
             __builtin_amdgcn_s_waitcnt(0);
@@ -280,9 +280,10 @@ __global__ __launch_bounds__(512, 2) void matmul_device(const kittens::gl<fp8e4m
 
     int curr = 0, next = 1;
 
-    load<2, false, kittens::ducks::rt_layout::row>(As[curr], A, {0, 0, block_row, 0});
-    load<2, false, kittens::ducks::rt_layout::row>(Bs[curr], B, {0, 0, block_col, 0});
+    load<2, false, kittens::ducks::rt_layout::row, st<fp8e4m3, BLOCK_SIZE_ROW, BLOCK_K>, kittens::gl<fp8e4m3, 1, 1, M, K>, coord<st<fp8e4m3, BLOCK_SIZE_ROW, BLOCK_K>>, NUM_WARPS*WARP_THREADS>(As[curr], A, {0, 0, block_row, 0});
+    load<2, false, kittens::ducks::rt_layout::row, st<fp8e4m3, BLOCK_SIZE_COL, BLOCK_K>, kittens::gl<fp8e4m3, 1, 1, N, K>, coord<st<fp8e4m3, BLOCK_SIZE_COL, BLOCK_K>>, NUM_WARPS*WARP_THREADS>(Bs[curr], B, {0, 0, block_col, 0});
 
+    __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
 
@@ -297,9 +298,12 @@ __global__ __launch_bounds__(512, 2) void matmul_device(const kittens::gl<fp8e4m
         load(a, as_subtile);
         auto bs_subtile = kittens::subtile_inplace<BLOCK_SIZE_COL / WARPS_COL, BLOCK_K>(Bs[curr], {warp_n, 0});
         load(b, bs_subtile);
-        load<2, false, kittens::ducks::rt_layout::row>(As[next], A, {0, 0, block_row, k + 1});
-        load<2, false, kittens::ducks::rt_layout::row>(Bs[next], B, {0, 0, block_col, k + 1});
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+        load<2, false, kittens::ducks::rt_layout::row, st<fp8e4m3, BLOCK_SIZE_ROW, BLOCK_K>, kittens::gl<fp8e4m3, 1, 1, M, K>, coord<st<fp8e4m3, BLOCK_SIZE_ROW, BLOCK_K>>, NUM_WARPS*WARP_THREADS>(As[next], A, {0, 0, block_row, k + 1});
+        load<2, false, kittens::ducks::rt_layout::row, st<fp8e4m3, BLOCK_SIZE_COL, BLOCK_K>, kittens::gl<fp8e4m3, 1, 1, N, K>, coord<st<fp8e4m3, BLOCK_SIZE_COL, BLOCK_K>>, NUM_WARPS*WARP_THREADS>(Bs[next], B, {0, 0, block_col, k + 1});
 
+        __builtin_amdgcn_s_waitcnt(0);
         __builtin_amdgcn_s_barrier();  // synchronizes all warps
         __builtin_amdgcn_sched_barrier(0); // stops compiler from reordering ops
 
@@ -478,7 +482,7 @@ int main() {
     constexpr int warmup_iters = 2;
     constexpr int timing_iters = 1;
     #else
-    constexpr int warmup_iters = 2;
+    constexpr int warmup_iters = 3;
     constexpr int timing_iters = 20;
     #endif
 
