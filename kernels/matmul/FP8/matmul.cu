@@ -465,6 +465,8 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
         // === ITERATION k ===
         // Load shared memory for k+2 while computing k
         {
+            /***** START GLOBAL TO SHARED VARS *****/
+
             // load<2, false,
             //      kittens::ducks::rt_layout::row, ST_A, kittens::gl<fp8e4m3, 1, 1, M, K>,
             //      coord<ST_A>,
@@ -486,6 +488,35 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
             constexpr int elem_per_warp = (16 / sizeof(fp8e4m3)) * kittens::WARP_THREADS; // 1024
             const T* lds_base = &dst_gl_to_st.data[0] + (warpid() * elem_per_warp);
 
+            /***** END GLOBAL TO SHARED VARS *****/
+
+            /***** START SHARED TO REGISTER VARS *****/
+
+            // auto as_subtile_temp = kittens::subtile_inplace<BLOCK_SIZE_ROW / WARPS_ROW, k_step>(As[next], {warp_m, 0});
+            // load(a_temp, as_subtile_temp);
+            using RT = RT_A;
+            RT& dst_st_to_rt = a_temp;
+            auto as_subtile_temp = kittens::subtile_inplace<BLOCK_SIZE_ROW / WARPS_ROW, k_step>(As[next], {warp_m, 0});
+            using ST_SUB = typeof(as_subtile_temp);
+            const ST_SUB& src_st_to_rt = as_subtile_temp;
+
+            using U  = ST_SUB::dtype;
+            uint32_t addr_st_to_rt = reinterpret_cast<uintptr_t>(&src_st_to_rt.data[laneid() * (16 / sizeof(U))]);
+
+            /***** END SHARED TO REGISTER VARS *****/
+
+            /***** START MMA VARS *****/
+
+            // this is doing the kth mma
+            // mma_ABt(c, a, b, c);
+            using D = RT_C;
+            D& d_mma = c;
+            const RT_A& a_mma = a;
+            const RT_B& b_mma = b;
+            const RT_C& c_mma = c;
+
+            /***** END MMA VARS *****/
+
             buffer_load_lds<T, ST, N_THREADS>(0, lds_base, srsrc, row_stride);
 
             buffer_load_lds<T, ST, N_THREADS>(1, lds_base, srsrc, row_stride);
@@ -501,19 +532,15 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
             buffer_load_lds<T, ST, N_THREADS>(6, lds_base, srsrc, row_stride);
 
             buffer_load_lds<T, ST, N_THREADS>(7, lds_base, srsrc, row_stride);
-        }
 
-        {
-            // auto as_subtile_temp = kittens::subtile_inplace<BLOCK_SIZE_ROW / WARPS_ROW, k_step>(As[next], {warp_m, 0});
-            // load(a_temp, as_subtile_temp);
-            using RT = RT_A;
-            RT& dst_st_to_rt = a_temp;
-            auto as_subtile_temp = kittens::subtile_inplace<BLOCK_SIZE_ROW / WARPS_ROW, k_step>(As[next], {warp_m, 0});
-            using ST_SUB = typeof(as_subtile_temp);
-            const ST_SUB& src_st_to_rt = as_subtile_temp;
-
-            using U  = ST_SUB::dtype;
-            uint32_t addr_st_to_rt = reinterpret_cast<uintptr_t>(&src_st_to_rt.data[laneid() * (16 / sizeof(U))]);
+            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, c_mma, 0, 0, 0);
+            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, d_mma, 0, 0, 1);
+            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, c_mma, 0, 1, 0);
+            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, d_mma, 0, 1, 1);
+            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, c_mma, 0, 2, 0);
+            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, d_mma, 0, 2, 1);
+            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, c_mma, 0, 3, 0);
+            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, d_mma, 0, 3, 1);
 
             ds_read_128_bits<RT, ST_SUB, U>(dst_st_to_rt, addr_st_to_rt, 0, 0, 0);
             ds_read_128_bits<RT, ST_SUB, U>(dst_st_to_rt, addr_st_to_rt, 0, 0, 1);
@@ -534,25 +561,8 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
             ds_read_128_bits<RT, ST_SUB, U>(dst_st_to_rt, addr_st_to_rt, 3, 0, 1);
             ds_read_128_bits<RT, ST_SUB, U>(dst_st_to_rt, addr_st_to_rt, 3, 1, 0);
             ds_read_128_bits<RT, ST_SUB, U>(dst_st_to_rt, addr_st_to_rt, 3, 1, 1);
-        }
 
-        {
-            // this is doing the kth mma
-            // mma_ABt(c, a, b, c);
-            using D = RT_C;
-            D& d_mma = c;
-            const RT_A& a_mma = a;
-            const RT_B& b_mma = b;
-            const RT_C& c_mma = c;
 
-            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, c_mma, 0, 0, 0);
-            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, d_mma, 0, 0, 1);
-            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, c_mma, 0, 1, 0);
-            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, d_mma, 0, 1, 1);
-            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, c_mma, 0, 2, 0);
-            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, d_mma, 0, 2, 1);
-            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, c_mma, 0, 3, 0);
-            mma_ABt_base_wrapper(d_mma, a_mma, b_mma, d_mma, 0, 3, 1);
             mma_ABt_base_wrapper(d_mma, a_mma, b_mma, c_mma, 1, 0, 0);
             mma_ABt_base_wrapper(d_mma, a_mma, b_mma, d_mma, 1, 0, 1);
             mma_ABt_base_wrapper(d_mma, a_mma, b_mma, c_mma, 1, 1, 0);
