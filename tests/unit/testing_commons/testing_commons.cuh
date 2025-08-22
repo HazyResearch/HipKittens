@@ -31,12 +31,20 @@ template<int S, int NW> std::string generate_test_name(std::string test_id) {
 template<int S, int NW, kittens::ducks::rt_layout::all L> std::string generate_test_name(std::string test_id) {
     std::string label = generate_test_name<S,NW>(test_id);
     if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
+    #ifdef KITTENS_CDNA4
+    else if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::accumulator_col>) label += "_[rt_accumulator_col_layout]";
+    else if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::accumulator_row>) label += "_[rt_accumulator_row_layout]";
+    #endif
     else label += "_[rt_col_layout]";
     return label;
 }
 template<int S, int NW, kittens::ducks::rt_layout::all L1, kittens::ducks::rt_layout::all L2> std::string generate_test_name(std::string test_id) {
     std::string label = generate_test_name<S,NW,L1>(test_id);
     if constexpr (std::is_same_v<L2, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
+    #ifdef KITTENS_CDNA4
+    else if constexpr (std::is_same_v<L2, kittens::ducks::rt_layout::accumulator_col>) label += "_[rt_accumulator_col_layout]";
+    else if constexpr (std::is_same_v<L2, kittens::ducks::rt_layout::accumulator_row>) label += "_[rt_accumulator_row_layout]";
+    #endif
     else label += "_[rt_col_layout]";
     return label;
 }
@@ -73,9 +81,43 @@ template<int H, int W, int NW, integral_wrapper _K> std::string generate_test_na
     }
     return label;
 }
+template<int H, int W, int NW, integral_wrapper _K, kittens::ducks::st_layout::all L> std::string generate_test_name(std::string test_id) {
+    constexpr int K = _K::value;
+    std::string label = test_id+"_["+std::to_string(H)+"x"+std::to_string(W)+"]x"+std::to_string(K);
+    if constexpr (NW > 1) {
+        label += "_["+std::to_string(NW)+"warps]";
+    }
+    if constexpr (std::is_same_v<L, kittens::ducks::st_layout::row>) label += "_[st_row_layout]";
+    #ifdef KITTENS_CDNA4
+    else if constexpr (std::is_same_v<L, kittens::ducks::st_layout::accumulator_col>) label += "_[st_accumulator_col_layout]";
+    else if constexpr (std::is_same_v<L, kittens::ducks::st_layout::accumulator_row>) label += "_[st_accumulator_row_layout]";
+    #endif
+    else label += "_[st_col_layout]";
+    return label;
+}
 template<int H, int W, int NW, kittens::ducks::rt_layout::all L> std::string generate_test_name(std::string test_id) {
     std::string label = generate_test_name<H,W,NW>(test_id);
     if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
+    #ifdef KITTENS_CDNA4
+    else if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::accumulator_col>) label += "_[rt_accumulator_col_layout]";
+    else if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::accumulator_row>) label += "_[rt_accumulator_row_layout]";
+    #endif
+    else label += "_[rt_col_layout]";
+    return label;
+}
+template<int H, int W, int NW, kittens::ducks::st_layout::all SL, kittens::ducks::rt_layout::all RL> std::string generate_test_name(std::string test_id) {
+    std::string label = generate_test_name<H,W,NW>(test_id);
+    if constexpr (std::is_same_v<SL, kittens::ducks::st_layout::row>) label += "_[st_row_layout]";
+    #ifdef KITTENS_CDNA4
+    else if constexpr (std::is_same_v<SL, kittens::ducks::st_layout::accumulator_col>) label += "_[st_accumulator_col_layout]";
+    else if constexpr (std::is_same_v<SL, kittens::ducks::st_layout::accumulator_row>) label += "_[st_accumulator_row_layout]";
+    #endif
+    else label += "_[st_col_layout]";
+    if constexpr (std::is_same_v<RL, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
+    #ifdef KITTENS_CDNA4
+    else if constexpr (std::is_same_v<RL, kittens::ducks::rt_layout::accumulator_col>) label += "_[rt_accumulator_col_layout]";
+    else if constexpr (std::is_same_v<RL, kittens::ducks::rt_layout::accumulator_row>) label += "_[rt_accumulator_row_layout]";
+    #endif
     else label += "_[rt_col_layout]";
     return label;
 }
@@ -129,14 +171,14 @@ struct wrapper_1d {
         test_info this_result;
         this_result.label = generate_test_name<S,NUM_WORKERS,args...>(test::test_identifier);
         if constexpr (test::template valid<S, NUM_WORKERS, args...>::value) {
-            constexpr int SIZE = S*16;
+            constexpr int SIZE = S*kittens::TILE_COL_DIM<dtype>;
             // initialize
             dtype *d_i, *d_o;
             std::vector<float> i_ref(SIZE);
             std::vector<float> o_ref(SIZE);
             initialize(&d_i, &d_o, i_ref, o_ref);
             // make descriptors
-            using GL = typename kittens::gl<dtype, 1, 1, 1, S*16>;
+            using GL = typename kittens::gl<dtype, 1, 1, 1, S*kittens::TILE_COL_DIM<dtype>>;
             GL input(d_i, nullptr, nullptr, nullptr, nullptr);
             GL output(d_o, nullptr, nullptr, nullptr, nullptr);
             // run kernel
@@ -145,11 +187,11 @@ struct wrapper_1d {
                 hipFuncAttributeMaxDynamicSharedMemorySize,
                 kittens::MAX_SHARED_MEMORY
             );
-            global_wrapper_1d<test, dtype, S, NUM_WORKERS, GL, args...><<<1, NUM_WORKERS*64, kittens::MAX_SHARED_MEMORY>>>(input, output);
+            global_wrapper_1d<test, dtype, S, NUM_WORKERS, GL, args...><<<1, NUM_WORKERS*kittens::WARP_THREADS, kittens::MAX_SHARED_MEMORY>>>(input, output);
             // fill in correct results on cpu
             test::template host_func<S, NUM_WORKERS, GL, args...>(i_ref, o_ref);
             // check and cleanup
-            this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, S*16);
+            this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, S*kittens::TILE_COL_DIM<dtype>);
         }
         else {
             this_result.result = test_result::INVALID;
@@ -188,29 +230,29 @@ struct wrapper_2d {
         test_info this_result;
         this_result.label = generate_test_name<H,W,NUM_WORKERS,args...>(test::test_identifier);
         if constexpr (test::template valid<H, W, NUM_WORKERS, args...>::value) {
-            constexpr int SIZE = H*W*256;
+            constexpr int SIZE = H*W*kittens::TILE_COL_DIM<dtype>*kittens::TILE_ROW_DIM<dtype>;
             // initialize
             dtype *d_i, *d_o;
             std::vector<float> i_ref(SIZE);
             std::vector<float> o_ref(SIZE);
             initialize(&d_i, &d_o, i_ref, o_ref);
             // make descriptors
-            using GL = typename kittens::gl<dtype, 1, 1, H*16, W*16>;
+            using GL = typename kittens::gl<dtype, 1, 1, H*kittens::TILE_ROW_DIM<dtype>, W*kittens::TILE_COL_DIM<dtype>>;
             GL input(d_i, nullptr, nullptr, nullptr, nullptr);
             GL output(d_o, nullptr, nullptr, nullptr, nullptr);
             // run kernel
             hipFuncSetAttribute(
                 reinterpret_cast<const void*>(global_wrapper_2d<test, dtype, H, W, NUM_WORKERS, GL, args...>),
                 hipFuncAttributeMaxDynamicSharedMemorySize,
-                kittens::MAX_SHARED_MEMORY
+                kittens::MAX_SHARED_MEMORY / 2
             );
-            global_wrapper_2d<test, dtype, H, W, NUM_WORKERS, GL, args...><<<1, NUM_WORKERS*64, kittens::MAX_SHARED_MEMORY>>>(input, output);
+            global_wrapper_2d<test, dtype, H, W, NUM_WORKERS, GL, args...><<<1, NUM_WORKERS*kittens::WARP_THREADS, kittens::MAX_SHARED_MEMORY / 2>>>(input, output);
             // fill in correct results on cpu
             test::template host_func<H, W, NUM_WORKERS, GL, args...>(i_ref, o_ref);
             // check and cleanup
 
             int is_fp8 = (this_result.label.find("fp8") != std::string::npos) || (this_result.label.find("e4m3") != std::string::npos) || (this_result.label.find("e5m2") != std::string::npos);
-            this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, W*16, is_fp8 ? 0.1 : 5e-2); // mma's sometimes produce small errors. this appears to be hardware.
+            this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, W*kittens::TILE_COL_DIM<dtype>, is_fp8 ? 0.1 : 5e-2); // mma's sometimes produce small errors. this appears to be hardware.
         }
         else {
             this_result.result = test_result::INVALID;
@@ -226,9 +268,14 @@ template<typename test, int MAX_H=8, int MAX_W=8, typename... args> using sweep_
 template<template<typename> typename test, int MAX_H=8, int MAX_W=8, int NUM_WORKERS=1, typename... args>
 struct sweep_gmem_type_2d {
     static void run(test_data &results) {
+        #ifdef KITTENS_CDNA4
+        sweep_size_2d<test<kittens::bf16>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
+        sweep_size_2d<test<kittens::half>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
+        #else
         sweep_size_2d<test<float>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
         sweep_size_2d<test<kittens::bf16>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
         sweep_size_2d<test<kittens::half>, MAX_H, MAX_W, NUM_WORKERS, args...>::run(results);
+        #endif
     }
 };
 template<template<typename> typename test, int MAX_H=8, int MAX_W=8, typename... args> using sweep_gmem_type_2d_warp = sweep_gmem_type_2d<test, MAX_H, MAX_W, 1, args...>;

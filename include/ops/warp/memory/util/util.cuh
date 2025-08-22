@@ -10,6 +10,13 @@
 
 namespace kittens {
 
+enum class coherency {
+    cache_all = 0,
+    cache_global = 1,
+    cache_stream = 2,
+    non_temporal = 3
+};
+
 /* ----------   Shared memory utilities  ---------- */
 __device__ inline float2 load_shared_vec(uint32_t lds_off) {
     float2 result;
@@ -112,7 +119,6 @@ __device__ inline float4 load_global_vec4_async(const float4* gptr) {
     );
     return v;   
 }
-
 
 /* ----------   To prevent generic addressing  ---------- */
 

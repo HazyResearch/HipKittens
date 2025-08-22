@@ -2,6 +2,14 @@
 
 #ifdef TEST_WARP_REGISTER_TILE_CONVERSIONS
 
+#ifdef KITTENS_CDNA4
+#define ROWS 32
+#define COLS 32
+#else
+#define ROWS 16
+#define COLS 16
+#endif
+
 // Transpose happens to need its own wrapper, as it has a different shape input and output.
 template<typename Ker, typename T, int H, int W, int NW, gl_t GTL_I, gl_t GTL_O, typename... args>
 static __global__ void transpose_global_wrapper_2d(const GTL_I input, GTL_O output) {
@@ -16,25 +24,25 @@ struct transpose_wrapper_2d {
         if constexpr (test::template valid<H, W, NUM_WORKERS, args...>::value) {
             // initialize
             kittens::bf16 *d_i, *d_o;
-            std::vector<float> i_ref(H*W*256);
-            std::vector<float> o_ref(H*W*256);
+            std::vector<float> i_ref(H*W*ROWS*COLS);
+            std::vector<float> o_ref(H*W*ROWS*COLS);
             initialize(&d_i, &d_o, i_ref, o_ref);
             // make descriptors
-            using GTL_I = typename kittens::gl<kittens::bf16, 1, 1, H*16, W*16>;
-            using GTL_O = typename kittens::gl<kittens::bf16, 1, 1, W*16, H*16>;
+            using GTL_I = typename kittens::gl<kittens::bf16, 1, 1, H*ROWS, W*COLS>;
+            using GTL_O = typename kittens::gl<kittens::bf16, 1, 1, W*COLS, H*ROWS>;
             GTL_I input (d_i, nullptr, nullptr, nullptr, nullptr);
             GTL_O output(d_o, nullptr, nullptr, nullptr, nullptr);
             // run kernel
             hipFuncSetAttribute(
                 reinterpret_cast<void *>(transpose_global_wrapper_2d<test, kittens::bf16, H, W, NUM_WORKERS, GTL_I, GTL_O, args...>),
                 hipFuncAttributeMaxDynamicSharedMemorySize,
-                kittens::MAX_SHARED_MEMORY
+                kittens::MAX_SHARED_MEMORY / 2 // half the shared memory because permlane32_swap uses shared memory
             );
-            transpose_global_wrapper_2d<test, kittens::bf16, H, W, NUM_WORKERS, GTL_I, GTL_O, args...><<<1, NUM_WORKERS*64, kittens::MAX_SHARED_MEMORY>>>(input, output);
+            transpose_global_wrapper_2d<test, kittens::bf16, H, W, NUM_WORKERS, GTL_I, GTL_O, args...><<<1, NUM_WORKERS*kittens::WARP_THREADS, kittens::MAX_SHARED_MEMORY / 2>>>(input, output);
             // fill in correct results on cpu
             test::template host_func<H, W, NUM_WORKERS, GTL_I, GTL_O, args...>(i_ref, o_ref);
             // check and cleanup
-            this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, W*16, 0.02); // mma's sometimes produce small errors. this appears to be hardware.
+            this_result.result = validate(d_i, d_o, i_ref, o_ref, this_result.label, W*COLS, 0.02); // mma's sometimes produce small errors. this appears to be hardware.
         }
         else {
             this_result.result = test_result::INVALID;
@@ -53,7 +61,7 @@ struct test_swap_layout {
         o_ref = i_ref; // overwrite the whole thing
     }
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt_bf<16*H, 16*W, L> reg_tile;
+        kittens::rt_bf<ROWS*H, COLS*W, L> reg_tile;
         kittens::load(reg_tile, input, {});
         auto &reg_tile_other_layout = kittens::swap_layout_inplace(reg_tile);
         kittens::store(output, reg_tile_other_layout, {});
@@ -63,13 +71,13 @@ struct test_transpose {
     template<int H, int W, int NW, kittens::ducks::rt_layout::all L> using valid = std::bool_constant<NW == 1 && W*H<=64>; // this is warp-level
     static inline const std::string test_identifier = "reg_transpose";
     template<int H, int W, int NW, gl_t GTL_I, gl_t GTL_O, kittens::ducks::rt_layout::all L> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
-        for(int i = 0; i < H*16; i++)
-            for(int j = 0; j < W*16; j++)
-                o_ref[i+j*H*16] = i_ref[i*W*16+j];
+        for(int i = 0; i < H*ROWS; i++)
+            for(int j = 0; j < W*COLS; j++)
+                o_ref[i+j*H*ROWS] = i_ref[i*W*COLS+j];
     }
     template<int H, int W, int NW, gl_t GTL_I, gl_t GTL_O, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GTL_I input, GTL_O output) {
-        kittens::rt_bf<16*H, 16*W, L> reg_tile;
-        kittens::rt_bf<16*W, 16*H, L> reg_tile_transpose;
+        kittens::rt_bf<ROWS*H, COLS*W, L> reg_tile;
+        kittens::rt_bf<COLS*W, ROWS*H, L> reg_tile_transpose;
         kittens::load(reg_tile, input, {});
         kittens::transpose_sep(reg_tile_transpose, reg_tile);
         kittens::store(output, reg_tile_transpose, {});
@@ -82,8 +90,8 @@ struct test_type_convert {
         o_ref = i_ref; // overwrite the whole thing
     }
     template<int H, int W, int NW, gl_t GL, typename T2, typename U2> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt<U2, 16*H, 16*W> reg_tile_U2;
-        kittens::rt<T2, 16*H, 16*W> reg_tile_T2;
+        kittens::rt<U2, ROWS*H, COLS*W> reg_tile_U2;
+        kittens::rt<T2, ROWS*H, COLS*W> reg_tile_T2;
         kittens::load(reg_tile_U2, input, {});
         kittens::copy(reg_tile_T2, reg_tile_U2);
         kittens::store(output, reg_tile_T2, {});
@@ -94,17 +102,17 @@ struct test_subtile {
     template<int H, int W, int NW, typename ST_H> using valid = std::bool_constant<NW == 1 && (H%(ST_H::value))==0 && W*H<=64>; // this is warp-level
     static inline const std::string test_identifier = "reg_subtile";
     template<int H, int W, int NW, gl_t GL, typename ST_H> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
-        for(int i = 0; i < H*16; i++)
-            for(int j = 0; j < W*16; j++)
-                o_ref[i*W*16 + j] = i_ref[i*W*16 + j] + float(i/(ST_H::value*16));
+        for(int i = 0; i < H*ROWS; i++)
+            for(int j = 0; j < W*COLS; j++)
+                o_ref[i*W*COLS + j] = i_ref[i*W*COLS + j] + float(i/(ST_H::value*ROWS));
     }
     template<int H, int W, int NW, gl_t GL, typename _ST_H> __device__ static void device_func(const GL input, const GL output) {
         constexpr int ST_H = _ST_H::value;
-        kittens::rt_fl<16*H, 16*W> reg_tile;
+        kittens::rt_fl<ROWS*H, COLS*W> reg_tile;
         kittens::load(reg_tile, input, {});
         #pragma unroll
         for(int i = 0; i < H/ST_H; i++) {
-            auto &ref = kittens::subtile_inplace<ST_H*16>(reg_tile, i);
+            auto &ref = kittens::subtile_inplace<ST_H*ROWS>(reg_tile, i);
             kittens::add(ref, ref, float(i));
         }
         kittens::store(output, reg_tile, {});
@@ -114,12 +122,12 @@ struct test_make_causal {
     template<int H, int W, int NW, kittens::ducks::rt_layout::all L> using valid = std::bool_constant<NW == 1 && H==W && W*H<=64>; // this is warp-level
     static inline const std::string test_identifier = "reg_make_causal";
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
-        for(int i = 0; i < H*16; i++)
-            for(int j = 0; j < W*16; j++)
-                o_ref[i*W*16 + j] = j<=i ? i_ref[i*W*16 + j] : 0;
+        for(int i = 0; i < H*ROWS; i++)
+            for(int j = 0; j < W*COLS; j++)
+                o_ref[i*W*COLS + j] = j<=i ? i_ref[i*W*COLS + j] : 0;
     }
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt_fl<16*H, 16*W, L> reg_tile;
+        kittens::rt_fl<ROWS*H, COLS*W, L> reg_tile;
         kittens::load(reg_tile, input, {});
         kittens::make_causal(reg_tile, reg_tile);
         kittens::store(output, reg_tile, {});
@@ -130,12 +138,12 @@ struct test_make_causal_t {
     template<int H, int W, int NW, kittens::ducks::rt_layout::all L> using valid = std::bool_constant<NW == 1 && H==W && W*H<=64>; // this is warp-level
     static inline const std::string test_identifier = "reg_make_causal";
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
-        for(int i = 0; i < H*16; i++)
-            for(int j = 0; j < W*16; j++)
-                o_ref[i*W*16 + j] = j>=i ? i_ref[i*W*16 + j] : 0;
+        for(int i = 0; i < H*ROWS; i++)
+            for(int j = 0; j < W*COLS; j++)
+                o_ref[i*W*COLS + j] = j>=i ? i_ref[i*W*COLS + j] : 0;
     }
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt_fl<16*H, 16*W, L> reg_tile;
+        kittens::rt_fl<ROWS*H, COLS*W, L> reg_tile;
         kittens::load(reg_tile, input, {});
         kittens::make_causal_t(reg_tile, reg_tile);
         kittens::store(output, reg_tile, {});
@@ -147,12 +155,12 @@ struct test_tril {
     static inline const std::string test_identifier = "reg_tril";
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
         // triangular lower, with diagonal starting at row_idx 4
-        for(int i = 0; i < H*16; i++)
-            for(int j = 0; j < W*16; j++)
-                o_ref[i*W*16 + j] = i>=j+(4*H) ? i_ref[i*W*16 + j] : 0;
+        for(int i = 0; i < H*ROWS; i++)
+            for(int j = 0; j < W*COLS; j++)
+                o_ref[i*W*COLS + j] = i>=j+(4*H) ? i_ref[i*W*COLS + j] : 0;
     }
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt_fl<16*H, 16*W, L> reg_tile;
+        kittens::rt_fl<ROWS*H, COLS*W, L> reg_tile;
         kittens::load(reg_tile, input, {});
         kittens::tril(reg_tile, reg_tile, 4*H);
         kittens::store(output, reg_tile, {});
@@ -163,12 +171,12 @@ struct test_triu {
     static inline const std::string test_identifier = "reg_triu";
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
         // triangular upper, with diagonal starting at row_idx 4
-        for(int i = 0; i < H*16; i++)
-            for(int j = 0; j < W*16; j++)
-                o_ref[i*W*16 + j] = i<=j+(4*H) ? i_ref[i*W*16 + j] : 0;
+        for(int i = 0; i < H*ROWS; i++)
+            for(int j = 0; j < W*COLS; j++)
+                o_ref[i*W*COLS + j] = i<=j+(4*H) ? i_ref[i*W*COLS + j] : 0;
     }
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt_fl<16*H, 16*W, L> reg_tile;
+        kittens::rt_fl<ROWS*H, COLS*W, L> reg_tile;
         kittens::load(reg_tile, input, {});
         kittens::triu(reg_tile, reg_tile, 4*H);
         kittens::store(output, reg_tile, {});
@@ -179,12 +187,12 @@ struct test_right_fill {
     static inline const std::string test_identifier = "reg_right_fill";
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
         // here, set everything to from and right of col_idx 8 is set to zero
-        for(int i = 0; i < H*16; i++) 
-            for(int j = 0; j < W*16; j++) 
-            o_ref[i*W*16 + j] = (j < (8 * W)) ? i_ref[i*W*16 + j] : 0;
+        for(int i = 0; i < H*ROWS; i++) 
+            for(int j = 0; j < W*COLS; j++) 
+            o_ref[i*W*COLS + j] = (j < (8 * W)) ? i_ref[i*W*COLS + j] : 0;
     }
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt_fl<16*H, 16*W, L> reg_tile;
+        kittens::rt_fl<ROWS*H, COLS*W, L> reg_tile;
         kittens::load(reg_tile, input, {});
         kittens::right_fill(reg_tile, reg_tile, 8 * W);
         kittens::store(output, reg_tile, {});
@@ -195,12 +203,12 @@ struct test_left_fill {
     static inline const std::string test_identifier = "reg_left_fill";
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
         // here, set everything to from and left of col_idx 8 is set to zero
-        for(int i = 0; i < H*16; i++) 
-            for(int j = 0; j < W*16; j++) 
-                o_ref[i*W*16 + j] = (j >= (8 * W)) ? i_ref[i*W*16 + j] : 0;
+        for(int i = 0; i < H*ROWS; i++) 
+            for(int j = 0; j < W*COLS; j++) 
+                o_ref[i*W*COLS + j] = (j >= (8 * W)) ? i_ref[i*W*COLS + j] : 0;
     }
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt_fl<16*H, 16*W, L> reg_tile;
+        kittens::rt_fl<ROWS*H, COLS*W, L> reg_tile;
         kittens::load(reg_tile, input, {});
         kittens::left_fill(reg_tile, reg_tile, 8 * W);
         kittens::store(output, reg_tile, {});
@@ -211,12 +219,12 @@ struct test_lower_fill {
     static inline const std::string test_identifier = "reg_lower_fill";
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
         // here, set everything to from and lower of row_idx 8 is set to zero
-        for(int i = 0; i < H*16; i++) 
-            for(int j = 0; j < W*16; j++) 
-                o_ref[i*W*16 + j] = (i < (8 * H)) ? i_ref[i*W*16 + j] : 0;
+        for(int i = 0; i < H*ROWS; i++) 
+            for(int j = 0; j < W*COLS; j++) 
+                o_ref[i*W*COLS + j] = (i < (8 * H)) ? i_ref[i*W*COLS + j] : 0;
     }
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt_fl<16*H, 16*W, L> reg_tile;
+        kittens::rt_fl<ROWS*H, COLS*W, L> reg_tile;
         kittens::load(reg_tile, input, {});
         kittens::lower_fill(reg_tile, reg_tile, 8 * H);
         kittens::store(output, reg_tile, {});
@@ -227,12 +235,12 @@ struct test_upper_fill {
     static inline const std::string test_identifier = "reg_upper_fill";
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
         // here, set everything to from and upper of row_idx 8 is set to zero
-        for(int i = 0; i < H*16; i++) 
-            for(int j = 0; j < W*16; j++) 
-                o_ref[i*W*16 + j] = (i >= ((8 * H))) ? i_ref[i*W*16 + j] : 0;
+        for(int i = 0; i < H*ROWS; i++) 
+            for(int j = 0; j < W*COLS; j++) 
+                o_ref[i*W*COLS + j] = (i >= ((8 * H))) ? i_ref[i*W*COLS + j] : 0;
     }
     template<int H, int W, int NW, gl_t GL, kittens::ducks::rt_layout::all L> __device__ static void device_func(const GL input, const GL output) {
-        kittens::rt_fl<16*H, 16*W, L> reg_tile;
+        kittens::rt_fl<ROWS*H, COLS*W, L> reg_tile;
         kittens::load(reg_tile, input, {});
         kittens::upper_fill(reg_tile, reg_tile, 8 * H);
         kittens::store(output, reg_tile, {});
@@ -241,10 +249,12 @@ struct test_upper_fill {
 
 void warp::reg::tile::conversions::tests(test_data &results) {
     std::cout << "\n ----- Starting ops/warp/register/tile/conversions tests! -----\n" << std::endl;
-    constexpr int SIZE = INTENSITY_1 ? 2  :
+    constexpr int SIZE = INTENSITY_0 ? 1  :
+                         INTENSITY_1 ? 2  :
                          INTENSITY_2 ? 4  : 
                          INTENSITY_3 ? 8  :
                          INTENSITY_4 ? 16 : -1;
+    // swap_layout
     sweep_size_2d_warp<test_swap_layout, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<test_swap_layout, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
 
@@ -263,22 +273,24 @@ void warp::reg::tile::conversions::tests(test_data &results) {
     sweep_size_2d_warp<test_subtile, SIZE, SIZE, std::integral_constant<int, 3>>::run(results);
     sweep_size_2d_warp<test_subtile, SIZE, SIZE, std::integral_constant<int, 4>>::run(results);
 
+    sweep_size_2d_warp<test_make_causal, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
+    sweep_size_2d_warp<test_make_causal_t, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
+
     sweep_size_2d_warp<test_right_fill, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<test_right_fill, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
     sweep_size_2d_warp<test_left_fill,  SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<test_left_fill,  SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
+
     sweep_size_2d_warp<test_lower_fill, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<test_lower_fill, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
     sweep_size_2d_warp<test_upper_fill, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<test_upper_fill, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
 
     sweep_size_2d_warp<test_tril, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
-    sweep_size_2d_warp<test_triu, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<test_tril, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
+    sweep_size_2d_warp<test_triu, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<test_triu, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
 
-    sweep_size_2d_warp<test_make_causal, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
-    sweep_size_2d_warp<test_make_causal_t, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     // sweep_size_2d_warp<test_make_causal, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results); NOT YET SUPPORTED
 }
 

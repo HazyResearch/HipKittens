@@ -56,23 +56,18 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
         "rt_base was provided an unsupported type."
     );
 
-    #ifdef KITTENS_CDNA4
-    static constexpr int tile_size_row        = std::is_same_v<layout, ducks::rt_layout::accumulator> ? kittens::ACCUMULATOR_TILE_ROW_DIM<T> : kittens::TILE_ROW_DIM<T>; // < Tile size is a constant 16 for everyone
-    static constexpr int tile_size_col        = std::is_same_v<layout, ducks::rt_layout::accumulator> ? kittens::ACCUMULATOR_TILE_COL_DIM<T> : kittens::TILE_COL_DIM<T>;
-    #else
     static constexpr int tile_size_row        = kittens::TILE_ROW_DIM<T>; // < Tile size is a constant 16 for everyone
     static constexpr int tile_size_col        = kittens::TILE_COL_DIM<T>;
-    #endif
     static constexpr int rows                 = tile_size_row; ///< Number of rows.
     static constexpr int cols                 = tile_size_col; ///< Number of cols.
-    static constexpr int num_elements         = rows*cols; // 256
-    static constexpr int elements_per_thread  = num_elements / kittens::WARP_THREADS; // 4
+    static constexpr int num_elements         = rows*cols; // 1024
+    static constexpr int elements_per_thread  = num_elements / kittens::WARP_THREADS; // 16
 
     static constexpr int packed_per_thread    = (elements_per_thread / base_types::packing<dtype>::num()) ; // 2
     static constexpr int registers_per_thread = packed_per_thread * sizeof(dtype) / 4; // 2 or 4, registers are 32-bit words
 
-    using row_vec_layout = std::conditional_t<std::is_same_v<layout, ducks::rt_layout::row>, ducks::rv_layout::align, ducks::rv_layout::ortho>; // for holding column reductions
-    using col_vec_layout = std::conditional_t<std::is_same_v<layout, ducks::rt_layout::row>, ducks::rv_layout::ortho, ducks::rv_layout::align>; // for holding row reductions
+    using row_vec_layout = std::conditional_t<std::is_same_v<layout, ducks::rt_layout::row> || std::is_same_v<layout, ducks::rt_layout::accumulator_row>, ducks::rv_layout::align, ducks::rv_layout::ortho>; // for holding column reductions
+    using col_vec_layout = std::conditional_t<std::is_same_v<layout, ducks::rt_layout::row> || std::is_same_v<layout, ducks::rt_layout::accumulator_row>, ducks::rv_layout::ortho, ducks::rv_layout::align>; // for holding row reductions
 
     dtype data[packed_per_thread]; ///< The actual storage for the base tile
 };

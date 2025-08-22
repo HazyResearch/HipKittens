@@ -59,7 +59,11 @@ struct rv {
     static_assert(length % kittens::TILE_ROW_DIM<T> == 0, "Length must be divisible by the tile dimension");
     static constexpr int tiles  = _length / kittens::TILE_ROW_DIM<T>; ///< Length in subtiles, aliased for consistency with sv type
     static constexpr int inner_dim = layout::inner_dim; ///< Internal layout within a subtile. Either 1 or 2.
+    #ifdef KITTENS_CDNA4
+    static constexpr int outer_dim = is_naive ? (tiles+1)/2 : tiles;
+    #else
     static constexpr int outer_dim = is_naive ? (tiles+3)/4 : tiles; ///< Outer dim (also length in tiles)
+    #endif
 
     dtype data[outer_dim][inner_dim]; ///< The actual register vector data.
 

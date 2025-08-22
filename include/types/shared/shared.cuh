@@ -5,6 +5,10 @@
 
 #pragma once
 
+#ifdef KITTENS_CDNA4
+#include "st_layout.cuh"
+#endif
+
 #include "sv.cuh"
 #include "st.cuh"
 

@@ -17,9 +17,13 @@ namespace ducks {
 namespace rv_layout {
 
 /**
- * @brief A dummy type used to identify an aligned (8x replicated) layout.
+ * @brief A dummy type used to identify an aligned (32x replicated) layout.
  */
+#ifdef KITTENS_CDNA4
+struct align { constexpr static int inner_dim = 8; };
+#else
 struct align { constexpr static int inner_dim = 2; };
+#endif
 /**
  * @brief A dummy type used to identify an orthogonal (4x replicated) layout.
  */

@@ -31,11 +31,8 @@ namespace kittens {
  * @brief Tile dimension constant.
  */
 #ifdef KITTENS_CDNA4
-// double the row dimension due to the direct to lds swizzle pattern
-template<typename T> constexpr int TILE_COL_DIM = sizeof(T) == 1 ? 32 : 16; 
+template<typename T> constexpr int TILE_COL_DIM = sizeof(T) == 1 ? 64 : 32; 
 template<typename T> constexpr int TILE_ROW_DIM = 32;
-template<typename T> constexpr int ACCUMULATOR_TILE_COL_DIM = sizeof(T) == 1 ? 64 : 32;
-template<typename T> constexpr int ACCUMULATOR_TILE_ROW_DIM = 32;
 #else
 template<typename T> constexpr int TILE_COL_DIM = sizeof(T) == 1 ? 32 : 16;
 template<typename T> constexpr int TILE_ROW_DIM = 16;
@@ -111,7 +108,7 @@ struct default_type {};
 /**
  * @brief Mask constant for all active threads in a warp.
  */
-static constexpr uint32_t MASK_ALL = 0xFFFFFFFF;
+static constexpr uint64_t MASK_ALL = 0xFFFFFFFFFFFFFFFF;
 
 /**
  * @brief Perform a shuffle down operation on a packed type synchronously across a warp.
@@ -122,11 +119,26 @@ static constexpr uint32_t MASK_ALL = 0xFFFFFFFF;
  * @return The result of the shuffle operation.
  */
 template<typename T>
-__device__ static inline T packed_shfl_down(uint32_t mask, const T &f, int delta) {
+__device__ static inline T packed_shfl_down(uint64_t mask, const T &f, int delta) {
+
+    #ifdef KITTENS_CDNA4
+    if constexpr (std::is_same_v<T, bf16_2> || std::is_same_v<T, bf16>) {
+        static_assert(sizeof(__hip_bfloat162) == sizeof(unsigned int));
+        union {
+          __hip_bfloat162 bf162;
+          unsigned int ui;
+        } u{f};
+        u.ui = __shfl_down_sync<unsigned long long, unsigned int>(mask, u.ui, delta, 64);
+        return u.bf162;
+    } else {
+        return __shfl_down(f, delta);
+    }
+    #else
     return __shfl_down(f, delta);
+    #endif
 }
 template<>
-__device__ inline float2 packed_shfl_down<float2>(uint32_t mask, const float2 &f, int delta) {
+__device__ inline float2 packed_shfl_down<float2>(uint64_t mask, const float2 &f, int delta) {
     float2 r;
     r.x = __shfl_down(f.x, delta);
     r.y = __shfl_down(f.y, delta);
@@ -141,35 +153,35 @@ __device__ inline float2 packed_shfl_down<float2>(uint32_t mask, const float2 &f
  * @return The result of the shuffle operation.
  */
 template<typename T>
-__device__ static inline T packed_shfl(uint32_t mask, const T &f, int src) {
+__device__ static inline T packed_shfl(uint64_t mask, const T &f, int src) {
     return __shfl(f, src);
 }
 template<>
-__device__ inline bf16 packed_shfl(uint32_t mask, const bf16 &f, int src) {
+__device__ inline bf16 packed_shfl(uint64_t mask, const bf16 &f, int src) {
     float r = __shfl(base_types::convertor<float, bf16>::convert(f), src);
     return base_types::convertor<bf16, float>::convert(r);
 }
 template<>
-__device__ inline bf16_2 packed_shfl(uint32_t mask, const bf16_2 &f, int src) {
+__device__ inline bf16_2 packed_shfl(uint64_t mask, const bf16_2 &f, int src) {
     float2 r;
     r.x = __shfl(base_types::convertor<float, bf16>::convert(f.x), src);
     r.y = __shfl(base_types::convertor<float, bf16>::convert(f.y), src);
     return base_types::convertor<bf16_2, float2>::convert(r);
 }
 template<>
-__device__ inline half packed_shfl(uint32_t mask, const half &f, int src) {
+__device__ inline half packed_shfl(uint64_t mask, const half &f, int src) {
     float r = __shfl(base_types::convertor<float, half>::convert(f), src);
     return base_types::convertor<half, float>::convert(r);
 }
 template<>
-__device__ inline half_2 packed_shfl(uint32_t mask, const half_2 &f, int src) {
+__device__ inline half_2 packed_shfl(uint64_t mask, const half_2 &f, int src) {
     float2 r;
     r.x = __shfl(base_types::convertor<float, half>::convert(f.x), src);
     r.y = __shfl(base_types::convertor<float, half>::convert(f.y), src);
     return base_types::convertor<half_2, float2>::convert(r);
 }
 template<>
-__device__ inline float2 packed_shfl<float2>(uint32_t mask, const float2 &f, int src) {
+__device__ inline float2 packed_shfl<float2>(uint64_t mask, const float2 &f, int src) {
     float2 r;
     r.x = __shfl(f.x, src);
     r.y = __shfl(f.y, src);
@@ -178,7 +190,6 @@ __device__ inline float2 packed_shfl<float2>(uint32_t mask, const float2 &f, int
 
 using bytes_8  = HIP_vector_type<float, 2>;
 using bytes_16 = HIP_vector_type<float, 4>;
-using bytes_32 = HIP_vector_type<float, 8>;
 
 /* ----------  SHARED MEMORY UTILS  ---------- */
 
