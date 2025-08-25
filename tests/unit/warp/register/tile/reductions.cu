@@ -112,16 +112,23 @@ void warp::reg::tile::reductions::tests(test_data &results) {
                          INTENSITY_4 ? 16 : 32;
     sweep_size_2d_warp<normalize_row, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<normalize_row, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
-    sweep_size_2d_warp<normalize_row, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_col>::run(results);
     sweep_size_2d_warp<normalize_col, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<normalize_col, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
-    sweep_size_2d_warp<normalize_col, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_col>::run(results);
     sweep_size_2d_warp<broadcast_row, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<broadcast_row, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
-    sweep_size_2d_warp<broadcast_row, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_col>::run(results);
     sweep_size_2d_warp<broadcast_col, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<broadcast_col, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
+
+    #ifdef KITTENS_CDNA4
+    sweep_size_2d_warp<normalize_row, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_row>::run(results);
+    sweep_size_2d_warp<normalize_col, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_row>::run(results);
+    sweep_size_2d_warp<broadcast_row, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_row>::run(results);
+    sweep_size_2d_warp<broadcast_col, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_row>::run(results);
+    sweep_size_2d_warp<normalize_row, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_col>::run(results);
+    sweep_size_2d_warp<normalize_col, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_col>::run(results);
+    sweep_size_2d_warp<broadcast_row, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_col>::run(results);
     sweep_size_2d_warp<broadcast_col, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_col>::run(results);
+    #endif
 }
 
 #endif

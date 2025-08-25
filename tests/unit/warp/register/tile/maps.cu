@@ -32,7 +32,11 @@ void warp::reg::tile::maps::tests(test_data &results) {
                          INTENSITY_4 ? 16 : -1;
     sweep_size_2d_warp<test_exp, SIZE, SIZE, kittens::ducks::rt_layout::row>::run(results);
     sweep_size_2d_warp<test_exp, SIZE, SIZE, kittens::ducks::rt_layout::col>::run(results);
+
+    #ifdef KITTENS_CDNA4
+    sweep_size_2d_warp<test_exp, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_row>::run(results);
     sweep_size_2d_warp<test_exp, SIZE, SIZE, kittens::ducks::rt_layout::accumulator_col>::run(results);
+    #endif
 }
 
 #endif

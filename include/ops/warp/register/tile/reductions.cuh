@@ -200,6 +200,56 @@ __device__ static inline void row_reduce(V &row_accum, const T &src, const V &sr
 }
 
 #ifdef KITTENS_CDNA4
+template<typename op, ducks::rv::all V, ducks::rt::accumulator_row_layout T, bool reset>
+__device__ static inline void row_reduce(V &row_accum, const T &src, const V &src_accum) {
+    // I actually like these static asserts because they give more verbose errors when things go wrong.
+    static_assert(std::is_same_v<typename V::layout, typename rt_base<typename T::T, typename T::layout>::col_vec_layout>); // compatible layout
+    static_assert(std::is_same_v<typename V::T2, typename T::dtype>); // compatible type
+    static_assert(V::outer_dim == T::height); // compatible size
+
+    using dtype = T::dtype;
+    using RT = V::dtype;
+    using RT2 = base_types::packing<RT>::packed_type;
+
+    #pragma unroll
+    for(int i = 0; i < src.height; i++) {
+        dtype accum_packed = src.tiles[i][0].data[0];
+        for (int k = 1; k < src.packed_per_tile; k++) {
+            accum_packed = op::template op<dtype>(accum_packed, src.tiles[i][0].data[k]);
+        }
+
+        #pragma unroll
+        for(int j = 1; j < src.width; j++) {
+            #pragma unroll
+            for (int k = 0; k < src.packed_per_tile; k++) {
+                accum_packed = op::template op<dtype>(accum_packed, src.tiles[i][j].data[k]);
+            }
+        }
+        RT accum_single = op::template op<RT>(accum_packed.x, accum_packed.y);
+
+        if constexpr (std::is_same_v<RT, float>) {
+            float res = __shfl(accum_single, laneid() ^ 32);
+            accum_single = op::template op<RT>(accum_single, res);
+        }
+        else if constexpr (std::is_same_v<RT, bf16>) {
+            uint2_t res = __builtin_amdgcn_permlane32_swap(__bfloat16_as_ushort(accum_single), __bfloat16_as_ushort(accum_single), false, true);
+            accum_single = op::template op<RT>(__ushort_as_bfloat16(res.x), __ushort_as_bfloat16(res.y));
+        }
+        else if constexpr (std::is_same_v<RT, half>) {
+            uint2_t res = __builtin_amdgcn_permlane32_swap(__half_as_ushort(accum_single), __half_as_ushort(accum_single), false, true);
+            accum_single = op::template op<RT>(__ushort_as_half(res.x), __ushort_as_half(res.y));
+        } else {
+            static_assert(false, "Unsupported type");
+        }
+
+        if(reset) {
+            row_accum[i][0] = accum_single;
+        }
+        else {
+            row_accum[i][0] = op::template op<RT>(src_accum[i][0], accum_single);
+        }
+    }
+}
 template<typename op, ducks::rv::all V, ducks::rt::accumulator_col_layout T, bool reset>
 __device__ static inline void row_reduce(V &row_accum, const T &src, const V &src_accum) {
     // I actually like these static asserts because they give more verbose errors when things go wrong.
@@ -450,6 +500,63 @@ __device__ static inline void col_reduce(V &col_accum, const T &src, const V &sr
 #endif
 
 #ifdef KITTENS_CDNA4
+template<typename op, ducks::rv::all V, ducks::rt::accumulator_row_layout T, bool reset>
+__device__ static inline void col_reduce(V &col_accum, const T &src, const V &src_accum) {
+    // I actually like these static asserts because they give more verbose errors when things go wrong.
+    static_assert(std::is_same_v<typename V::layout, typename rt_base<typename T::T, typename T::layout>::row_vec_layout>); // compatible layout
+    static_assert(std::is_same_v<typename V::dtype, typename T::dtype>); // compatible type
+    static_assert(V::outer_dim == T::width); // compatible size
+
+    using RT2 = V::dtype;
+    using RT = base_types::packing<RT2>::unpacked_type;
+
+    const int leader = (laneid() / 32) * 32;
+    const int packed_per_tile = 8;
+    const int max_shift = 16;
+
+    RT2 accum[packed_per_tile];
+
+    #pragma unroll
+    for(int j = 0; j < src.width; j++) {
+        #pragma unroll
+        for(int k = 0; k < packed_per_tile; k++) {
+            accum[k] = src.tiles[0][j].data[k];
+        }
+        #pragma unroll
+        for(int i = 1; i < src.height; i++) {
+            #pragma unroll
+            for(int k = 0; k < packed_per_tile; k++) {
+                accum[k] = op::template op<RT2>(accum[k], src.tiles[i][j].data[k]);
+            }
+        }
+
+        #pragma unroll
+        for(int k = 0; k < packed_per_tile; k++) {
+            for (int shift = max_shift; shift > 0; shift /= 2) {
+                accum[k] = op::template op<RT2>(accum[k], packed_shfl_down(MASK_ALL, accum[k], shift));
+            }
+        }
+
+        if(reset) {
+            #pragma unroll
+            for(int k = 0; k < packed_per_tile; k++) {
+                col_accum[j][k] = accum[k];
+            }
+        }
+        else {
+            #pragma unroll
+            for(int k = 0; k < packed_per_tile; k++) {
+                col_accum[j][k] = op::template op<RT2>(src_accum[j][k], accum[k]);
+            }
+        }
+
+        #pragma unroll
+        for(int k = 0; k < packed_per_tile; k++) {
+            col_accum[j][k] = packed_shfl(MASK_ALL, col_accum[j][k], leader);
+        }
+    }
+}
+
 template<typename op, ducks::rv::all V, ducks::rt::accumulator_col_layout T, bool reset>
 __device__ static inline void col_reduce(V &col_accum, const T &src, const V &src_accum) {
 
