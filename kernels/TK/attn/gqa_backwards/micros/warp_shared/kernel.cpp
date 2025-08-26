@@ -4,7 +4,7 @@ using namespace kittens;
 
 constexpr int b = 1;
 constexpr int h = 1;
-constexpr int n = 128;
+constexpr int n = 32;
 constexpr int d = 32;
 
 constexpr int BLOCK_SIZE = 32;
@@ -24,6 +24,9 @@ struct micro_globals {
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
 void micro_tk(const micro_globals g) {
+
+    int i = blockIdx.x;
+
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
     st_bf<n, d, ducks::st_layout::row> (&tile_smem)[NUM_WARPS] = al.allocate<st_bf<n, d, ducks::st_layout::row>, NUM_WARPS>();
@@ -40,7 +43,7 @@ void micro_tk(const micro_globals g) {
     __syncthreads();
 
     // load to smem
-    load<2, false>(tile_smem[warpid()], g.in, {0, 0, 0, 0}, swizzled_offsets);
+    load<2, false>(tile_smem[warpid()], g.in, {0, 0, i, 0}, swizzled_offsets);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_s_barrier();
     __syncthreads();
