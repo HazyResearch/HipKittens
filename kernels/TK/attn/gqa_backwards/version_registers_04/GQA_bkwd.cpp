@@ -123,6 +123,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
         // 14. dS_ij = P_ij o (dO_i @ V_j^T - delta_i)
         sub_row(dP_ij, dP_ij, delta_i);
         mul(dP_ij, dP_ij, S_ij);
+        mul(dP_ij, dP_ij, scale_factor);
 
         // 15. dQ_i += dS_ij @ K_j (load from HBM and write back)
         qkvo_tile<D, float, accum_col_l> dQ_i;
@@ -137,7 +138,6 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
         store(g.dQg, dQ_i, {b,h,i,0});
 
         // 16. dK_j += dS_ij^T @ Q_i
-        mul(dS_ij_bf16_acc_col, dS_ij_bf16_acc_col, scale_factor);
         attn_tile<D,bf16,col_l> dS_ij_bf16_col;
         swap_layout(dS_ij_bf16_col, dS_ij_bf16_acc_col);
         qkvo_tile<D, bf16, col_l> Q_i_col;
