@@ -50,7 +50,6 @@ struct rv {
     using identifier = ducks::rv::identifier; ///< Type identifier for the rv structure.
     static_assert(kittens::ducks::base_types::T1<_T>); // confirm it's a supported type
     using layout = _layout;
-    using matrix_layout = _matrix_layout;
     static constexpr bool is_naive = std::is_same_v<layout, ducks::rv_layout::naive>;
     static constexpr bool is_ortho = std::is_same_v<layout, ducks::rv_layout::ortho>;
     using T = kittens::base_types::packing<_T>::unpacked_type;

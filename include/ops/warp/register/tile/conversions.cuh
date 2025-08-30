@@ -473,7 +473,6 @@ __device__ static inline rt<T2, _rows, _cols, layout>& transpose_inplace(rt<T2, 
         #pragma unroll
         for(int j = 0; j < i; j++) {
             #ifdef KITTENS_CDNA4
-            using matrix_layout = typename rt<T2, _rows, _cols, layout>::matrix_layout;
             rt_base<T2, layout, matrix_layout> tmp;
             #else
             rt_base<T2, layout> tmp;
