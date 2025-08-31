@@ -155,8 +155,6 @@ dS_ij_tk = torch.zeros_like(dS_test.bfloat16().clone())
 
 # TK
 print("Running ThunderKittens ...")
-P_tk = torch.zeros_like(P_tiled).float()
-dOg_out_tk = torch.zeros_like(dO_tk).float()
 dQ_tk = torch.zeros_like(q_grad_tiled_bhnd).float()
 dK_tk = torch.zeros_like(k_grad_tiled_bhnd).float()
 dV_tk = torch.zeros_like(v_grad_tiled_bhnd).float()
@@ -169,8 +167,6 @@ tk_kernel.dispatch_prep(
 )
 
 tk_kernel.dispatch_bwd_combined(
-    P_tk,
-    dOg_out_tk,
     Q_tk,     
     K_tk,     
     V_tk,     
@@ -193,14 +189,6 @@ tk_kernel.dispatch_bwd_combined(
 print(f"\nTK vs Tiled comparison:")
 
 num_print = 17
-print("\nP outputs:")
-print(f"TK: {P_tk[0, 0, :num_print, :num_print]}")
-print(f"P: {P_tiled[0, 0, :num_print, :num_print]}")
-
-print("\ndOg_out outputs:")
-print(f"TK: {dOg_out_tk[0, 0, :num_print, :num_print]}")
-print(f"dOg: {dO_bhnd[0, 0, :num_print, :num_print]}")
-
 print("\nDelta outputs:")
 print(f"TK: {delta_tk[0, 0, 0, :num_print]}")
 print(f"Delta: {delta_tiled[0, 0, 0, :num_print]}")
@@ -238,19 +226,11 @@ def robustness_check(ref, pred):
     return diff, error_count, numel, rel_error, l2_error, cos, mask   
 
 # Compute diffs in float32 to avoid bf16 quantization in the comparison itself
-P_diff, P_err_cnt, P_total, P_rel_error, P_l2_error, P_cos, P_mask = robustness_check(P_tiled, P_tk)
-dOg_out_diff, dOg_out_err_cnt, dOg_out_total, dOg_out_rel_error, dOg_out_l2_error, dOg_out_cos, dOg_out_mask = robustness_check(dO_bhnd, dOg_out_tk)
 delta_diff, delta_err_cnt, delta_total, delta_rel_error, delta_l2_error, delta_cos, delta_mask = robustness_check(delta_tiled, delta_tk)
 q_diff, q_err_cnt, q_total, q_rel_error, q_l2_error, q_cos, q_mask = robustness_check(q_grad_tiled_bhnd, dQ_tk)
 k_diff, k_err_cnt, k_total, k_rel_error, k_l2_error, k_cos, k_mask = robustness_check(k_grad_tiled_bhnd, dK_tk)
 v_diff, v_err_cnt, v_total, v_rel_error, v_l2_error, v_cos, v_mask = robustness_check(v_grad_tiled_bhnd, dV_tk)
 
-print(f"P: max_abs={P_diff.max().item():.6f}, max_rel={P_rel_error:.4f}, "
-      f"rel_l2={P_l2_error:.4f}, cos={P_cos:.6f}, "
-      f"errors={P_err_cnt}/{P_total} ({100*P_err_cnt/P_total:.4f}%)")
-print(f"dOg_out: max_abs={dOg_out_diff.max().item():.6f}, max_rel={dOg_out_rel_error:.4f}, "
-      f"rel_l2={dOg_out_l2_error:.4f}, cos={dOg_out_cos:.6f}, "
-      f"errors={dOg_out_err_cnt}/{dOg_out_total} ({100*dOg_out_err_cnt/dOg_out_total:.4f}%)")
 print(f"Delta: max_abs={delta_diff.max().item():.6f}, max_rel={delta_rel_error:.4f}, "
       f"rel_l2={delta_l2_error:.4f}, cos={delta_cos:.6f}, "
       f"errors={delta_err_cnt}/{delta_total} ({100*delta_err_cnt/delta_total:.4f}%)")
