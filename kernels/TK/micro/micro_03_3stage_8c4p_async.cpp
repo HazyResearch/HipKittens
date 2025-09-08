@@ -31,7 +31,7 @@ __host__ __device__ inline int ceil_div(int a, int b) {
 struct micro_globals {
     gl<bf16, -1, -1, -1, -1> a, b;
     gl<bf16, -1, -1, -1, -1> c;
-    dim3 grid()  { return dim3((N / NEW_COL_BLOCK_SIZE), ( M / NEW_ROW_BLOCK_SIZE)); } 
+    dim3 grid()  { return dim3((N / NEW_COL_BLOCK_SIZE) * ( M / NEW_ROW_BLOCK_SIZE)); } 
     dim3 block() { return dim3(NUM_THREADS); } 
     size_t dynamic_shared_memory() { return 3 * (M_BLOCK + N_BLOCK) * BLOCK_SIZE * BLOCK_SIZE * sizeof(bf16); } 
 };
@@ -46,8 +46,21 @@ void micro_tk(const micro_globals g) {
     st_bf<BLOCK_SIZE, BLOCK_SIZE, ducks::st_layout::row> (&Bs)[3][N_BLOCK] =
     al.allocate<st_bf<BLOCK_SIZE, BLOCK_SIZE, ducks::st_layout::row>, 3, N_BLOCK>();
 
-    int row = blockIdx.y * M_BLOCK;
-    int col = blockIdx.x * N_BLOCK;
+    int wgid = (blockIdx.y * gridDim.x) + blockIdx.x;
+    const int NUM_WGS  = gridDim.x * gridDim.y;
+    const int NUM_XCDS = 8;  
+    wgid = (wgid % NUM_XCDS) * (NUM_WGS / NUM_XCDS) + (wgid / NUM_XCDS);
+    const int WGM = 4;  
+    const int num_pid_m = ceil_div(M, NEW_ROW_BLOCK_SIZE); // 7680 / 192 = 40
+    const int num_pid_n = ceil_div(N, NEW_COL_BLOCK_SIZE); // 7680 / 256 = 30
+    const int num_wgid_in_group = WGM * num_pid_n;
+    const int group_id     = wgid / num_wgid_in_group;
+    const int first_pid_m  = group_id * WGM;
+    const int group_size_m = min(num_pid_m - first_pid_m, WGM);
+    const int pid_m = first_pid_m + ((wgid % num_wgid_in_group) % group_size_m);
+    const int pid_n = (wgid % num_wgid_in_group) / group_size_m;
+    int row = pid_m * M_BLOCK;  
+    int col = pid_n * N_BLOCK;  
 
     int warp_id = kittens::warpid();
     const int local_warp_id = warp_id % 4;

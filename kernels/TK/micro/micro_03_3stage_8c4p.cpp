@@ -150,7 +150,7 @@ __host__ __device__ inline int ceil_div(int a, int b) {
     return (a + b - 1) / b;
   }
 
-#define M 8192
+#define M 9216
 #define K 8192
 #define N 8192
 
