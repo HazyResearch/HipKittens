@@ -395,10 +395,11 @@ __global__ void attend_ker(const attn_globals<D> g) {
     swap_layout_and_transpose(o_reg_transposed, o_reg);
     store<1>(g.Og, o_reg_transposed, {batch_idx, tile_idx, head_idx, 0});
 
-    typename attn_tile<D, float, accum_col_l>::row_vec L_vec;
-    log(L_vec, norm_vec);
-    add(L_vec, L_vec, max_vec);
-    store(g.L_vec, L_vec, {batch_idx, head_idx, 0, tile_idx});
+    // multiply by ln(2)
+    mul(max_vec, max_vec, 0.69314718056f);
+    log(norm_vec, norm_vec);
+    add(norm_vec, norm_vec, max_vec);
+    store(g.L_vec, norm_vec, {batch_idx, head_idx, 0, tile_idx});
 }
 
 template<int D>

@@ -1,8 +1,8 @@
 # Compiler
 GPU_TARGET=CDNA4
 
-TARGET=tk_kernel_fwd
-SRC=GQA_fwd.cpp
+TARGET=tk_kernel_bkwd
+SRC=GQA_bkwd.cpp
 
 # HIP variables
 ROCM_INSTALL_DIR := $(ROCM_PATH)

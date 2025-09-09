@@ -268,6 +268,8 @@ l_tiled = exp_scores.sum(dim=-1, keepdim=True)
 P_tiled = exp_scores / l_tiled
 O_tiled = torch.matmul(P_tiled, V_tiled_expanded)
 L_tiled = (m_tiled + torch.log(l_tiled)).squeeze(-1)
+# L_tiled = torch.log(l_tiled).squeeze(-1)
+# L_tiled = m_tiled.squeeze(-1)
 
 dQ_tiled, dK_tiled, dV_tiled, delta_tiled = simple_flash_backward(Q_tiled.float(), K_tiled.float(), V_tiled.float(), dO_tiled.float(), L_tiled)
 out_tiled_bnhd = O_tiled.transpose(1, 2) # BHND -> BNHD
@@ -288,12 +290,12 @@ dO_tk = dO_bhnd.transpose(1, 2).bfloat16().clone().contiguous()
 
 # Call TK forward to get O and L
 O_tk = torch.zeros_like(out_tiled_bnhd).bfloat16().clone().contiguous()
-L_tk = torch.zeros_like(L_tiled).float().contiguous()
+L_tk = torch.zeros_like(L_tiled).float().transpose(-1, -2).contiguous()
 
 tk_kernel_fwd.dispatch_fwd(Q_tk, K_tk, V_tk, O_tk, L_tk)
 torch.cuda.synchronize()
-print(f"O_tk.shape: {O_tk.shape}")
-print(f"L_tk.shape: {L_tk.shape}")
+
+# L_tk = L_tiled.float().contiguous()
 
 # TK
 print("Running ThunderKittens ...")
@@ -369,6 +371,8 @@ for _ in range(num_iters):
     elapsed_time = start_event.elapsed_time(end_event)
     timings.append(elapsed_time)
     delta_tk = delta_tk.transpose(-1, -2).contiguous()
+
+L_tk = L_tk.transpose(-1, -2).contiguous()
 
 avg_time_tk = sum(timings) / len(timings)
 eff_tk = efficiency(flops_ref, avg_time_tk)
@@ -472,5 +476,3 @@ print(f"K grad: max_abs={k_diff.max().item():.6f}, max_rel={k_rel_error:.4f}, "
 print(f"V grad: max_abs={v_diff.max().item():.6f}, max_rel={v_rel_error:.4f}, "
       f"rel_l2={v_l2_error:.4f}, cos={v_cos:.6f}, "
       f"errors={v_err_cnt}/{v_total} ({100*v_err_cnt/v_total:.4f}%)")
-
-
