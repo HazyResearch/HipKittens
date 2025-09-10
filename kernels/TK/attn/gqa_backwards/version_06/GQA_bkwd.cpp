@@ -330,6 +330,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
     // Shared tiles
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
+    // K_j_smem is organized in 16x16 tiles
     st_bf<BLOCK_SIZE_KV, D, ducks::st_layout::accumulator, ducks::st_matrix::mfma_16x16x32> (&K_j_smem) = al.allocate<st_bf<BLOCK_SIZE_KV, D, ducks::st_layout::accumulator, ducks::st_matrix::mfma_16x16x32>>();
     st_bf<SLICE_QO, D, ducks::st_layout::classical, ducks::st_matrix::mfma_16x16x32> (&Q_i_smem)[2][2] = al.allocate<st_bf<SLICE_QO, D, ducks::st_layout::classical, ducks::st_matrix::mfma_16x16x32>, 2, 2>();
     st_bf<SLICE_QO, D, ducks::st_layout::classical, ducks::st_matrix::mfma_16x16x32> (&dO_i_smem)[2][2] = al.allocate<st_bf<SLICE_QO, D, ducks::st_layout::classical, ducks::st_matrix::mfma_16x16x32>, 2, 2>();
@@ -361,13 +362,16 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
     int tic = 0, toc = 1;
     // Load KV data using the KV head index
     G::load<1, false>(K_j_smem, g.K, {batch_idx, seq_idx, kv_head_idx, 0});
-    // For now, load first Q head in the group for initialization
+    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_sched_barrier(0);
+
     // 6. Load K_j and V_j from HBM to registers  
     load<1>(V_j, g.V, {batch_idx, j, kv_head_idx, 0});
     // 7. Initialize dK_j = 0 and dV_j = 0
     zero(dK_j_T);
     zero(dV_j_T);
-
+    load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_sched_barrier(0);
@@ -421,15 +425,16 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
                 // 14. dS_ij = P_ij o (dP_ij - delta_i)
                 load(delta_i, subvec_inplace<DOT_SLICE_QO>(delta_smem[tic], 0));
                 load(dO_i, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][0], {0, 0}));
+                // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
 
                 __builtin_amdgcn_s_setprio(1);
                 zero(dP_ij);
+                mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
                 mma_ABt(dP_ij, dO_i, V_j, dP_ij);
                 mul(dP_ij, dP_ij, scale_factor);
-                mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
                 sub_row(dP_ij, dP_ij, delta_i);
                 mul(dP_ij, dP_ij, P_ij);
                 copy(dP_ij_bf16, dP_ij);
@@ -438,11 +443,11 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
 
+                load(L_smem[toc], g.L_vec, {batch_idx, q_head_idx, 0, i + 1});
+                G::load<1, false>(Q_i_smem[toc][0], g.Q, {batch_idx, (i + 1) * 2, q_head_idx, 0});
                 auto attn_i_smem_subtile = subtile_inplace<WARP_SIZE_KV, DOT_SLICE_QO>(attn_i_smem, {warpid, 0});
                 store(attn_i_smem_subtile, dP_ij_bf16_accum_row);
-                load(L_smem[toc], g.L_vec, {batch_idx, q_head_idx, 0, i + 1});
                 load(dO_i_col, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][0], {0, 0}));
-                G::load<1, false>(Q_i_smem[toc][0], g.Q, {batch_idx, (i + 1) * 2, q_head_idx, 0});
                 load(Q_i_col, subtile_inplace<DOT_SLICE_QO, D>(Q_i_smem[tic][0], {0, 0}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 __builtin_amdgcn_s_barrier();
@@ -461,7 +466,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
                 // 15. dQ_i += dS_ij @ K_j (32x16)=(32x256)x(256x16)
                 load(dP_ij_bf16_col_T, attn_i_smem);
-                load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
+                // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
@@ -500,6 +505,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
                 load(delta_i, subvec_inplace<DOT_SLICE_QO>(delta_smem[tic], 1));
                 load(dO_i, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][0], {1, 0}));
+                // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
@@ -508,9 +514,9 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
                 // 14. dS_ij = P_ij o (dP_ij - delta_i)
                 __builtin_amdgcn_s_setprio(1);
                 zero(dP_ij);
+                mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
                 mma_ABt(dP_ij, dO_i, V_j, dP_ij);
                 mul(dP_ij, dP_ij, scale_factor);
-                mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
                 sub_row(dP_ij, dP_ij, delta_i);
                 mul(dP_ij, dP_ij, P_ij);
                 copy(dP_ij_bf16, dP_ij);
@@ -519,11 +525,11 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
 
+                load(delta_smem[toc], g.delta_vec, {batch_idx, q_head_idx, 0, i + 1});
+                G::load<1, false>(dO_i_smem[toc][0], g.dOg, {batch_idx, (i + 1) * 2, q_head_idx, 0});
                 auto attn_i_smem_subtile = subtile_inplace<WARP_SIZE_KV, DOT_SLICE_QO>(attn_i_smem, {warpid, 0});
                 store(attn_i_smem_subtile, dP_ij_bf16_accum_row); // bank conflicts
-                load(delta_smem[toc], g.delta_vec, {batch_idx, q_head_idx, 0, i + 1});
                 load(dO_i_col, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][0], {1, 0}));
-                G::load<1, false>(dO_i_smem[toc][0], g.dOg, {batch_idx, (i + 1) * 2, q_head_idx, 0});
                 load(Q_i_col, subtile_inplace<DOT_SLICE_QO, D>(Q_i_smem[tic][0], {1, 0}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 __builtin_amdgcn_s_barrier();
@@ -542,7 +548,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
                 // 15. dQ_i += dS_ij @ K_j (32x16)=(32x256)x(256x16)
                 load(dP_ij_bf16_col_T, attn_i_smem);
-                load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
+                // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
@@ -583,15 +589,16 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
                 // 14. dS_ij = P_ij o (dP_ij - delta_i)
                 load(delta_i, subvec_inplace<DOT_SLICE_QO>(delta_smem[tic], 2));
                 load(dO_i, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][1], {0, 0}));
+                // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
 
                 __builtin_amdgcn_s_setprio(1);
                 zero(dP_ij);
+                mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
                 mma_ABt(dP_ij, dO_i, V_j, dP_ij);
                 mul(dP_ij, dP_ij, scale_factor);
-                mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
                 sub_row(dP_ij, dP_ij, delta_i);
                 mul(dP_ij, dP_ij, P_ij);
                 copy(dP_ij_bf16, dP_ij);
@@ -600,9 +607,9 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
 
+                G::load<1, false>(Q_i_smem[toc][1], g.Q, {batch_idx, (i + 1) * 2 + 1, q_head_idx, 0});
                 auto attn_i_smem_subtile = subtile_inplace<WARP_SIZE_KV, DOT_SLICE_QO>(attn_i_smem, {warpid, 0});
                 store(attn_i_smem_subtile, dP_ij_bf16_accum_row);
-                G::load<1, false>(Q_i_smem[toc][1], g.Q, {batch_idx, (i + 1) * 2 + 1, q_head_idx, 0});
                 load(dO_i_col, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][1], {0, 0}));
                 load(Q_i_col, subtile_inplace<DOT_SLICE_QO, D>(Q_i_smem[tic][1], {0, 0}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
@@ -622,7 +629,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
                 // 15. dQ_i += dS_ij @ K_j (32x16)=(32x256)x(256x16)
                 load(dP_ij_bf16_col_T, attn_i_smem);
-                load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
+                // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
@@ -661,6 +668,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
                 load(delta_i, subvec_inplace<DOT_SLICE_QO>(delta_smem[tic], 3));
                 load(dO_i, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][1], {1, 0}));
+                // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
@@ -669,9 +677,9 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
                 // 14. dS_ij = P_ij o (dP_ij - delta_i)
                 __builtin_amdgcn_s_setprio(1);
                 zero(dP_ij);
+                mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
                 mma_ABt(dP_ij, dO_i, V_j, dP_ij);
                 mul(dP_ij, dP_ij, scale_factor);
-                mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
                 sub_row(dP_ij, dP_ij, delta_i);
                 mul(dP_ij, dP_ij, P_ij);
                 copy(dP_ij_bf16, dP_ij);
@@ -680,9 +688,9 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
 
+                G::load<1, false>(dO_i_smem[toc][1], g.dOg, {batch_idx, (i + 1) * 2 + 1, q_head_idx, 0});
                 auto attn_i_smem_subtile = subtile_inplace<WARP_SIZE_KV, DOT_SLICE_QO>(attn_i_smem, {warpid, 0});
                 store(attn_i_smem_subtile, dP_ij_bf16_accum_row);
-                G::load<1, false>(dO_i_smem[toc][1], g.dOg, {batch_idx, (i + 1) * 2 + 1, q_head_idx, 0});
                 load(dO_i_col, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][1], {1, 0}));
                 load(Q_i_col, subtile_inplace<DOT_SLICE_QO, D>(Q_i_smem[tic][1], {1, 0}));
                 asm volatile("s_waitcnt lgkmcnt(0)");
@@ -702,7 +710,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
                 // 15. dQ_i += dS_ij @ K_j (32x16)=(32x256)x(256x16)
                 load(dP_ij_bf16_col_T, attn_i_smem);
-                load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
+                // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
                 __builtin_amdgcn_s_waitcnt(0);
                 __builtin_amdgcn_s_barrier();
                 __builtin_amdgcn_sched_barrier(0);
@@ -745,15 +753,16 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             // 14. dS_ij = P_ij o (dP_ij - delta_i)
             load(delta_i, subvec_inplace<DOT_SLICE_QO>(delta_smem[tic], 0));
             load(dO_i, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][0], {0, 0}));
+            // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
             __builtin_amdgcn_s_setprio(1);
             zero(dP_ij);
+            mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
             mul(dP_ij, dP_ij, scale_factor);
-            mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
@@ -783,7 +792,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
             // 15. dQ_i += dS_ij @ K_j (32x16)=(32x256)x(256x16)
             load(dP_ij_bf16_col_T, attn_i_smem);
-            load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
+            // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -821,6 +830,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
             load(delta_i, subvec_inplace<DOT_SLICE_QO>(delta_smem[tic], 1));
             load(dO_i, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][0], {1, 0}));
+            // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -829,9 +839,9 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             // 14. dS_ij = P_ij o (dP_ij - delta_i)
             __builtin_amdgcn_s_setprio(1);
             zero(dP_ij);
+            mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
             mul(dP_ij, dP_ij, scale_factor);
-            mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
@@ -861,7 +871,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
             // 15. dQ_i += dS_ij @ K_j (32x16)=(32x256)x(256x16)
             load(dP_ij_bf16_col_T, attn_i_smem);
-            load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
+            // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -901,15 +911,16 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             // 14. dS_ij = P_ij o (dP_ij - delta_i)
             load(delta_i, subvec_inplace<DOT_SLICE_QO>(delta_smem[tic], 2));
             load(dO_i, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][1], {0, 0}));
+            // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
             __builtin_amdgcn_s_setprio(1);
             zero(dP_ij);
+            mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
             mul(dP_ij, dP_ij, scale_factor);
-            mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
@@ -939,7 +950,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
             // 15. dQ_i += dS_ij @ K_j (32x16)=(32x256)x(256x16)
             load(dP_ij_bf16_col_T, attn_i_smem);
-            load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
+            // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -977,6 +988,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
             load(delta_i, subvec_inplace<DOT_SLICE_QO>(delta_smem[tic], 3));
             load(dO_i, subtile_inplace<DOT_SLICE_QO, D>(dO_i_smem[tic][1], {1, 0}));
+            // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
@@ -985,9 +997,9 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
             // 14. dS_ij = P_ij o (dP_ij - delta_i)
             __builtin_amdgcn_s_setprio(1);
             zero(dP_ij);
+            mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             mma_ABt(dP_ij, dO_i, V_j, dP_ij);
             mul(dP_ij, dP_ij, scale_factor);
-            mul(delta_i, delta_i, scale_factor); // really weird compiler lifetime thing
             sub_row(dP_ij, dP_ij, delta_i);
             mul(dP_ij, dP_ij, P_ij);
             copy(dP_ij_bf16, dP_ij);
@@ -1017,7 +1029,7 @@ __global__ void attend_bwd_combined_ker(const attn_bwd_combined_globals<D> g) {
 
             // 15. dQ_i += dS_ij @ K_j (32x16)=(32x256)x(256x16)
             load(dP_ij_bf16_col_T, attn_i_smem);
-            load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
+            // load(K_j_col, subtile_inplace<256, 16>(K_j_smem, {0, warpid}));
             asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
