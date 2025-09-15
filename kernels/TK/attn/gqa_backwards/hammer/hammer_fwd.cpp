@@ -410,16 +410,20 @@ __global__ void attend_ker(const attn_globals<D> g) {
     store(g.L_vec, norm_vec, {batch_idx, head_idx, 0, tile_idx});
 }
 
-__global__ void detect_nan_kernel(bf16* O, bf16* O_ref, float* L, float* L_ref, 
-                                 int O_size, int L_size, bool* nan_found) {
+
+__device__ inline bool is_nan(bf16 val) {
+    return val != val;
+}
+
+__global__ void detect_nan_kernel(bf16* O, float* L, int O_size, int L_size, bool* nan_found) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = gridDim.x * blockDim.x;
     
     // Check O arrays for NaN
     for (int i = tid; i < O_size; i += total_threads) {
-        if (isnan(float(O[i])) || isnan(float(O_ref[i]))) {
-            printf("NaN found in O arrays at index %d: O=%f, O_ref=%f\n", 
-                   i, float(O[i]), float(O_ref[i]));
+        if (O[i] != O[i]) {
+            printf("NaN found in O arrays at index %d: O=%f\n", 
+                   i, float(O[i]));
             *nan_found = true;
             return;  // Early exit
         }
@@ -427,13 +431,31 @@ __global__ void detect_nan_kernel(bf16* O, bf16* O_ref, float* L, float* L_ref,
     
     // Check L arrays for NaN
     for (int i = tid; i < L_size; i += total_threads) {
-        if (isnan(L[i]) || isnan(L_ref[i])) {
-            printf("NaN found in L arrays at index %d: L=%f, L_ref=%f\n", 
-                   i, L[i], L_ref[i]);
+        if (L[i] != L[i]) {
+            printf("NaN found in L arrays at index %d: L=%f\n", 
+                   i, L[i]);
             *nan_found = true;
             return;  // Early exit
         }
     }
+}
+
+__global__ void nan_micro() {
+    bf16 nan_val = bf16(0.0f) / bf16(0.0f);
+    
+    // Convert to get bit representation
+    union { bf16 b; uint16_t i; } bits;
+    bits.b = nan_val;
+    
+    printf("bf16 bit representation: 0x%x\n", bits.i);
+    printf("NaN value (as float): %f\n", (float) nan_val);
+    printf("nan != nan: %d\n", nan_val != nan_val);
+    printf("is_nan: %d\n", is_nan(nan_val));
+    
+    // Also test float conversion preservation
+    float as_float = (float) nan_val;
+    printf("float bit representation: 0x%x\n", as_float);
+    printf("float nan != nan: %d\n", as_float != as_float);
 }
 
 int main() {
@@ -444,9 +466,6 @@ int main() {
     bf16 *V = new bf16[ATTN_B * ATTN_H * ATTN_N * ATTN_D];
     bf16 *O = new bf16[ATTN_B * ATTN_H * ATTN_N * ATTN_D];
     float *L = new float[ATTN_B * ATTN_H * ATTN_N];
-
-    bf16 *O_ref = new bf16[ATTN_B * ATTN_H * ATTN_N * ATTN_D];
-    float *L_ref = new float[ATTN_B * ATTN_H * ATTN_N];
 
     // random number generator
     std::random_device rd;
@@ -459,12 +478,10 @@ int main() {
         K[i] = bf16(dis(gen));
         V[i] = bf16(dis(gen));
         O[i] = bf16(0.0f);
-        O_ref[i] = bf16(0.0f);
     }
 
     for (int i = 0; i < ATTN_B * ATTN_H * ATTN_N; i++) {
         L[i] = 0.0f;
-        L_ref[i] = 0.0f;
     }
 
     // copy Q, K, V to device
@@ -476,37 +493,21 @@ int main() {
     hipMemcpy(d_K, K, ATTN_B * ATTN_H * ATTN_N * ATTN_D * sizeof(bf16), hipMemcpyHostToDevice);
     hipMemcpy(d_V, V, ATTN_B * ATTN_H * ATTN_N * ATTN_D * sizeof(bf16), hipMemcpyHostToDevice);
     
-    bf16 *d_O, *d_O_ref;
-    float *d_L, *d_L_ref;
+    bf16 *d_O;
+    float *d_L;
     hipMalloc(&d_O, ATTN_B * ATTN_H * ATTN_N * ATTN_D * sizeof(bf16));
     hipMalloc(&d_L, ATTN_B * ATTN_H * ATTN_N * sizeof(float));
-    hipMalloc(&d_O_ref, ATTN_B * ATTN_H * ATTN_N * ATTN_D * sizeof(bf16));
-    hipMalloc(&d_L_ref, ATTN_B * ATTN_H * ATTN_N * sizeof(float));
 
     hipMemcpy(d_O, O, ATTN_B * ATTN_H * ATTN_N * ATTN_D * sizeof(bf16), hipMemcpyHostToDevice);
     hipMemcpy(d_L, L, ATTN_B * ATTN_H * ATTN_N * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_O_ref, O_ref, ATTN_B * ATTN_H * ATTN_N * ATTN_D * sizeof(bf16), hipMemcpyHostToDevice);
-    hipMemcpy(d_L_ref, L_ref, ATTN_B * ATTN_H * ATTN_N * sizeof(float), hipMemcpyHostToDevice);
 
     _gl_QKVO input_gl_q(d_Q, ATTN_B, ATTN_N, ATTN_H, ATTN_D);
     _gl_QKVO input_gl_k(d_K, ATTN_B, ATTN_N, ATTN_H, ATTN_D);
     _gl_QKVO input_gl_v(d_V, ATTN_B, ATTN_N, ATTN_H, ATTN_D);
     _gl_QKVO output_gl_o(d_O, ATTN_B, ATTN_N, ATTN_H, ATTN_D);
     _gl_L output_gl_l(d_L, ATTN_B, ATTN_H, 1, ATTN_N);
-    _gl_QKVO output_gl_o_ref(d_O_ref, ATTN_B, ATTN_N, ATTN_H, ATTN_D);
-    _gl_L output_gl_l_ref(d_L_ref, ATTN_B, ATTN_H, 1, ATTN_N);
-
-    attn_globals<ATTN_D> g_ref{input_gl_q, input_gl_k, input_gl_v, output_gl_o_ref, output_gl_l_ref};
-    attend_ker<ATTN_D><<<g_ref.grid(), g_ref.block(), g_ref.dynamic_shared_memory()>>>(g_ref);
-    hipDeviceSynchronize();
-    HIP_CHECK(hipGetLastError());
-    // // copy O_ref and L_ref to host
-    // hipMemcpy(O_ref, d_O_ref, ATTN_B * ATTN_H * ATTN_N * ATTN_D * sizeof(bf16), hipMemcpyDeviceToHost);
-    // hipMemcpy(L_ref, d_L_ref, ATTN_B * ATTN_H * ATTN_N * sizeof(float), hipMemcpyDeviceToHost);
-    // hipDeviceSynchronize();
 
     attn_globals<ATTN_D> g{input_gl_q, input_gl_k, input_gl_v, output_gl_o, output_gl_l};
-
     // Allocate GPU memory for NaN detection
     bool* d_nan_found;
     hipMalloc(&d_nan_found, sizeof(bool));
@@ -528,7 +529,7 @@ int main() {
         // Launch NaN detection kernel
         dim3 nan_grid(256);    // 256 blocks
         dim3 nan_block(256);   // 256 threads per block
-        detect_nan_kernel<<<nan_grid, nan_block>>>(d_O, d_O_ref, d_L, d_L_ref, 
+        detect_nan_kernel<<<nan_grid, nan_block>>>(d_O, d_L, 
                                                    O_size, L_size, d_nan_found);
         hipDeviceSynchronize();
         HIP_CHECK(hipGetLastError());
@@ -553,16 +554,12 @@ int main() {
     delete[] V;
     delete[] O;
     delete[] L;
-    delete[] O_ref;
-    delete[] L_ref;
 
     hipFree(d_Q);
     hipFree(d_K);
     hipFree(d_V);
     hipFree(d_O);
     hipFree(d_L);
-    hipFree(d_O_ref);
-    hipFree(d_L_ref);
     hipFree(d_nan_found);
 
     return 0;
