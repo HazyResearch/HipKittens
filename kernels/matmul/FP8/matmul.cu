@@ -754,11 +754,8 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
     for (int k = 0; k < k_iters - 2; ++k, curr ^= 1, next ^= 1) {
         __builtin_amdgcn_sched_barrier(0);
         asm volatile("s_waitcnt vmcnt(16)");
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-
-        __builtin_amdgcn_sched_barrier(0);
         asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
         {
