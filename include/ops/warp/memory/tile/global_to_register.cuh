@@ -41,14 +41,14 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
 
     #pragma unroll
     for(int i = 0; i < dst.height; i++) {
-        int row = dst.base_tile_rows*i + row_offset;
+        const int row = dst.base_tile_rows*i + row_offset;
         
         #pragma unroll
         for(int j = 0; j < dst.width; j++) {
 
             #pragma unroll
             for(int k = 0; k < dst.base_tile_num_strides; k++) {
-                int col = dst.base_tile_cols*j + col_offset + k*dst.base_tile_elements_per_stride_group;
+                const int col = dst.base_tile_cols*j + col_offset + k*dst.base_tile_elements_per_stride_group;
 
                 U2* tmp;
                 if constexpr (std::is_same_v<U2, bf16_2>) {

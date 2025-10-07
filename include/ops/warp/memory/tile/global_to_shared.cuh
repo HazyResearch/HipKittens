@@ -26,7 +26,8 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx)
     constexpr int elem_per_warp = elem_per_thread * kittens::WARP_THREADS;
     constexpr int bytes_per_warp = elem_per_warp * sizeof(T);
     constexpr int num_warps = N_THREADS / kittens::WARP_THREADS;
-    constexpr int bytes_per_row = ST::cols * sizeof(T);
+    constexpr int bytes_per_subtile_row = ST::underlying_subtile_cols * sizeof(T);
+    constexpr int bytes_per_subtile = bytes_per_subtile_row * ST::underlying_rows;
     const int laneid = kittens::laneid();
     const int warpid = kittens::warpid() % num_warps;
 
@@ -42,12 +43,15 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx)
     for (int i = 0; i < memcpy_per_tile; i++) {
 
         int lane_byte_offset = (laneid * bytes_per_thread) + (warpid * bytes_per_warp) + (i * num_warps * bytes_per_warp);
-        int row = lane_byte_offset / bytes_per_row;
-        int col = (lane_byte_offset % bytes_per_row) / sizeof(T);
+        int subtile_id = lane_byte_offset / bytes_per_subtile;
+        lane_byte_offset = lane_byte_offset % bytes_per_subtile;
+
+        int row = lane_byte_offset / bytes_per_subtile_row;
+        int col = (lane_byte_offset % bytes_per_subtile_row) / sizeof(T);
         uint32_t swizzled_shared_byte_offset = dst.idx((uint32_t)0, {row, col});
 
-        int swizzled_global_row = swizzled_shared_byte_offset / bytes_per_row;
-        int swizzled_global_col = (swizzled_shared_byte_offset % bytes_per_row) / sizeof(T);
+        int swizzled_global_row = swizzled_shared_byte_offset / bytes_per_subtile_row;
+        int swizzled_global_col = (swizzled_shared_byte_offset % bytes_per_subtile_row) / sizeof(T) + subtile_id * ST::underlying_subtile_cols;
         uint32_t swizzled_global_byte_offset = (swizzled_global_row * row_stride + swizzled_global_col) * sizeof(T);
 
         const T* lds_elem_ptr = lds_base + (i * N_THREADS * elem_per_thread);
@@ -86,7 +90,8 @@ __device__ inline void prefill_swizzled_offsets(
     constexpr int elem_per_warp = elem_per_thread * kittens::WARP_THREADS;
     constexpr int bytes_per_warp = elem_per_warp * sizeof(T);
     constexpr int num_warps = N_THREADS / kittens::WARP_THREADS;
-    constexpr int bytes_per_row = ST::cols * sizeof(T);
+    constexpr int bytes_per_subtile_row = ST::underlying_subtile_cols * sizeof(T);
+    constexpr int bytes_per_subtile = bytes_per_subtile_row * ST::underlying_rows;
     const int laneid = kittens::laneid();
     const int warpid = kittens::warpid() % num_warps;
 
@@ -95,11 +100,15 @@ __device__ inline void prefill_swizzled_offsets(
     #pragma unroll
     for (int i = 0; i < memcpy_per_tile; i++) {
         int lane_byte_offset = (laneid * bytes_per_thread) + (warpid * bytes_per_warp) + (i * num_warps * bytes_per_warp);
-        int row = lane_byte_offset / bytes_per_row;
-        int col = (lane_byte_offset % bytes_per_row) / sizeof(T);
+        int subtile_id = lane_byte_offset / bytes_per_subtile;
+        lane_byte_offset = lane_byte_offset % bytes_per_subtile;
+
+        int row = lane_byte_offset / bytes_per_subtile_row;
+        int col = (lane_byte_offset % bytes_per_subtile_row) / sizeof(T);
+
         uint32_t swizzled_shared_byte_offset = dst.idx((uint32_t)0, {row, col});
-        int swizzled_global_row = swizzled_shared_byte_offset / bytes_per_row;
-        int swizzled_global_col = (swizzled_shared_byte_offset % bytes_per_row) / sizeof(T);
+        int swizzled_global_row = swizzled_shared_byte_offset / bytes_per_subtile_row;
+        int swizzled_global_col = (swizzled_shared_byte_offset % bytes_per_subtile_row) / sizeof(T) + subtile_id * ST::underlying_subtile_cols;
         uint32_t swizzled_global_byte_offset = (swizzled_global_row * row_stride + swizzled_global_col) * sizeof(T);
         swizzled_offsets[i] = swizzled_global_byte_offset;
     }
@@ -119,9 +128,7 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx, const uint
     
     constexpr int elem_per_thread = bytes_per_thread / sizeof(T);
     constexpr int elem_per_warp = elem_per_thread * kittens::WARP_THREADS;
-    constexpr int bytes_per_warp = elem_per_warp * sizeof(T);
     constexpr int num_warps = N_THREADS / kittens::WARP_THREADS;
-    constexpr int bytes_per_row = ST::cols * sizeof(T);
     const int laneid = kittens::laneid();
     const int warpid = kittens::warpid() % num_warps;
 
@@ -180,7 +187,8 @@ __device__ static inline void store(const GL &dst, const ST &src, const COORD &i
     constexpr int elem_per_warp = elem_per_thread * kittens::WARP_THREADS;
     constexpr int bytes_per_warp = elem_per_warp * sizeof(T);
     constexpr int num_warps = N_THREADS / kittens::WARP_THREADS;
-    constexpr int bytes_per_row = ST::cols * sizeof(T);
+    constexpr int bytes_per_subtile_row = ST::underlying_subtile_cols * sizeof(T);
+    constexpr int bytes_per_subtile = bytes_per_subtile_row * ST::underlying_rows;
     const int laneid = kittens::laneid();
     const int warpid = kittens::warpid() % num_warps;
 
@@ -193,8 +201,11 @@ __device__ static inline void store(const GL &dst, const ST &src, const COORD &i
     #pragma unroll
     for (int i = 0; i < memcpy_per_tile; i++) {
         int lane_byte_offset = (laneid * bytes_per_thread) + (warpid * bytes_per_warp) + (i * num_warps * bytes_per_warp);
-        int row = lane_byte_offset / bytes_per_row;
-        int col = (lane_byte_offset % bytes_per_row) / sizeof(T);
+        int subtile_id = lane_byte_offset / bytes_per_subtile;
+        lane_byte_offset = lane_byte_offset % bytes_per_subtile;
+
+        int row = lane_byte_offset / bytes_per_subtile_row;
+        int col = (lane_byte_offset % bytes_per_subtile_row) / sizeof(T) + subtile_id * ST::underlying_subtile_cols;
 
         int global_byte_offset = (row * row_stride + col) * sizeof(T);
 
