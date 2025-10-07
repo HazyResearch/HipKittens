@@ -7,8 +7,8 @@ constexpr int BLOCK_SIZE_KV = 256; // block size for KV
 constexpr int DOT_SLICE_QO = 16;
 constexpr int WARP_SIZE_KV = 32; // warp size for KV
 
-template<int D, typename T=bf16, typename L=col_l, typename M=mfma_16x16x32> using attn_tile_T = rt<T, WARP_SIZE_KV, DOT_SLICE_QO, L, M>;
-template<int D, typename T=bf16, typename L=col_l, typename M=mfma_16x16x32> using attn_tile_T_dq = rt<T, BLOCK_SIZE_KV, DOT_SLICE_QO, L, M>;
+template<int D, typename T=bf16, typename L=row_l, typename S=rt_16x16_s> using attn_tile_T = rt<T, WARP_SIZE_KV, DOT_SLICE_QO, L, S>;
+template<int D, typename T=bf16, typename L=col_l, typename S=rt_32x16_s> using attn_tile_T_dq = rt<T, BLOCK_SIZE_KV, DOT_SLICE_QO, L, S>;
 
 #define NUM_WARPS 8
 #define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
@@ -28,12 +28,11 @@ void micro_tk(const micro_globals<D> g) {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
 
-    // We parameterize this using mfma_32x32x16 because we want the base tile for it to be 32x16. Not that it uses that intrinsic.
-    st_bf<BLOCK_SIZE_KV, DOT_SLICE_QO, ducks::st_layout::classical, ducks::st_matrix::mfma_32x32x16> (&attn_i_smem) = al.allocate<st_bf<BLOCK_SIZE_KV, DOT_SLICE_QO, ducks::st_layout::classical, ducks::st_matrix::mfma_32x32x16>>();
+    st_bf<BLOCK_SIZE_KV, DOT_SLICE_QO> (&attn_i_smem) = al.allocate<st_bf<BLOCK_SIZE_KV, DOT_SLICE_QO>>();
 
     // Register tiles
-    attn_tile_T<D, bf16, accum_row_l> dP_ij_bf16_accum_row;
-    attn_tile_T_dq<D, bf16, col_l> dP_ij_bf16_col_T; // for dq
+    attn_tile_T<D> dP_ij_bf16_accum_row;
+    attn_tile_T_dq<D> dP_ij_bf16_col_T; // for dq
 
     const int warpid = kittens::warpid();
 

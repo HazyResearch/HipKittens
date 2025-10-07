@@ -6,7 +6,7 @@ constexpr int ATTN_D = 128; // dimension
 constexpr int SLICE_QO = 32;
 constexpr int DOT_SLICE_QO = 16;
 
-template<int D, typename T=bf16, typename L=row_l, typename M=mfma_16x16x32> using qo_tile = rt<T, DOT_SLICE_QO, D, L, M>;
+template<int D, typename T=bf16, typename L=row_l, typename S=rt_16x16_s> using qo_tile = rt<T, DOT_SLICE_QO, D, L, S>;
 
 #define NUM_WARPS 8
 #define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
@@ -28,11 +28,11 @@ void micro_tk(const micro_globals<D> g) {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
 
-    st_bf<SLICE_QO, D, ducks::st_layout::classical, ducks::st_matrix::mfma_16x16x32> (&Q_i_smem) = al.allocate<st_bf<SLICE_QO, D, ducks::st_layout::classical, ducks::st_matrix::mfma_16x16x32>>();
+    st_bf<SLICE_QO, D> (&Q_i_smem) = al.allocate<st_bf<SLICE_QO, D>>();
 
     // Register tiles
-    qo_tile<D, bf16, row_l, mfma_16x16x32> Q_i;
-    qo_tile<D, bf16, col_l, mfma_32x32x16> Q_i_col;
+    qo_tile<D, bf16, row_l, rt_16x32_s> Q_i;
+    qo_tile<D, bf16, col_l, rt_16x32_s> Q_i_col;
 
     const int warpid = kittens::warpid();
 

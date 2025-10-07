@@ -17,11 +17,7 @@ n = 256
 d = 128
 
 # pytorch
-x = torch.ones((1, n, 1, d), dtype=torch.bfloat16, device='cuda')
-x[0, :32, 0, :] = 0
-x[0, 32:64, 0, :] = 1
-x[0, 64:96, 0, :] = 2
-x[0, 96:128, 0, :] = 3
+x = torch.randn((1, n, 1, d), dtype=torch.bfloat16, device='cuda')
 
 # reference
 y = x
@@ -35,14 +31,14 @@ diff = (y - y_tk).abs().max()
 print(y.shape, x.shape)
 print(f"diff: {diff}")
 
-print(y[0, 0:32, 0, :1].T)
-print(y_tk[0, 0:32, 0, :1].T)
+print(y[0, 0:16, 0, :1].T)
+print(y_tk[0, 0:16, 0, :1].T)
 
-print(y[0, 32:64, 0, :1].T)
-print(y_tk[0, 32:64, 0, :1].T)
+print(y[0, 16:32, 0, :1].T)
+print(y_tk[0, 16:32, 0, :1].T)
 
-print(y[0, 64:96, 0, :1].T)
-print(y_tk[0, 64:96, 0, :1].T)
+print(y[0, 32:48, 0, :1].T)
+print(y_tk[0, 32:48, 0, :1].T)
 
-print(y[0, 96:128, 0, :1].T)
-print(y_tk[0, 96:128, 0, :1].T)
+print(y[0, 48:64, 0, :1].T)
+print(y_tk[0, 48:64, 0, :1].T)
