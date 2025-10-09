@@ -123,11 +123,13 @@ __device__ inline static void load(RT &dst, const ST &src) {
             const int col = (col_offset + k * RT::base_tile_elements_per_stride_group) % ST::underlying_subtile_cols;
             const int shared_base_col = (col_offset + k * RT::base_tile_elements_per_stride_group) / ST::underlying_subtile_cols;
             
-            const int shared_base_subtile_id = shared_base_row * shared_subtiles_per_register_subtile_row + shared_base_col;
+            const int shared_base_subtile_id = shared_base_row * ST::underlying_subtiles_per_row + shared_base_col;
             const int shared_base_offset = shared_base_subtile_id * ST::underlying_subtile_bytes;
 
             const uint32_t swizzled_offset = src.swizzle({row, col});
+            const uint32_t next_swizzled_offset = src.swizzle({row, col + 4});
             const uint32_t addr = src_ptr + swizzled_offset + shared_base_offset;
+            const uint32_t next_addr = src_ptr + next_swizzled_offset + shared_base_offset;
 
             int idx = k * RT::base_tile_stride / packing;
 
@@ -141,8 +143,18 @@ __device__ inline static void load(RT &dst, const ST &src) {
                     const int offset = shared_subtile_id * ST::underlying_subtile_bytes;
 
                     if constexpr (std::is_same_v<U2, bf16_2>) {
+                        // Special handling for 32x16 and stride == 8
+                        if constexpr (RT::base_tile_stride == 8 && (std::is_same_v<typename ST::shape, st_32x16_s> || std::is_same_v<typename ST::shape, st_16x16_s>)) {
+                            asm volatile(
+                                "ds_read_b64 %0, %2 offset:%4\n"
+                                "ds_read_b64 %1, %3 offset:%4\n"
+                                : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx])),
+                                  "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx + 2]))
+                                : "v"(addr), "v"(next_addr), "i"(offset)
+                                : "memory"
+                            );
                         // Use ds_read_b128 for stride == 8, dtype == bf16
-                        if constexpr (RT::base_tile_stride == 8) {
+                        } else if constexpr (RT::base_tile_stride == 8) {
                             asm volatile(
                                 "ds_read_b128 %0, %1 offset:%2\n"
                                 : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][j].data[idx]))
@@ -264,7 +276,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
             const int row = (row_offset + k * RT::base_tile_elements_per_stride_group) % ST::underlying_subtile_rows;
             const int shared_base_row = (row_offset + k * RT::base_tile_elements_per_stride_group) / ST::underlying_subtile_rows;
 
-            const int shared_base_subtile_id = shared_base_row * shared_subtiles_per_register_subtile_row + shared_base_col;
+            const int shared_base_subtile_id = shared_base_row * ST::underlying_subtiles_per_row + shared_base_col;
             const int shared_base_offset = shared_base_subtile_id * ST::underlying_subtile_bytes;
 
             const uint32_t swizzled_offset = src.swizzle({row, col});
