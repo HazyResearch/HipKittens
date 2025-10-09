@@ -54,25 +54,33 @@ __device__ inline void mask_vec2_imm(uint32_t rel_vgpr, uint32_t neg_inf_vgpr,
 
 template<ducks::rt::accumulator_col_layout RT>
 __device__ inline void mask_kv_tile(RT &dst, int q_abs, int k_abs) {
+    // Lane geometry
     const int lane = laneid();
-    const int col  = lane & 31;
+    const int col  = lane & 31;                 // 0..31 column within the 32-wide col tile
 
-    const int q_base = q_abs * Q_BLOCK_SIZE;
-    const int k_base = k_abs * KV_BLOCK_SIZE;
+    // Absolute positions
+    const int q_base = q_abs * Q_BLOCK_SIZE;    // start index for this Q tile
+    const int k_base = k_abs * KV_BLOCK_SIZE;   // start index for this K/V tile
+
+    // q position for this lane's column
     const int q_pos  = q_base + col;
+
+    // One -inf VGPR reused everywhere (hoisted)
+    uint32_t neg_inf_v;
+    asm volatile("v_mov_b32 %0, 0xff800000" : "=v"(neg_inf_v));
 
     #pragma unroll
     for (int i = 0; i < dst.height; ++i) {
-        const int row_base = (i*32) + ((lane >> 5) << 2);
-        const uint32_t rel = static_cast<uint32_t>(q_pos - (k_base + row_base));
+        // Row base of the 32x* chunk produced by MFMA 
+        const int row_base = (i * 32) + ((lane >> 5) << 2); // multiplesof 4
 
-        // ONE v_mov per (i): keep -inf in a VGPR to satisfy e32 cndmask
-        uint32_t neg_inf_v;
-        asm volatile("v_mov_b32 %0, 0xff800000" : "=v"(neg_inf_v));
+        // Relative index of the FIRST element in this row-chunk w.r.t. q_pos
+        // (smaller rel ⇒ more "future" keys that must be -inf)
+        const int rel0 = q_pos - (k_base + row_base);
+        const uint32_t rel = static_cast<uint32_t>(rel0);
 
         #pragma unroll
         for (int j = 0; j < dst.width; ++j) {
-            // references to 32-bit lanes (no copies)
             auto& d0x = *reinterpret_cast<uint32_t*>(&dst.tiles[i][j].data[0].x);
             auto& d0y = *reinterpret_cast<uint32_t*>(&dst.tiles[i][j].data[0].y);
             auto& d1x = *reinterpret_cast<uint32_t*>(&dst.tiles[i][j].data[1].x);
@@ -90,24 +98,21 @@ __device__ inline void mask_kv_tile(RT &dst, int q_abs, int k_abs) {
             auto& d7x = *reinterpret_cast<uint32_t*>(&dst.tiles[i][j].data[7].x);
             auto& d7y = *reinterpret_cast<uint32_t*>(&dst.tiles[i][j].data[7].y);
 
-            // ii = 0 → offsets 0,1 and 2,3
-            mask_vec2_imm<0, 1 >(rel, neg_inf_v, d0x, d0y);
-            mask_vec2_imm<2, 3 >(rel, neg_inf_v, d1x, d1y);
-
-            // ii = 1 → offsets 8,9 and 10,11
-            mask_vec2_imm<8, 9 >(rel, neg_inf_v, d2x, d2y);
-            mask_vec2_imm<10,11>(rel, neg_inf_v, d3x, d3y);
-
-            // ii = 2 → offsets 16,17 and 18,19
-            mask_vec2_imm<16,17>(rel, neg_inf_v, d4x, d4y);
-            mask_vec2_imm<18,19>(rel, neg_inf_v, d5x, d5y);
-
-            // ii = 3 → offsets 24,25 and 26,27
-            mask_vec2_imm<24,25>(rel, neg_inf_v, d6x, d6y);
-            mask_vec2_imm<26,27>(rel, neg_inf_v, d7x, d7y);
+            //  - reuse a single neg_inf register
+            //  - keep VCC live across the pair
+            //  - avoid reloading -inf or recomputing rel
+            mask_vec2_imm< 0, 1 >(rel, neg_inf_v, d0x, d0y);
+            mask_vec2_imm< 2, 3 >(rel, neg_inf_v, d1x, d1y);
+            mask_vec2_imm< 8, 9 >(rel, neg_inf_v, d2x, d2y);
+            mask_vec2_imm<10,11 >(rel, neg_inf_v, d3x, d3y);
+            mask_vec2_imm<16,17 >(rel, neg_inf_v, d4x, d4y);
+            mask_vec2_imm<18,19 >(rel, neg_inf_v, d5x, d5y);
+            mask_vec2_imm<24,25 >(rel, neg_inf_v, d6x, d6y);
+            mask_vec2_imm<26,27 >(rel, neg_inf_v, d7x, d7y);
         }
     }
 }
+
 
 
 /**********************************************************/
@@ -249,7 +254,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
     __builtin_amdgcn_s_barrier();
 
     // hot loop
-    // #pragma unroll 
+    #pragma unroll 
     for (int j = 3; j < max_num_tiles - 1; j += 2) {
         // Cluster 0: QK1
         __builtin_amdgcn_s_setprio(1);
@@ -287,6 +292,7 @@ __global__ void attend_ker(const attn_globals<D> g) {
         col_max(max_vec, att_block[1], max_vec);
         sub_col(att_block[1], att_block[1], max_vec);
         exp2(att_block[1], att_block[1]);
+        // exp_first_half_k(att_block[1], att_block[1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -341,7 +347,8 @@ __global__ void attend_ker(const attn_globals<D> g) {
         copy(max_vec_prev, max_vec);
         col_max(max_vec, att_block[0], max_vec);
         sub_col(att_block[0], att_block[0], max_vec);
-        exp2(att_block[0], att_block[0]);
+        exp_first_half_k(att_block[0], att_block[0]);
+        exp_second_half_k(att_block[0], att_block[0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
