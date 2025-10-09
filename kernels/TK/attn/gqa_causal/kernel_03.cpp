@@ -259,7 +259,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
     #pragma unroll 
     for (int j = 3; j < max_num_tiles - 1; j += 2) {
         // Cluster 0: QK1
-        __builtin_amdgcn_s_setprio(1);
         swap_layout_and_transpose(k_reg_transposed, k_reg);
         mma_AtB(att_block[1], k_reg_transposed, q_reg_transposed, att_block[1]);
         //      Finish softmax for QK0
@@ -268,7 +267,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
         mul(norm_vec, norm_vec, max_vec_prev);
         col_sum(norm_vec, att_block[0], norm_vec);
         copy(att_block_bf16, att_block[0]);
-        __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
     
@@ -283,7 +281,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
         __builtin_amdgcn_s_barrier();
     
         // Cluster 2: A0V0
-        __builtin_amdgcn_s_setprio(1);
         mul_col(o_reg, o_reg, max_vec_prev);
         mma_AtB(o_reg, v_reg, att_block_bf16, o_reg);
         //      Partial softmax for QK1
@@ -298,7 +295,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
         col_max(max_vec, att_block[1], max_vec);
         sub_col(att_block[1], att_block[1], max_vec);
         exp2(att_block[1], att_block[1]);
-        __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
     
@@ -341,7 +337,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
         __builtin_amdgcn_s_barrier();
     
         // Cluster 6: A1V1
-        __builtin_amdgcn_s_setprio(1);
         mma_AtB(o_reg, v_reg, att_block_bf16, o_reg);
         //      Partial softmax for QK2
         if constexpr (causal) {
@@ -356,7 +351,6 @@ __global__ void attend_ker(const attn_globals<D> g) {
         sub_col(att_block[0], att_block[0], max_vec);
         exp_first_half_k(att_block[0], att_block[0]);
         exp_second_half_k(att_block[0], att_block[0]);
-        __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
     
