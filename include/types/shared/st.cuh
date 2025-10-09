@@ -140,9 +140,13 @@ struct st_subtile {
     int row_offset, col_offset;
 
     __device__ st_subtile(ST &src, int2 rowcol) {
-        data = &src.data[0];
         row_offset = rowcol.x * rows;
         col_offset = rowcol.y * cols;
+        const int subtile_row_offset = row_offset / underlying_subtile_rows;
+        const int subtile_col_offset = col_offset / underlying_subtile_cols;
+        const int subtile_id = subtile_row_offset * underlying_subtiles_per_row + subtile_col_offset;
+        const int subtile_offset = subtile_id * underlying_subtile_elements;
+        data = &src.data[subtile_offset];
     }
 
     __device__ __forceinline__ static const uint32_t swizzle(int2 coord) {

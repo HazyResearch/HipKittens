@@ -134,7 +134,7 @@ struct st_32x16 {
 
         if constexpr (sizeof(T) == 2) {
             const int first_swizzle = ((offset % 512) >> 7) << 3;
-            const int second_swizzle = ((offset % 1024) >> 8) << 7;
+            const int second_swizzle = ((offset % 1024) >> 9) << 4;
             const int swizzled_offset = offset ^ first_swizzle ^ second_swizzle;
             return swizzled_offset;
         } else {

@@ -46,7 +46,7 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx)
 
         const int row = subtile_lane_byte_offset / ST::underlying_subtile_row_bytes;
         const int col = (subtile_lane_byte_offset % ST::underlying_subtile_row_bytes) / sizeof(T);
-        const uint32_t swizzled_shared_byte_offset = ST::swizzle({row, col});
+        const uint32_t swizzled_shared_byte_offset = dst.swizzle({row, col});
 
         const int swizzled_global_row = (swizzled_shared_byte_offset / ST::underlying_subtile_row_bytes) + subtile_row * ST::underlying_subtile_rows;
         const int swizzled_global_col = (swizzled_shared_byte_offset % ST::underlying_subtile_row_bytes) / sizeof(T) + subtile_col * ST::underlying_subtile_cols;
@@ -100,10 +100,10 @@ __device__ inline void prefill_swizzled_offsets(
 
         int row = subtile_lane_byte_offset / ST::underlying_subtile_row_bytes;
         int col = (subtile_lane_byte_offset % ST::underlying_subtile_row_bytes) / sizeof(T);
-        const uint32_t swizzled_shared_byte_offset = ST::swizzle({row, col});
+        const uint32_t swizzled_shared_byte_offset = dst.swizzle({row, col});
 
         const int swizzled_global_row = (swizzled_shared_byte_offset / ST::underlying_subtile_row_bytes) + subtile_row * ST::underlying_subtile_rows;
-        const int swizzled_global_col = (swizzled_shared_byte_offset % ST::underlying_subtile_row_bytes) / sizeof(T) + subtile_id * ST::underlying_subtile_cols;
+        const int swizzled_global_col = (swizzled_shared_byte_offset % ST::underlying_subtile_row_bytes) / sizeof(T) + subtile_col * ST::underlying_subtile_cols;
         const uint32_t swizzled_global_byte_offset = (swizzled_global_row * row_stride + swizzled_global_col) * sizeof(T);
         swizzled_offsets[i] = swizzled_global_byte_offset;
     }
@@ -199,7 +199,7 @@ __device__ static inline void store(const GL &dst, const ST &src, const COORD &i
 
         const int row = subtile_lane_byte_offset / ST::underlying_subtile_row_bytes;
         const int col = (subtile_lane_byte_offset % ST::underlying_subtile_row_bytes) / sizeof(T);
-        const uint32_t swizzled_shared_byte_offset = ST::swizzle({row, col});
+        const uint32_t swizzled_shared_byte_offset = src.swizzle({row, col});
 
         const int swizzled_global_row = (swizzled_shared_byte_offset / ST::underlying_subtile_row_bytes) + subtile_row * ST::underlying_subtile_rows;
         const int swizzled_global_col = (swizzled_shared_byte_offset % ST::underlying_subtile_row_bytes) / sizeof(T) + subtile_col * ST::underlying_subtile_cols;
