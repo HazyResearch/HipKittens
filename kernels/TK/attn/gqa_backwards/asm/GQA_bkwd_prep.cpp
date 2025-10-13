@@ -56,9 +56,9 @@ __device__ inline static void load_shuffled(RT &dst, const GL &src, const COORD 
         #pragma unroll
         for(int j = 0; j < dst.width; j++) {
             U2* tmp;
-            float2 loaded = std::bit_cast<float2>(llvm_amdgcn_raw_buffer_load_b64(
+            float4 loaded = std::bit_cast<float4>(llvm_amdgcn_raw_buffer_load_b128(
                 std::bit_cast<i32x4>(br),
-                (i * tile_row_stride + j * tile_stride + laneid * 4) * sizeof(U),
+                (i * tile_row_stride + j * tile_stride + laneid * 8) * sizeof(U),
                 0,
                 0
             ));
@@ -67,6 +67,73 @@ __device__ inline static void load_shuffled(RT &dst, const GL &src, const COORD 
             for(int k = 0; k < dst.packed_per_thread; k++) {
                 dst.tiles[i][j].data[k] = base_types::convertor<T2, U2>::convert(tmp[k]);
             }
+        }
+    }
+}
+
+template<int axis, ducks::rt::row_layout RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
+__device__ inline static void store_shuffled(const GL &dst, const RT &src, const COORD &idx) {
+    using T2 = RT::dtype;
+    using U = typename GL::dtype;
+    using U2 = base_types::packing<U>::packed_type;
+
+    U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
+    const int row_stride = dst.template stride<axis>();
+    int laneid = kittens::laneid();
+
+    const int row_offset = (laneid % 4) * 4;
+    const int col_offset = ((laneid / 32) * 16) + (((laneid % 32) / 16) * 2) + (((laneid % 16) / 4) * 4);
+
+    uint32_t buffer_size = dst.batch() * dst.depth() * dst.rows() * dst.cols() * sizeof(U);
+    std::uintptr_t as_int = reinterpret_cast<std::uintptr_t>(dst_ptr);
+    std::uint64_t  as_u64 = static_cast<std::uint64_t>(as_int);    // widen if host is 32-bit
+    buffer_resource br = make_buffer_resource(as_u64, buffer_size, 0x00020000);
+
+    #pragma unroll
+    for(int i = 0; i < src.height; i++) {
+        int row = src.base_tile_rows * i + row_offset;
+        #pragma unroll
+        for(int j = 0; j < src.width; j++) {
+            int col = src.base_tile_cols * j + col_offset;
+
+            const uint32_t val_0 = *reinterpret_cast<const uint32_t*>(&src.tiles[i][j].data[0]);
+            const uint32_t val_1 = *reinterpret_cast<const uint32_t*>(&src.tiles[i][j].data[1]);
+            const uint32_t val_2 = *reinterpret_cast<const uint32_t*>(&src.tiles[i][j].data[2]);
+            const uint32_t val_3 = *reinterpret_cast<const uint32_t*>(&src.tiles[i][j].data[3]);
+
+            uint32_t offset_0 = (row * row_stride + col) * sizeof(U);
+            uint32_t offset_1 = ((row + 1) * row_stride + col) * sizeof(U);
+            uint32_t offset_2 = ((row + 2) * row_stride + col) * sizeof(U);
+            uint32_t offset_3 = ((row + 3) * row_stride + col) * sizeof(U);
+
+            llvm_amdgcn_raw_buffer_store_b32(
+                val_0,
+                std::bit_cast<i32x4>(br),
+                offset_0,
+                0,
+                0
+            );
+            llvm_amdgcn_raw_buffer_store_b32(
+                val_1,
+                std::bit_cast<i32x4>(br),
+                offset_1,
+                0,
+                0
+            );
+            llvm_amdgcn_raw_buffer_store_b32(
+                val_2,
+                std::bit_cast<i32x4>(br),
+                offset_2,
+                0,
+                0
+            );
+            llvm_amdgcn_raw_buffer_store_b32(
+                val_3,
+                std::bit_cast<i32x4>(br),
+                offset_3,
+                0,
+                0
+            );
         }
     }
 }
@@ -128,10 +195,10 @@ __global__ void attend_dq_shuffle_ker(const attn_dq_shuffle_globals<D> g) {
 
     const int warpid = kittens::warpid();
 
-    qo_tile<D, bf16, row_l, rt_16x16_s> dQg;
+    qo_tile<D, bf16, row_l, rt_16x32_s> dQg;
 
     load_shuffled<2>(dQg, g.dQg_in, {batch_idx, q_head_idx, seq_idx * NUM_WARPS + warpid, 0});
-    store<1>(g.dQg_out, dQg, {batch_idx, seq_idx * NUM_WARPS + warpid, q_head_idx, 0});
+    store_shuffled<1>(g.dQg_out, dQg, {batch_idx, seq_idx * NUM_WARPS + warpid, q_head_idx, 0});
 }
 
 template<int D>
