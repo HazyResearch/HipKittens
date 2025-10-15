@@ -185,13 +185,11 @@ __device__ inline void prefill_swizzled_offsets_fp6(
 
     constexpr int bytes_per_warp = bytes_per_thread * kittens::WARP_THREADS; // 16 * 64 = 1024
     constexpr int bytes_per_block = bytes_per_thread * N_THREADS;
+    constexpr int bytes_per_row = ST::cols * 6 / 8;
 
-    constexpr int bytes_per_subtile = (kittens::TILE_COL_DIM<T> * kittens::TILE_ROW_DIM<T> * 6 / 8) / 2;
     const int warp_id = warpid();
     const int laneid = kittens::laneid() % kittens::WARP_THREADS;
-    // row stride
-    constexpr int subtiles_per_row = ST::cols / (kittens::TILE_COL_DIM<T> / 2);
-    constexpr int bytes_per_subtile_row = (kittens::TILE_COL_DIM<T> / 2) * 6 / 8;
+
     const int row_stride_bytes = src.template stride<axis>() * 6 / 8;
 
     #pragma unroll
@@ -200,16 +198,8 @@ __device__ inline void prefill_swizzled_offsets_fp6(
         const int warp_byte_offset = (i * bytes_per_block) + (warp_id * bytes_per_warp);
         const int lane_byte_offset = laneid * bytes_per_thread + warp_byte_offset;
 
-        const int subtile_id = lane_byte_offset / bytes_per_subtile;
-        const int subtile_row_offset = subtile_id / subtiles_per_row;
-        const int subtile_col_offset = subtile_id % subtiles_per_row;
-
-        const int subtile_byte_offset = lane_byte_offset % bytes_per_subtile;
-        const int inner_subtile_row_offset = subtile_byte_offset / bytes_per_subtile_row;
-        const int inner_subtile_col_byte_offset = subtile_byte_offset % bytes_per_subtile_row;
-
-        const int row_offset = subtile_row_offset * kittens::TILE_ROW_DIM<T> + inner_subtile_row_offset;
-        const int col_byte_offset = subtile_col_offset * bytes_per_subtile_row + inner_subtile_col_byte_offset;
+        const int row_offset = lane_byte_offset / bytes_per_row;
+        const int col_byte_offset = lane_byte_offset % bytes_per_row;
 
         swizzled_offsets[i] = row_offset * row_stride_bytes + col_byte_offset;
     }
@@ -276,13 +266,10 @@ __device__ inline void load_global_to_shared_direct_with_swizzled_offsets_fp6(
      const int laneid = kittens::laneid() % kittens::WARP_THREADS;
      auto* lds_bytes = reinterpret_cast<const uint8_t*>(&src.data[0]);
 
-     const int subtile_id = laneid / 32;
      const int row_offset = laneid % 16;
-     const int col_offset = 32 * ((laneid % 32) / 16);
+     const int col_offset = 32 * (laneid / 16);
 
-     const int subtile_cols = kittens::TILE_COL_DIM<U> / 2;
-     const int subtile_byte_offset = (kittens::TILE_COL_DIM<U> * kittens::TILE_ROW_DIM<U> * 6 / 8) / 2;
-     const int byte_offset = ((row_offset * subtile_cols + col_offset) * 6 / 8) + (subtile_id * subtile_byte_offset);
+     const int byte_offset = (row_offset * kittens::TILE_COL_DIM<U> + col_offset) * 6 / 8;
      const uint32_t addr = reinterpret_cast<uintptr_t>(lds_bytes + byte_offset);
 
      const int tile_stride = (kittens::TILE_ROW_DIM<U> * kittens::TILE_COL_DIM<U> * 6 / 8);
