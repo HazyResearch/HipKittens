@@ -34,21 +34,35 @@ __device__ inline static void load(RV &dst, const SV &src) {
     
     // TODO: this uses no inter-thread communication and is therefore not optimal.
     if constexpr (std::is_same_v<typename RV::layout, align_l>) {
-        const int offset = (laneid % dst.aligned_threads) * dst.stride;
 
-        #pragma unroll
-        for (int w = 0; w < dst.outer_dim; w++) {
+        if constexpr (std::is_same_v<typename RV::shape, rt_16x16_s>) {
+            const int lane_offset = 4*(laneid/16) + laneid%4;
+            const uint32_t addr = reinterpret_cast<uintptr_t>(&src.data[0]) + lane_offset * sizeof(U);
+            #pragma unroll
+            for(auto w = 0; w < dst.outer_dim; w++) {
+                asm volatile(
+                    "ds_read_b32 %0, %1 offset:%2\n"
+                    : "=v"(dst[w][0])
+                    : "v"(addr), "i"(w * 16 * sizeof(U))
+                    : "memory"
+                );
+            }
+        } else {
+            const int offset = (laneid % dst.aligned_threads) * dst.stride;
 
             #pragma unroll
-            for (int i = 0; i < dst.strides_per_tile; i++) {
-                const int idx = w * dst.reductions + offset + i * dst.elements_per_stride_group;
-                
+            for (int w = 0; w < dst.outer_dim; w++) {
+
                 #pragma unroll
-                for (int j = 0; j < dst.packed_per_stride; j++) {
-                    dst[w][i * dst.packed_per_stride + j] = base_types::convertor<T2, U2>::convert(*(U2*) (&src.data[idx + j * dst.packing]));
+                for (int i = 0; i < dst.strides_per_tile; i++) {
+                    const int idx = w * dst.reductions + offset + i * dst.elements_per_stride_group;
+                    
+                    #pragma unroll
+                    for (int j = 0; j < dst.packed_per_stride; j++) {
+                        dst[w][i * dst.packed_per_stride + j] = base_types::convertor<T2, U2>::convert(*(U2*) (&src.data[idx + j * dst.packing]));
+                    }
                 }
             }
-
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, ortho_l>) {

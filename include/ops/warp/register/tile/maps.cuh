@@ -589,37 +589,40 @@ __device__ static inline void add_row(T &dst, const T &src, const V &row_values)
 template<ducks::rt::all T, ducks::rv::all V>
 __device__ static inline void sub_row(T &dst, const T &src, const V &row_values) {
 
-    // #pragma unroll
-    // for(int i = 0; i < dst.height; i++) {
-    //     #pragma unroll
-    //     for(int j = 0; j < dst.width; j++) {
-    //         asm volatile(
-    //             "v_subrev_f32_dpp %0, %1, %2 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf"
-    //             : "=v"(dst.tiles[i][j].data[0].x)
-    //             : "v"(row_values[i][0]), "v"(src.tiles[i][j].data[0].x)
-    //             : "memory"
-    //         );
-    //         asm volatile(
-    //             "v_subrev_f32_dpp %0, %1, %2 quad_perm:[1,1,1,1] row_mask:0xf bank_mask:0xf"
-    //             : "=v"(dst.tiles[i][j].data[0].y)
-    //             : "v"(row_values[i][0]), "v"(src.tiles[i][j].data[0].y)
-    //             : "memory"
-    //         );
-    //         asm volatile(
-    //             "v_subrev_f32_dpp %0, %1, %2 quad_perm:[2,2,2,2] row_mask:0xf bank_mask:0xf"
-    //             : "=v"(dst.tiles[i][j].data[1].x)
-    //             : "v"(row_values[i][0]), "v"(src.tiles[i][j].data[1].x)
-    //             : "memory"
-    //         );
-    //         asm volatile(
-    //             "v_subrev_f32_dpp %0, %1, %2 quad_perm:[3,3,3,3] row_mask:0xf bank_mask:0xf"
-    //             : "=v"(dst.tiles[i][j].data[1].y)
-    //             : "v"(row_values[i][0]), "v"(src.tiles[i][j].data[1].y)
-    //             : "memory"
-    //         );
-    //     }
-    // }
-    row_map<base_ops::sub, T, V>(dst, src, row_values);
+    if constexpr (std::is_same_v<typename V::shape, rt_16x16_s>) {
+        #pragma unroll
+        for(int i = 0; i < dst.height; i++) {
+            #pragma unroll
+            for(int j = 0; j < dst.width; j++) {
+                asm volatile(
+                    "v_subrev_f32_dpp %0, %1, %2 quad_perm:[0,0,0,0] row_mask:0xf bank_mask:0xf"
+                    : "=v"(dst.tiles[i][j].data[0].x)
+                    : "v"(row_values[i][0]), "v"(src.tiles[i][j].data[0].x)
+                    : "memory"
+                );
+                asm volatile(
+                    "v_subrev_f32_dpp %0, %1, %2 quad_perm:[1,1,1,1] row_mask:0xf bank_mask:0xf"
+                    : "=v"(dst.tiles[i][j].data[0].y)
+                    : "v"(row_values[i][0]), "v"(src.tiles[i][j].data[0].y)
+                    : "memory"
+                );
+                asm volatile(
+                    "v_subrev_f32_dpp %0, %1, %2 quad_perm:[2,2,2,2] row_mask:0xf bank_mask:0xf"
+                    : "=v"(dst.tiles[i][j].data[1].x)
+                    : "v"(row_values[i][0]), "v"(src.tiles[i][j].data[1].x)
+                    : "memory"
+                );
+                asm volatile(
+                    "v_subrev_f32_dpp %0, %1, %2 quad_perm:[3,3,3,3] row_mask:0xf bank_mask:0xf"
+                    : "=v"(dst.tiles[i][j].data[1].y)
+                    : "v"(row_values[i][0]), "v"(src.tiles[i][j].data[1].y)
+                    : "memory"
+                );
+            }
+        }
+    } else {
+        row_map<base_ops::sub, T, V>(dst, src, row_values);
+    }
 }
 /**
  * @brief Multiplies each row of a tile by row values.
