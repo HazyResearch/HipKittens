@@ -2,7 +2,7 @@
 GPU_TARGET=CDNA4
 
 TARGET=tk_kernel_bkwd
-SRC=GQA_bkwd_4warps.cpp
+SRC=GQA_bkwd_asm_interleaved.cpp
 
 # HIP variables
 ROCM_INSTALL_DIR := $(ROCM_PATH)

@@ -21,14 +21,12 @@ torch.set_printoptions(
     threshold=float("inf")  
 )
 
-torch.cuda.set_device(5)
-
 # **************************************************
 # Benchmarking
 # **************************************************
 
-num_warmup = 100
-num_iters = 500
+num_warmup = 500
+num_iters = 100
 start_event = torch.cuda.Event(enable_timing=True) # in milliseconds
 end_event = torch.cuda.Event(enable_timing=True)
 
@@ -131,12 +129,12 @@ def simple_flash_backward(Q, K, V, dO, L):
 # **************************************************
 
 
-causal = True
+causal = False
 b = 16
-h_q = 16  # number of query heads  
-h_kv = 16  # number of key/value heads (for GQA)
+h_q = 64  # number of query heads  
+h_kv = 8  # number of key/value heads (for GQA)
 group_size = h_q // h_kv  # queries per KV head group
-n = 8192
+n = 2048
 d = 128
 dtype = torch.bfloat16
 mean = 10
@@ -179,7 +177,7 @@ if use_aiter:
         K_aiter = K_bhnd.transpose(1, 2).contiguous().detach().requires_grad_(True)  
         V_aiter = V_bhnd.transpose(1, 2).contiguous().detach().requires_grad_(True)  
         dO_aiter = dO_bhnd.transpose(1, 2).contiguous()
-        out_aiter, softmax_lse = aiter.flash_attn_func(Q_aiter, K_aiter, V_aiter, causal=causal, return_lse=True, deterministic=False)
+        out_aiter, softmax_lse = aiter.flash_attn_func(Q_aiter, K_aiter, V_aiter, causal, return_lse=True, deterministic=False)
         out_aiter.backward(dO_aiter)
     
     for _ in range(num_iters):
@@ -187,7 +185,7 @@ if use_aiter:
         K_aiter = K_bhnd.transpose(1, 2).contiguous().detach().requires_grad_(True)  
         V_aiter = V_bhnd.transpose(1, 2).contiguous().detach().requires_grad_(True)  
         dO_aiter = dO_bhnd.transpose(1, 2).contiguous()
-        out_aiter, softmax_lse = aiter.flash_attn_func(Q_aiter, K_aiter, V_aiter, causal=causal, return_lse=True, deterministic=False)
+        out_aiter, softmax_lse = aiter.flash_attn_func(Q_aiter, K_aiter, V_aiter, causal, return_lse=True, deterministic=False)
         torch.cuda.synchronize()
         start_event.record()
         out_aiter.backward(dO_aiter)
