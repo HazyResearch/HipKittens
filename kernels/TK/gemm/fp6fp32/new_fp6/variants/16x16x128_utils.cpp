@@ -200,6 +200,13 @@ __device__ inline void prefill_swizzled_offsets_fp6(
         int col_offset = warp_col_offset + (laneid % (128 / elems_per_thread)) * elems_per_thread;
         int row_offset = warp_row_offset + (laneid / (128 / elems_per_thread));
 
+        int element_offset_in_st = (row_offset * ST::underlying_cols + col_offset);
+        element_offset_in_st ^= (((element_offset_in_st % (16*128)) >> 8) << 4);
+        int byte_offset_in_st = element_offset_in_st * 6 / 8;
+
+        col_offset = (byte_offset_in_st % (ST::underlying_cols * 6 / 8)) * 8 / 6;
+        row_offset = byte_offset_in_st / (ST::underlying_cols * 6 / 8);
+
         const int offset_in_global = (row_offset * row_stride + col_offset) * 6 / 8;
 
         swizzled_offsets[i] = offset_in_global;
@@ -271,10 +278,12 @@ __device__ inline void load_global_to_shared_direct_with_swizzled_offsets_fp6(
      const int row_offset = laneid % 16;
      const int col_offset = 32 * (laneid / 16);  // NOTE: This col_offset is in bytes, not elements.
 
-     const int byte_offset = (row_offset * kittens::TILE_COL_DIM<U> + col_offset);
-     const uintptr_t addrptr = reinterpret_cast<uintptr_t>(lds_bytes + byte_offset);
-     const uint32_t addr = reinterpret_cast<uintptr_t>(lds_bytes + byte_offset);
-     as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(addrptr);
+     uint32_t byte_offset = (row_offset * kittens::TILE_COL_DIM<U> + col_offset);
+     byte_offset ^= (((byte_offset % (16*128)) >> 8) << 4);
+     uint32_t byte_offset_second = byte_offset + 16;
+     byte_offset_second ^= (((byte_offset_second % (16*128)) >> 8) << 4);
+     uint32_t addr = reinterpret_cast<uintptr_t>(lds_bytes + byte_offset);
+     uint32_t addr_second = reinterpret_cast<uintptr_t>(lds_bytes + byte_offset_second);
 
      const int tile_stride = (kittens::TILE_ROW_DIM<U> * kittens::TILE_COL_DIM<U>);
      const int row_stride = tile_stride * src.underlying_width;
@@ -284,17 +293,20 @@ __device__ inline void load_global_to_shared_direct_with_swizzled_offsets_fp6(
 
        #pragma unroll
        for(int j = 0; j < dst.width; j++) {
-
-           #pragma unroll
-           for (int k = 1; k >= 0; k--) {
-               asm volatile(
-                   "ds_read_b96 %0, %1 offset:%2\n"
-                   : "=v"(*reinterpret_cast<__uint96_t*>((reinterpret_cast<uint8_t*>(&dst.tiles[i][j].data[0]) + k * 12)))
-                   : "v"(addr),
-                   "i"(i * row_stride + j * tile_stride + k * 16)
-                   : "memory"
-               );
-           }
+            asm volatile(
+                "ds_read_b96 %0, %1 offset:%2\n"
+                : "=v"(*reinterpret_cast<__uint96_t*>((reinterpret_cast<uint8_t*>(&dst.tiles[i][j].data[0]))))
+                : "v"(addr),
+                "i"(i * row_stride + j * tile_stride)
+                : "memory"
+            );
+            asm volatile(
+                "ds_read_b96 %0, %1 offset:%2\n"
+                : "=v"(*reinterpret_cast<__uint96_t*>((reinterpret_cast<uint8_t*>(&dst.tiles[i][j].data[0]) + 12)))
+                : "v"(addr_second),
+                "i"(i * row_stride + j * tile_stride)
+                : "memory"
+            );
        }
     }
  }
