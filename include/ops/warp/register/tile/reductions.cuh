@@ -61,6 +61,9 @@ __device__ static inline void row_reduce(V &row_accum, const T &src, const V &sr
         else if constexpr (std::is_same_v<RT, half> && T::base_tile_rows == 32) {
             uint2_t res = __builtin_amdgcn_permlane32_swap(__half_as_ushort(accum_single), __half_as_ushort(accum_single), false, true);
             accum_single = op::template op<RT>(__ushort_as_half(res.x), __ushort_as_half(res.y));
+        } else if constexpr (std::is_same_v<RT, float> && T::base_tile_rows == 32) {
+            uint2_t res = __builtin_amdgcn_permlane32_swap(__float_as_uint(accum_single), __float_as_uint(accum_single), false, true);
+            accum_single = op::template op<RT>(__uint_as_float(res.x), __uint_as_float(res.y));
         } else {
             for (int shift = max_shift; shift > 0; shift--) {
                 accum_single = op::template op<RT>(accum_single, __shfl_down(accum_single, shift * T::base_tile_rows));
@@ -272,6 +275,9 @@ __device__ static inline void col_reduce(V &col_accum, const T &src, const V &sr
         else if constexpr (std::is_same_v<RT, half> && T::base_tile_cols == 32) {
             uint2_t res = __builtin_amdgcn_permlane32_swap(__half_as_ushort(accum_single), __half_as_ushort(accum_single), false, true);
             accum_single = op::template op<RT>(__ushort_as_half(res.x), __ushort_as_half(res.y));
+        } else if constexpr (std::is_same_v<RT, float> && T::base_tile_cols == 32) {
+            uint2_t res = __builtin_amdgcn_permlane32_swap(__float_as_uint(accum_single), __float_as_uint(accum_single), false, true);
+            accum_single = op::template op<RT>(__uint_as_float(res.x), __uint_as_float(res.y));
         } else {
             for (int shift = max_shift; shift > 0; shift--) {
                 accum_single = op::template op<RT>(accum_single, __shfl_down(accum_single, shift * T::base_tile_cols));
