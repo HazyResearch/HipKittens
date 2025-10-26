@@ -59,7 +59,7 @@ struct micro_globals {
 constexpr int axis = 2;
 
 template<typename D, typename A, typename B, typename C>
-__device__ inline void mma_ABt_base_wrapper(D& d_mma, const A& a_mma, const B& b_mma, const C& c_mma, int n, int m, int k) {
+__device__ inline static void mma_ABt_base_wrapper(D& d_mma, const A& a_mma, const B& b_mma, const C& c_mma, int n, int m, int k) {
     using T = typename D::dtype;
     static_assert(D::rows == A::rows && D::cols == B::rows); // Check D matches A, B
     static_assert(A::cols == B::cols); // Check reduction dim is same
@@ -564,7 +564,7 @@ int main() {
     // random number generator
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_real_distribution<> dis(-.0f, 1.0f);
+    std::uniform_real_distribution<> dis(-1.0f, 1.0f);
 
     // Initialize with different values
     for (int i = 0; i < M * K; i++) {
