@@ -18,8 +18,8 @@ B = torch.randn(N, N, dtype=torch.bfloat16, device='cuda') / 10.0
 Bt = B.t().contiguous()  # Transpose B for the kernel
 
 if profiling:
-    num_warmup = 100
-    num_iters = 500
+    num_warmup = 500
+    num_iters = 100
 else:
     num_warmup = 1
     num_iters = 0
@@ -29,24 +29,24 @@ end_event = torch.cuda.Event(enable_timing=True)
 flops_ref = (2 * N**3)  # FLOPs for reference
 
 if profiling:
-    # Reference matmul using PyTorch
-    for _ in range(num_warmup):
-        C_pytorch = torch.matmul(A, Bt)
-    timings_pytorch = []
-    for _ in range(num_iters):
-        torch.cuda.synchronize()
-        start_event.record()
-        C_pytorch = torch.matmul(A, Bt)
-        end_event.record()
-        torch.cuda.synchronize()
-        elapsed_time = start_event.elapsed_time(end_event)
-        timings_pytorch.append(elapsed_time)
-    if profiling:
-        print(f"{C_pytorch.dtype=}")
-        avg_time_pytorch = sum(timings_pytorch) / len(timings_pytorch)
-        tflops_pytorch = flops_ref / (avg_time_pytorch * 1e9) 
-        print(f"PyTorch reference average execution time: {avg_time_pytorch:.4f} ms")
-        print(f"PyTorch reference performance: {tflops_pytorch:.2f} TFLOPS for {N}x{N} matrix multiplication.\n")
+    # # Reference matmul using PyTorch
+    # for _ in range(num_warmup):
+    #     C_pytorch = torch.matmul(A, Bt)
+    # timings_pytorch = []
+    # for _ in range(num_iters):
+    #     torch.cuda.synchronize()
+    #     start_event.record()
+    #     C_pytorch = torch.matmul(A, Bt)
+    #     end_event.record()
+    #     torch.cuda.synchronize()
+    #     elapsed_time = start_event.elapsed_time(end_event)
+    #     timings_pytorch.append(elapsed_time)
+    # if profiling:
+    #     print(f"{C_pytorch.dtype=}")
+    #     avg_time_pytorch = sum(timings_pytorch) / len(timings_pytorch)
+    #     tflops_pytorch = flops_ref / (avg_time_pytorch * 1e9) 
+    #     print(f"PyTorch reference average execution time: {avg_time_pytorch:.4f} ms")
+    #     print(f"PyTorch reference performance: {tflops_pytorch:.2f} TFLOPS for {N}x{N} matrix multiplication.\n")
 
     # Reference matmul using AITER (AMD)
     for _ in range(num_warmup):
@@ -91,7 +91,7 @@ if profiling:
 # Compare against reference
 if profiling:
     C_float = C.float()
-    C_ref_float = C_pytorch.float()
+    C_ref_float = C_aiter.float()
     diff = (C_float - C_ref_float).abs()
     max_error = diff.max().item()
     mean_error = diff.mean().item()
