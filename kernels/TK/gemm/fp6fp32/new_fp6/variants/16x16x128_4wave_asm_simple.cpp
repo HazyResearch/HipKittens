@@ -60,8 +60,8 @@ void micro_tk(const micro_globals g) {
 
     using ST_A = st_fp6<HALF_BLOCK_SIZE_M, K_STEP, st_16x128_s>; // TO CHECK
     using ST_B = st_fp6<HALF_BLOCK_SIZE_N, K_STEP, st_16x128_s>;
-    ST_A (&As)[2] = al.allocate<ST_A, 2>(); // TO CHECK
-    ST_B (&Bs)[2] = al.allocate<ST_B, 2>();
+    ST_A (&As)[2][2] = al.allocate<ST_A, 2, 2>(); // TO CHECK
+    ST_B (&Bs)[2][2] = al.allocate<ST_B, 2, 2>();
 
     using A_0_range          = ducks::rt::split_many_t<ducks::rt::type_list<ducks::rt::range<224, 255>>, 8>; // 32 registers - v[224:255]
     using A_1_range          = ducks::rt::split_many_t<ducks::rt::type_list<ducks::rt::range<192, 223>>, 8>;
@@ -98,26 +98,33 @@ void micro_tk(const micro_globals g) {
     const int warp_row = warpid() / 2;
     const int warp_col = warpid() % 2;
 
+    int tic = 0, toc = 1;
+
+    G::load(As[tic][0], g.a, {0, 0, row*2, 0});
+    G::load(As[tic][1], g.a, {0, 0, row*2+1, 0});
+    G::load(Bs[tic][0], g.b, {0, 0, col*2, 0});
+    G::load(Bs[tic][1], g.b, {0, 0, col*2+1, 0});
+
     {
         constexpr int k = 0;
-        G::load(As[0], g.a, {0, 0, row*2, k});
-        G::load(As[1], g.a, {0, 0, row*2+1, k});
-        G::load(Bs[0], g.b, {0, 0, col*2, k});
-        G::load(Bs[1], g.b, {0, 0, col*2+1, k});
-        __builtin_amdgcn_s_waitcnt(0);
+        G::load(As[toc][0], g.a, {0, 0, row*2, k+1});
+        G::load(As[toc][1], g.a, {0, 0, row*2+1, k+1});
+        G::load(Bs[toc][0], g.b, {0, 0, col*2, k+1});
+        G::load(Bs[toc][1], g.b, {0, 0, col*2+1, k+1});
+
+        asm volatile("s_waitcnt vmcnt(16)");
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[0], {warp_row, 0});
+        auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[tic][0], {warp_row, 0});
         load(A_0, a_subtile_0);
-        auto a_subtile_1 = kittens::subtile_inplace<64, 128>(As[1], {warp_row, 0});
+        auto a_subtile_1 = kittens::subtile_inplace<64, 128>(As[tic][1], {warp_row, 0});
         load(A_1, a_subtile_1);
-        auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[0], {warp_col, 0});
+        auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[tic][0], {warp_col, 0});
         load(B_0, b_subtile_0);
-        auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[1], {warp_col, 0});
+        auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[tic][1], {warp_col, 0});
         load(B_1, b_subtile_1);
-        __builtin_amdgcn_s_waitcnt(0);
-        __builtin_amdgcn_s_barrier();
+        asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_sched_barrier(0);
 
         shuffle_in_place(A_0);
@@ -129,26 +136,51 @@ void micro_tk(const micro_globals g) {
         mma_ABt(C_accum_10, B_0, A_1);
         mma_ABt(C_accum_11, B_1, A_1);
     }
+    tic ^= 1, toc ^= 1;
+    for (int k = 1; k < k_iters - 1; k++, tic ^= 1, toc ^= 1) {
+        G::load(As[toc][0], g.a, {0, 0, row*2, k+1});
+        G::load(As[toc][1], g.a, {0, 0, row*2+1, k+1});
+        G::load(Bs[toc][0], g.b, {0, 0, col*2, k+1});
+        G::load(Bs[toc][1], g.b, {0, 0, col*2+1, k+1});
 
-    for (int k = 1; k < k_iters; k++) {
-        G::load(As[0], g.a, {0, 0, row*2, k});
-        G::load(As[1], g.a, {0, 0, row*2+1, k});
-        G::load(Bs[0], g.b, {0, 0, col*2, k});
-        G::load(Bs[1], g.b, {0, 0, col*2+1, k});
-        __builtin_amdgcn_s_waitcnt(0);
+        asm volatile("s_waitcnt vmcnt(16)");
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[0], {warp_row, 0});
+        auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[tic][0], {warp_row, 0});
         load(A_0, a_subtile_0);
-        auto a_subtile_1 = kittens::subtile_inplace<64, 128>(As[1], {warp_row, 0});
+        auto a_subtile_1 = kittens::subtile_inplace<64, 128>(As[tic][1], {warp_row, 0});
         load(A_1, a_subtile_1);
-        auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[0], {warp_col, 0});
+        auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[tic][0], {warp_col, 0});
         load(B_0, b_subtile_0);
-        auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[1], {warp_col, 0});
+        auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[tic][1], {warp_col, 0});
         load(B_1, b_subtile_1);
-        __builtin_amdgcn_s_waitcnt(0);
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_sched_barrier(0);
+
+        shuffle_in_place(A_0);
+        shuffle_in_place(B_0);
+        shuffle_in_place(A_1);
+        shuffle_in_place(B_1);
+        mma_ABt(C_accum_00, B_0, A_0, C_accum_00);
+        mma_ABt(C_accum_01, B_1, A_0, C_accum_01);
+        mma_ABt(C_accum_10, B_0, A_1, C_accum_10);
+        mma_ABt(C_accum_11, B_1, A_1, C_accum_11);
+    }
+    {
+        asm volatile("s_waitcnt vmcnt(0)");
         __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+
+        auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[tic][0], {warp_row, 0});
+        load(A_0, a_subtile_0);
+        auto a_subtile_1 = kittens::subtile_inplace<64, 128>(As[tic][1], {warp_row, 0});
+        load(A_1, a_subtile_1);
+        auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[tic][0], {warp_col, 0});
+        load(B_0, b_subtile_0);
+        auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[tic][1], {warp_col, 0});
+        load(B_1, b_subtile_1);
+        asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_sched_barrier(0);
 
         shuffle_in_place(A_0);
