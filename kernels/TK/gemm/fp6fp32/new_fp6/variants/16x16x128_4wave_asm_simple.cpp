@@ -32,7 +32,8 @@ constexpr int REG_BLOCK_N      = BLOCK_SIZE_N / 2 / WARPS_COL;
 
 #define M 256
 #define N 256
-#define K 128
+#define K 256
+constexpr int k_iters = K / K_STEP;
 
 using _gl_A = gl<din, -1, -1, -1, -1>;
 using _gl_B = gl<din, -1, -1, -1, -1>;
@@ -92,34 +93,68 @@ void micro_tk(const micro_globals g) {
     const int warp_row = warpid() / 2;
     const int warp_col = warpid() % 2;
 
-    G::load(As[0], g.a, {0, 0, 0, 0});
-    G::load(As[1], g.a, {0, 0, 1, 0});
-    G::load(Bs[0], g.b, {0, 0, 0, 0});
-    G::load(Bs[1], g.b, {0, 0, 1, 0});
-    __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+    {
+        constexpr int k = 0;
+        G::load(As[0], g.a, {0, 0, 0, k});
+        G::load(As[1], g.a, {0, 0, 1, k});
+        G::load(Bs[0], g.b, {0, 0, 0, k});
+        G::load(Bs[1], g.b, {0, 0, 1, k});
+        __builtin_amdgcn_s_waitcnt(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
 
-    auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[0], {warp_row, 0});
-    load(A_0, a_subtile_0);
-    auto a_subtile_1 = kittens::subtile_inplace<64, 128>(As[1], {warp_row, 0});
-    load(A_1, a_subtile_1);
-    auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[0], {warp_col, 0});
-    load(B_0, b_subtile_0);
-    auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[1], {warp_col, 0});
-    load(B_1, b_subtile_1);
-    __builtin_amdgcn_s_waitcnt(0);
-    __builtin_amdgcn_s_barrier();
-    __builtin_amdgcn_sched_barrier(0);
+        auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[0], {warp_row, 0});
+        load(A_0, a_subtile_0);
+        auto a_subtile_1 = kittens::subtile_inplace<64, 128>(As[1], {warp_row, 0});
+        load(A_1, a_subtile_1);
+        auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[0], {warp_col, 0});
+        load(B_0, b_subtile_0);
+        auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[1], {warp_col, 0});
+        load(B_1, b_subtile_1);
+        __builtin_amdgcn_s_waitcnt(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
 
-    shuffle_in_place(A_0);
-    shuffle_in_place(B_0);
-    shuffle_in_place(A_1);
-    shuffle_in_place(B_1);
-    mma_ABt(C_accum_00, A_0, B_0);
-    mma_ABt(C_accum_01, A_0, B_1);
-    mma_ABt(C_accum_10, A_1, B_0);
-    mma_ABt(C_accum_11, A_1, B_1);
+        shuffle_in_place(A_0);
+        shuffle_in_place(B_0);
+        shuffle_in_place(A_1);
+        shuffle_in_place(B_1);
+        mma_ABt(C_accum_00, A_0, B_0);
+        mma_ABt(C_accum_01, A_0, B_1);
+        mma_ABt(C_accum_10, A_1, B_0);
+        mma_ABt(C_accum_11, A_1, B_1);
+    }
+
+    for (int k = 1; k < k_iters; k++) {
+        G::load(As[0], g.a, {0, 0, 0, k});
+        G::load(As[1], g.a, {0, 0, 1, k});
+        G::load(Bs[0], g.b, {0, 0, 0, k});
+        G::load(Bs[1], g.b, {0, 0, 1, k});
+        __builtin_amdgcn_s_waitcnt(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+
+        auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[0], {warp_row, 0});
+        load(A_0, a_subtile_0);
+        auto a_subtile_1 = kittens::subtile_inplace<64, 128>(As[1], {warp_row, 0});
+        load(A_1, a_subtile_1);
+        auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[0], {warp_col, 0});
+        load(B_0, b_subtile_0);
+        auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[1], {warp_col, 0});
+        load(B_1, b_subtile_1);
+        __builtin_amdgcn_s_waitcnt(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+
+        shuffle_in_place(A_0);
+        shuffle_in_place(B_0);
+        shuffle_in_place(A_1);
+        shuffle_in_place(B_1);
+        mma_ABt(C_accum_00, A_0, B_0, C_accum_00);
+        mma_ABt(C_accum_01, A_0, B_1, C_accum_01);
+        mma_ABt(C_accum_10, A_1, B_0, C_accum_10);
+        mma_ABt(C_accum_11, A_1, B_1, C_accum_11);
+    }
     // macros::v_nop();
     // macros::v_nop();
     // macros::v_nop();
