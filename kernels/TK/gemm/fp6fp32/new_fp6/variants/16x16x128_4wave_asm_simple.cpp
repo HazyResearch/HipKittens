@@ -100,15 +100,184 @@ void micro_tk(const micro_globals g) {
 
     int tic = 0, toc = 1;
 
-    G::load(As[tic][0], g.a, {0, 0, row*2, 0});
-    G::load(Bs[tic][0], g.b, {0, 0, col*2, 0});
-    G::load(Bs[tic][1], g.b, {0, 0, col*2+1, 0});
-    G::load(As[tic][1], g.a, {0, 0, row*2+1, 0});
+    // Global to shared addresses
+    constexpr int bytes_per_thread = ST_A::underlying_subtile_bytes_per_thread;
+    constexpr int memcpy_per_tile = ST_A::rows * ST_A::cols * sizeof(fp6) / (bytes_per_thread * NUM_THREADS);
+    uint32_t global_to_shared_swizzled_offsets[memcpy_per_tile];
+    G::prefill_swizzled_offsets(As[tic][0], g.a, global_to_shared_swizzled_offsets);
 
-    G::load(As[toc][0], g.a, {0, 0, row*2, 1});
-    G::load(Bs[toc][0], g.b, {0, 0, col*2, 1});
-    G::load(Bs[toc][1], g.b, {0, 0, col*2+1, 1});
-    G::load(As[toc][1], g.a, {0, 0, row*2+1, 1});
+    // Shared to register addresses
+    ds_read_b96_addresses addresses;
+
+    auto do_interleaved_cluster_prologue_Bshuffle = [&](auto& dst_st, const auto& src_gl, auto idx, auto& dst, const auto& src, auto& a, auto& b, auto& c, auto& shuffle) {
+        shuffle_in_place<0, 0>(shuffle);
+        macros::v_nop();
+        macros::v_nop();
+        mma_ABt<0, 0, 0>(c, b, a);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 0);
+        mma_ABt<0, 1, 0>(c, b, a);
+        addresses = get_address_fp6(dst, src);
+        mma_ABt<0, 2, 0>(c, b, a);
+        shuffle_in_place<1, 0>(shuffle);
+        mma_ABt<0, 3, 0>(c, b, a);
+        load_fp6<0, 0>(dst, src, addresses);
+        mma_ABt<1, 0, 0>(c, b, a);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 1);
+        mma_ABt<1, 1, 0>(c, b, a);
+        shuffle_in_place<2, 0>(shuffle);
+        mma_ABt<1, 2, 0>(c, b, a);
+        load_fp6<1, 0>(dst, src, addresses);
+        mma_ABt<1, 3, 0>(c, b, a);
+        mma_ABt<2, 0, 0>(c, b, a);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 2);
+        mma_ABt<2, 1, 0>(c, b, a);
+        load_fp6<2, 0>(dst, src, addresses);
+        mma_ABt<2, 2, 0>(c, b, a);
+        shuffle_in_place<3, 0>(shuffle);
+        mma_ABt<2, 3, 0>(c, b, a);
+        load_fp6<3, 0>(dst, src, addresses);
+        mma_ABt<3, 0, 0>(c, b, a);
+        mma_ABt<3, 1, 0>(c, b, a);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 3);
+        mma_ABt<3, 2, 0>(c, b, a);
+        mma_ABt<3, 3, 0>(c, b, a);
+    };
+
+    auto do_interleaved_cluster_prologue_Ashuffle = [&](auto& dst_st, const auto& src_gl, auto idx, auto& dst, const auto& src, auto& a, auto& b, auto& c, auto& shuffle) {
+        shuffle_in_place<0, 0>(shuffle);
+        macros::v_nop();
+        macros::v_nop();
+        mma_ABt<0, 0, 0>(c, b, a);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 0);
+        mma_ABt<1, 0, 0>(c, b, a);
+        addresses = get_address_fp6(dst, src);
+        mma_ABt<2, 0, 0>(c, b, a);
+        shuffle_in_place<1, 0>(shuffle);
+        mma_ABt<3, 0, 0>(c, b, a);
+        load_fp6<0, 0>(dst, src, addresses);
+        mma_ABt<0, 1, 0>(c, b, a);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 1);
+        mma_ABt<1, 1, 0>(c, b, a);
+        shuffle_in_place<2, 0>(shuffle);
+        mma_ABt<2, 1, 0>(c, b, a);
+        load_fp6<1, 0>(dst, src, addresses);
+        mma_ABt<3, 1, 0>(c, b, a);
+        mma_ABt<0, 2, 0>(c, b, a);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 2);
+        mma_ABt<1, 2, 0>(c, b, a);
+        load_fp6<2, 0>(dst, src, addresses);
+        mma_ABt<2, 2, 0>(c, b, a);
+        shuffle_in_place<3, 0>(shuffle);
+        mma_ABt<3, 2, 0>(c, b, a);
+        load_fp6<3, 0>(dst, src, addresses);
+        mma_ABt<0, 3, 0>(c, b, a);
+        mma_ABt<1, 3, 0>(c, b, a);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 3);
+        mma_ABt<2, 3, 0>(c, b, a);
+        mma_ABt<3, 3, 0>(c, b, a);
+    };
+
+    auto do_interleaved_cluster_loop_Bshuffle = [&](auto& dst_st, const auto& src_gl, auto idx, auto& dst, const auto& src, auto& a, auto& b, auto& c, auto& shuffle) {
+        shuffle_in_place<0, 0>(shuffle);
+        macros::v_nop();
+        macros::v_nop();
+        mma_ABt<0, 0, 0>(c, b, a, c);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 0);
+        mma_ABt<0, 1, 0>(c, b, a, c);
+        addresses = get_address_fp6(dst, src);
+        mma_ABt<0, 2, 0>(c, b, a, c);
+        shuffle_in_place<1, 0>(shuffle);
+        mma_ABt<0, 3, 0>(c, b, a, c);
+        load_fp6<0, 0>(dst, src, addresses);
+        mma_ABt<1, 0, 0>(c, b, a, c);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 1);
+        mma_ABt<1, 1, 0>(c, b, a, c);
+        shuffle_in_place<2, 0>(shuffle);
+        mma_ABt<1, 2, 0>(c, b, a, c);
+        load_fp6<1, 0>(dst, src, addresses);
+        mma_ABt<1, 3, 0>(c, b, a, c);
+        mma_ABt<2, 0, 0>(c, b, a, c);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 2);
+        mma_ABt<2, 1, 0>(c, b, a, c);
+        load_fp6<2, 0>(dst, src, addresses);
+        mma_ABt<2, 2, 0>(c, b, a, c);
+        shuffle_in_place<3, 0>(shuffle);
+        mma_ABt<2, 3, 0>(c, b, a, c);
+        load_fp6<3, 0>(dst, src, addresses);
+        mma_ABt<3, 0, 0>(c, b, a, c);
+        mma_ABt<3, 1, 0>(c, b, a, c);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 3);
+        mma_ABt<3, 2, 0>(c, b, a, c);
+        mma_ABt<3, 3, 0>(c, b, a, c);
+    };
+
+    auto do_interleaved_cluster_loop_Ashuffle = [&](auto& dst_st, const auto& src_gl, auto idx, auto& dst, const auto& src, auto& a, auto& b, auto& c, auto& shuffle) {
+        shuffle_in_place<0, 0>(shuffle);
+        macros::v_nop();
+        macros::v_nop();
+        mma_ABt<0, 0, 0>(c, b, a, c);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 0);
+        mma_ABt<1, 0, 0>(c, b, a, c);
+        addresses = get_address_fp6(dst, src);
+        mma_ABt<2, 0, 0>(c, b, a, c);
+        shuffle_in_place<1, 0>(shuffle);
+        mma_ABt<3, 0, 0>(c, b, a, c);
+        load_fp6<0, 0>(dst, src, addresses);
+        mma_ABt<0, 1, 0>(c, b, a, c);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 1);
+        mma_ABt<1, 1, 0>(c, b, a, c);
+        shuffle_in_place<2, 0>(shuffle);
+        mma_ABt<2, 1, 0>(c, b, a, c);
+        load_fp6<1, 0>(dst, src, addresses);
+        mma_ABt<3, 1, 0>(c, b, a, c);
+        mma_ABt<0, 2, 0>(c, b, a, c);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 2);
+        mma_ABt<1, 2, 0>(c, b, a, c);
+        load_fp6<2, 0>(dst, src, addresses);
+        mma_ABt<2, 2, 0>(c, b, a, c);
+        shuffle_in_place<3, 0>(shuffle);
+        mma_ABt<3, 2, 0>(c, b, a, c);
+        load_fp6<3, 0>(dst, src, addresses);
+        mma_ABt<0, 3, 0>(c, b, a, c);
+        mma_ABt<1, 3, 0>(c, b, a, c);
+        G::load_once(dst_st, src_gl, idx, global_to_shared_swizzled_offsets, 3);
+        mma_ABt<2, 3, 0>(c, b, a, c);
+        mma_ABt<3, 3, 0>(c, b, a, c);
+    };
+
+    G::load_once(As[tic][0], g.a, {0, 0, row*2, 0}, global_to_shared_swizzled_offsets, 0);
+    G::load_once(As[tic][0], g.a, {0, 0, row*2, 0}, global_to_shared_swizzled_offsets, 1);
+    G::load_once(As[tic][0], g.a, {0, 0, row*2, 0}, global_to_shared_swizzled_offsets, 2);
+    G::load_once(As[tic][0], g.a, {0, 0, row*2, 0}, global_to_shared_swizzled_offsets, 3);
+    G::load_once(Bs[tic][0], g.b, {0, 0, col*2, 0}, global_to_shared_swizzled_offsets, 0);
+    G::load_once(Bs[tic][0], g.b, {0, 0, col*2, 0}, global_to_shared_swizzled_offsets, 1);
+    G::load_once(Bs[tic][0], g.b, {0, 0, col*2, 0}, global_to_shared_swizzled_offsets, 2);
+    G::load_once(Bs[tic][0], g.b, {0, 0, col*2, 0}, global_to_shared_swizzled_offsets, 3);
+    G::load_once(Bs[tic][1], g.b, {0, 0, col*2+1, 0}, global_to_shared_swizzled_offsets, 0);
+    G::load_once(Bs[tic][1], g.b, {0, 0, col*2+1, 0}, global_to_shared_swizzled_offsets, 1);
+    G::load_once(Bs[tic][1], g.b, {0, 0, col*2+1, 0}, global_to_shared_swizzled_offsets, 2);
+    G::load_once(Bs[tic][1], g.b, {0, 0, col*2+1, 0}, global_to_shared_swizzled_offsets, 3);
+    G::load_once(As[tic][1], g.a, {0, 0, row*2+1, 0}, global_to_shared_swizzled_offsets, 0);
+    G::load_once(As[tic][1], g.a, {0, 0, row*2+1, 0}, global_to_shared_swizzled_offsets, 1);
+    G::load_once(As[tic][1], g.a, {0, 0, row*2+1, 0}, global_to_shared_swizzled_offsets, 2);
+    G::load_once(As[tic][1], g.a, {0, 0, row*2+1, 0}, global_to_shared_swizzled_offsets, 3);
+
+    G::load_once(As[toc][0], g.a, {0, 0, row*2, 1}, global_to_shared_swizzled_offsets, 0);
+    G::load_once(As[toc][0], g.a, {0, 0, row*2, 1}, global_to_shared_swizzled_offsets, 1);
+    G::load_once(As[toc][0], g.a, {0, 0, row*2, 1}, global_to_shared_swizzled_offsets, 2);
+    G::load_once(As[toc][0], g.a, {0, 0, row*2, 1}, global_to_shared_swizzled_offsets, 3);
+    G::load_once(Bs[toc][0], g.b, {0, 0, col*2, 1}, global_to_shared_swizzled_offsets, 0);
+    G::load_once(Bs[toc][0], g.b, {0, 0, col*2, 1}, global_to_shared_swizzled_offsets, 1);
+    G::load_once(Bs[toc][0], g.b, {0, 0, col*2, 1}, global_to_shared_swizzled_offsets, 2);
+    G::load_once(Bs[toc][0], g.b, {0, 0, col*2, 1}, global_to_shared_swizzled_offsets, 3);
+    G::load_once(Bs[toc][1], g.b, {0, 0, col*2+1, 1}, global_to_shared_swizzled_offsets, 0);
+    G::load_once(Bs[toc][1], g.b, {0, 0, col*2+1, 1}, global_to_shared_swizzled_offsets, 1);
+    G::load_once(Bs[toc][1], g.b, {0, 0, col*2+1, 1}, global_to_shared_swizzled_offsets, 2);
+    G::load_once(Bs[toc][1], g.b, {0, 0, col*2+1, 1}, global_to_shared_swizzled_offsets, 3);
+    G::load_once(As[toc][1], g.a, {0, 0, row*2+1, 1}, global_to_shared_swizzled_offsets, 0);
+    G::load_once(As[toc][1], g.a, {0, 0, row*2+1, 1}, global_to_shared_swizzled_offsets, 1);
+    G::load_once(As[toc][1], g.a, {0, 0, row*2+1, 1}, global_to_shared_swizzled_offsets, 2);
+    G::load_once(As[toc][1], g.a, {0, 0, row*2+1, 1}, global_to_shared_swizzled_offsets, 3);
 
     __builtin_amdgcn_sched_barrier(0);
     asm volatile("s_waitcnt vmcnt(28)"); 
@@ -116,7 +285,11 @@ void micro_tk(const micro_globals g) {
     __builtin_amdgcn_sched_barrier(0);
 
     auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[tic][0], {warp_row, 0});
-    load(A_0, a_subtile_0);
+    addresses = get_address_fp6(A_0, a_subtile_0);
+    load_fp6<0, 0>(A_0, a_subtile_0, addresses);
+    load_fp6<1, 0>(A_0, a_subtile_0, addresses);
+    load_fp6<2, 0>(A_0, a_subtile_0, addresses);
+    load_fp6<3, 0>(A_0, a_subtile_0, addresses);
 
     __builtin_amdgcn_sched_barrier(0);
     asm volatile("s_waitcnt vmcnt(24)");
@@ -124,86 +297,87 @@ void micro_tk(const micro_globals g) {
     __builtin_amdgcn_sched_barrier(0);
 
     auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[tic][0], {warp_col, 0});
-    load(B_0, b_subtile_0);
-    shuffle_in_place(A_0);
+    addresses = get_address_fp6(B_0, b_subtile_0);
+    load_fp6<0, 0>(B_0, b_subtile_0, addresses);
+    asm volatile("s_waitcnt lgkmcnt(0)");
+    shuffle_in_place<0, 0>(A_0);
+    load_fp6<1, 0>(B_0, b_subtile_0, addresses);
+    shuffle_in_place<1, 0>(A_0);
+    load_fp6<2, 0>(B_0, b_subtile_0, addresses);
+    shuffle_in_place<2, 0>(A_0);
+    load_fp6<3, 0>(B_0, b_subtile_0, addresses);
+    shuffle_in_place<3, 0>(A_0);
 
     {
         constexpr int k = 0;
         asm volatile("s_waitcnt vmcnt(16)");
-        asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
+        asm volatile("s_waitcnt lgkmcnt(0)");
 
         auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[tic][1], {warp_col, 0});
-        load(B_1, b_subtile_1);
-        G::load(As[tic][0], g.a, {0, 0, row*2, k+2});
-        shuffle_in_place(B_0);
-        mma_ABt(C_accum_00, B_0, A_0);
+        do_interleaved_cluster_prologue_Bshuffle(As[tic][0], g.a, coord<ST_A>{0, 0, row*2, k+2}, B_1, b_subtile_1, A_0, B_0, C_accum_00, B_0);
 
         asm volatile("s_waitcnt lgkmcnt(0)");
 
         auto a_subtile_1 = kittens::subtile_inplace<64, 128>(As[tic][1], {warp_row, 0});
-        load(A_1, a_subtile_1);
-        G::load(Bs[tic][0], g.b, {0, 0, col*2, k+2});
-        shuffle_in_place(B_1);
-        mma_ABt(C_accum_01, B_1, A_0);
+        do_interleaved_cluster_prologue_Bshuffle(Bs[tic][0], g.b, coord<ST_B>{0, 0, col*2, k+2}, A_1, a_subtile_1, A_0, B_1, C_accum_01, B_1);
 
         asm volatile("s_waitcnt vmcnt(16)");
+        __builtin_amdgcn_s_barrier();
         asm volatile("s_waitcnt lgkmcnt(0)");
 
         auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[toc][0], {warp_row, 0});
-        load(A_0, a_subtile_0);
-        G::load(Bs[tic][1], g.b, {0, 0, col*2+1, k+2});
-        shuffle_in_place(A_1);
-        mma_ABt(C_accum_10, B_0, A_1);
+        do_interleaved_cluster_prologue_Ashuffle(Bs[tic][1], g.b, coord<ST_B>{0, 0, col*2+1, k+2}, A_0, a_subtile_0, A_1, B_0, C_accum_10, A_1);
 
         auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[toc][0], {warp_col, 0});
-        load(B_0, b_subtile_0);
-        G::load(As[tic][1], g.a, {0, 0, row*2+1, k+2});
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        shuffle_in_place(A_0);
-        mma_ABt(C_accum_11, B_1, A_1);
+        do_interleaved_cluster_prologue_Ashuffle(As[tic][1], g.a, coord<ST_A>{0, 0, row*2+1, k+2}, B_0, b_subtile_0, A_1, B_1, C_accum_11, A_0);
     }
     tic ^= 1, toc ^= 1;
     #pragma unroll
     for (int k = 1; k < k_iters - 2; k++, tic ^= 1, toc ^= 1) {
         asm volatile("s_waitcnt vmcnt(16)");
-        asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
+        asm volatile("s_waitcnt lgkmcnt(0)");
 
         auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[tic][1], {warp_col, 0});
-        load(B_1, b_subtile_1);
-        G::load(As[tic][0], g.a, {0, 0, row*2, k+2});
-        shuffle_in_place(B_0);
-        mma_ABt(C_accum_00, B_0, A_0, C_accum_00);
+        // load(B_1, b_subtile_1);
+        // G::load(As[tic][0], g.a, {0, 0, row*2, k+2});
+        // shuffle_in_place(B_0);
+        // mma_ABt(C_accum_00, B_0, A_0, C_accum_00);
+        do_interleaved_cluster_loop_Bshuffle(As[tic][0], g.a, coord<ST_A>{0, 0, row*2, k+2}, B_1, b_subtile_1, A_0, B_0, C_accum_00, B_0);
 
         asm volatile("s_waitcnt lgkmcnt(0)");
 
         auto a_subtile_1 = kittens::subtile_inplace<64, 128>(As[tic][1], {warp_row, 0});
-        load(A_1, a_subtile_1);
-        G::load(Bs[tic][0], g.b, {0, 0, col*2, k+2});
-        shuffle_in_place(B_1);
-        mma_ABt(C_accum_01, B_1, A_0, C_accum_01);
+        // load(A_1, a_subtile_1);
+        // G::load(Bs[tic][0], g.b, {0, 0, col*2, k+2});
+        // shuffle_in_place(B_1);
+        // mma_ABt(C_accum_01, B_1, A_0, C_accum_01);
+        do_interleaved_cluster_loop_Bshuffle(Bs[tic][0], g.b, coord<ST_B>{0, 0, col*2, k+2}, A_1, a_subtile_1, A_0, B_1, C_accum_01, B_1);
 
         asm volatile("s_waitcnt vmcnt(16)");
+        __builtin_amdgcn_s_barrier();
         asm volatile("s_waitcnt lgkmcnt(0)");
 
         auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[toc][0], {warp_row, 0});
-        load(A_0, a_subtile_0);
-        G::load(Bs[tic][1], g.b, {0, 0, col*2+1, k+2});
-        shuffle_in_place(A_1);
-        mma_ABt(C_accum_10, B_0, A_1, C_accum_10);
+        // load(A_0, a_subtile_0);
+        // G::load(Bs[tic][1], g.b, {0, 0, col*2+1, k+2});
+        // shuffle_in_place(A_1);
+        // mma_ABt(C_accum_10, B_0, A_1, C_accum_10);
+        do_interleaved_cluster_loop_Ashuffle(Bs[tic][1], g.b, coord<ST_B>{0, 0, col*2+1, k+2}, A_0, a_subtile_0, A_1, B_0, C_accum_10, A_1);
 
         auto b_subtile_0 = kittens::subtile_inplace<64, 128>(Bs[toc][0], {warp_col, 0});
-        load(B_0, b_subtile_0);
-        G::load(As[tic][1], g.a, {0, 0, row*2+1, k+2});
-        asm volatile("s_waitcnt lgkmcnt(0)");
-        shuffle_in_place(A_0);
-        mma_ABt(C_accum_11, B_1, A_1, C_accum_11);
+        // load(B_0, b_subtile_0);
+        // G::load(As[tic][1], g.a, {0, 0, row*2+1, k+2});
+        // asm volatile("s_waitcnt lgkmcnt(0)");
+        // shuffle_in_place(A_0);
+        // mma_ABt(C_accum_11, B_1, A_1, C_accum_11);
+        do_interleaved_cluster_loop_Ashuffle(As[tic][1], g.a, coord<ST_A>{0, 0, row*2+1, k+2}, B_0, b_subtile_0, A_1, B_1, C_accum_11, A_0);
     }
     { // k = k_iters - 2
         asm volatile("s_waitcnt vmcnt(16)");
-        asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
+        asm volatile("s_waitcnt lgkmcnt(0)");
 
         auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[tic][1], {warp_col, 0});
         load(B_1, b_subtile_1);
@@ -218,6 +392,7 @@ void micro_tk(const micro_globals g) {
         mma_ABt(C_accum_01, B_1, A_0, C_accum_01);
 
         asm volatile("s_waitcnt vmcnt(8)");
+        __builtin_amdgcn_s_barrier();
         asm volatile("s_waitcnt lgkmcnt(0)");
 
         auto a_subtile_0 = kittens::subtile_inplace<64, 128>(As[toc][0], {warp_row, 0});
@@ -234,8 +409,8 @@ void micro_tk(const micro_globals g) {
     tic ^= 1, toc ^= 1;
     { // k = k_iters - 1
         asm volatile("s_waitcnt vmcnt(0)");
-        asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
+        asm volatile("s_waitcnt lgkmcnt(0)");
 
         auto b_subtile_1 = kittens::subtile_inplace<64, 128>(Bs[tic][1], {warp_col, 0});
         load(B_1, b_subtile_1);
@@ -249,7 +424,6 @@ void micro_tk(const micro_globals g) {
         shuffle_in_place(B_1);
         mma_ABt(C_accum_01, B_1, A_0, C_accum_01);
 
-        asm volatile("s_waitcnt vmcnt(16)");
         asm volatile("s_waitcnt lgkmcnt(0)");
 
         shuffle_in_place(A_1);
