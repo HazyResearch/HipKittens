@@ -194,7 +194,7 @@ void micro_tk(const micro_globals g) {
     // tic^=1, toc^=1;
 
     // Inner loop over K dimension
-    // #pragma unroll
+    #pragma unroll
     for (int k = 0; k < k_iters - 2; k++, tic^=1, toc^=1) {
 
         auto as_subtile0 = kittens::subtile_inplace<BLOCK_SIZE_M / WARPS_ROW / 2, K_STEP>(As[tic][0], {warp_m, 0});
