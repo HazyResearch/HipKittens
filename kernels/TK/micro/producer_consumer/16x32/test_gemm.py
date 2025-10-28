@@ -25,8 +25,8 @@ num_blocks_y = (N / 256)
 print(f"{num_blocks_x=} mod 32 {num_blocks_x % 32}, {num_blocks_y=} mod 32 {num_blocks_y % 32}\n")
 
 if args.profile:
-    num_warmup = 1000
-    num_iters = 300
+    num_warmup = 500
+    num_iters = 100
 else:
     num_warmup = 0
     num_iters = 1

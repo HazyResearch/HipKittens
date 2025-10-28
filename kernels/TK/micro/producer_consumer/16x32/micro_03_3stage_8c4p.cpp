@@ -28,6 +28,7 @@ using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 struct micro_globals {
     gl<bf16, -1, -1, -1, -1> a, b;
     gl<bf16, -1, -1, -1, -1> c;
+    hipStream_t stream;
     dim3 grid()  { return dim3(N / NEW_COL_BLOCK_SIZE, M / NEW_ROW_BLOCK_SIZE); } 
     dim3 block() { return dim3(NUM_THREADS); } 
     size_t dynamic_shared_memory() { return MAX_SHARED_MEMORY; } 
@@ -95,7 +96,6 @@ void micro_tk(const micro_globals g) {
             G::load<2, false>(Bs[s][n][0], g.b, {0, 0, col*2 + 2*n + 0, 0}, swizzled_offsets_B);
             G::load<2, false>(Bs[s][n][1], g.b, {0, 0, col*2 + 2*n + 1, 0}, swizzled_offsets_B);
         }
-        asm volatile("s_waitcnt vmcnt(0)");
     }
     if (is_producer) {
         #pragma unroll
@@ -108,9 +108,8 @@ void micro_tk(const micro_globals g) {
             G::load<2, false>(Bs[n1][n][0], g.b, {0, 0, col*2 + 2*n + 0, 1}, swizzled_offsets_B);
             G::load<2, false>(Bs[n1][n][1], g.b, {0, 0, col*2 + 2*n + 1, 1}, swizzled_offsets_B);
         }
-
-        asm volatile("s_waitcnt vmcnt(0)");
     }
+    __builtin_amdgcn_s_waitcnt(0);
     __syncthreads();
 
     if (is_consumer) {
@@ -134,7 +133,6 @@ void micro_tk(const micro_globals g) {
                 G::load<2, false>(Bs[n2][n][0], g.b, {0, 0, col*2 + 2*n + 0, tile + 2}, swizzled_offsets_B);
                 G::load<2, false>(Bs[n2][n][1], g.b, {0, 0, col*2 + 2*n + 1, tile + 2}, swizzled_offsets_B);
             }
-            asm volatile("s_waitcnt vmcnt(2)");
         } else if (is_consumer) {
             A_slice a0;
             B_slice b0, b1;
@@ -163,6 +161,7 @@ void micro_tk(const micro_globals g) {
             mma_ABt(C_accum[1][1], a0, b1, C_accum[1][1]);
             __builtin_amdgcn_s_setprio(0);
         }
+        asm volatile("s_waitcnt vmcnt(0)");
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         int tmp = s;
@@ -250,8 +249,7 @@ void micro_tk(const micro_globals g) {
 void dispatch_micro(micro_globals g) {
     const unsigned long mem_size = g.dynamic_shared_memory();
     hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    micro_tk<<<g.grid(), g.block(), mem_size>>>(g);
-    hipDeviceSynchronize();
+    micro_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
   }
 
 PYBIND11_MODULE(tk_kernel, m) {

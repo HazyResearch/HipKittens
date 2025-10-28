@@ -27,6 +27,7 @@ using B_slice = rt_bf<HALF_BLOCK_SIZE, BLOCK_SIZE, row_l, rt_16x32_s>;
 struct micro_globals {
     gl<bf16, -1, -1, -1, -1> a, b;
     gl<bf16, -1, -1, -1, -1> c;
+    hipStream_t stream;
     dim3 grid()  { return dim3((N / NEW_COL_BLOCK_SIZE) * ( M / NEW_ROW_BLOCK_SIZE)); } 
     dim3 block() { return dim3(NUM_THREADS); } 
     size_t dynamic_shared_memory() { return MAX_SHARED_MEMORY; } 
@@ -114,51 +115,52 @@ void micro_tk(const micro_globals g) {
         load<2,false>(Bs[tic][n][1], g.b, {0, 0, col*2 + 2*n + 1, 0});
         if (warp_leader) atomicAdd((int*)&prod_cntB[0][3], 1);  
     }
-    if (warp_id >= 3 && warp_id < 6) {
-        int m = warp_id % 3, n = warp_id % 3;
-        load<2,false>(As[1][m][0], g.a, {0, 0, row*2 + 2*m + 0, 1});
-        load<2,false>(Bs[1][n][0], g.b, {0, 0, col*2 + 2*n + 0, 1});
-        load<2,false>(As[1][m][1], g.a, {0, 0, row*2 + 2*m + 1, 1});
-        load<2,false>(Bs[1][n][1], g.b, {0, 0, col*2 + 2*n + 1, 1});
-        if (warp_leader) atomicAdd((int*)&prod_cntA[1][warp_id % 3], 1);  
-        if (warp_leader) atomicAdd((int*)&prod_cntB[1][warp_id % 3], 1);  
-    }
-    if (warp_id == 7) {
-        int n = 3;
-        load<2,false>(Bs[1][n][0], g.b, {0, 0, col*2 + 2*n + 0, 1});
-        load<2,false>(Bs[1][n][1], g.b, {0, 0, col*2 + 2*n + 1, 1});
-        if (warp_leader) atomicAdd((int*)&prod_cntB[1][3], 1);  
-    }
-    asm volatile("s_waitcnt vmcnt(0)");
-    __syncthreads();
+    // if (warp_id >= 3 && warp_id < 6) {
+    //     int m = warp_id % 3, n = warp_id % 3;
+    //     load<2,false>(As[1][m][0], g.a, {0, 0, row*2 + 2*m + 0, 1});
+    //     load<2,false>(Bs[1][n][0], g.b, {0, 0, col*2 + 2*n + 0, 1});
+    //     load<2,false>(As[1][m][1], g.a, {0, 0, row*2 + 2*m + 1, 1});
+    //     load<2,false>(Bs[1][n][1], g.b, {0, 0, col*2 + 2*n + 1, 1});
+    //     if (warp_leader) atomicAdd((int*)&prod_cntA[1][warp_id % 3], 1);  
+    //     if (warp_leader) atomicAdd((int*)&prod_cntB[1][warp_id % 3], 1);  
+    // }
+    // if (warp_id == 7) {
+    //     int n = 3;
+    //     load<2,false>(Bs[1][n][0], g.b, {0, 0, col*2 + 2*n + 0, 1});
+    //     load<2,false>(Bs[1][n][1], g.b, {0, 0, col*2 + 2*n + 1, 1});
+    //     if (warp_leader) atomicAdd((int*)&prod_cntB[1][3], 1);  
+    // }
+    
     if (warp_leader && warp_id < 3) {
         while (prod_cntA[0][warp_id] < 1) { __builtin_amdgcn_s_sleep(0); }
         while (prod_cntB[0][warp_id] < 1) { __builtin_amdgcn_s_sleep(0); }
-        while (prod_cntA[1][warp_id] < 1) { __builtin_amdgcn_s_sleep(0); }
-        while (prod_cntB[1][warp_id] < 1) { __builtin_amdgcn_s_sleep(0); }
+        // while (prod_cntA[1][warp_id] < 1) { __builtin_amdgcn_s_sleep(0); }
+        // while (prod_cntB[1][warp_id] < 1) { __builtin_amdgcn_s_sleep(0); }
         prod_cntA[0][warp_id] = prod_cntB[0][warp_id] = 0;
-        prod_cntA[1][warp_id] = prod_cntB[1][warp_id] = 0;
+        // prod_cntA[1][warp_id] = prod_cntB[1][warp_id] = 0;
         __atomic_store_n(&readyA[0][warp_id], 0, __ATOMIC_RELEASE);
         __atomic_store_n(&readyB[0][warp_id], 0, __ATOMIC_RELEASE);
-        __atomic_store_n(&readyA[1][warp_id], 1, __ATOMIC_RELEASE);
-        __atomic_store_n(&readyB[1][warp_id], 1, __ATOMIC_RELEASE);
+        // __atomic_store_n(&readyA[1][warp_id], 1, __ATOMIC_RELEASE);
+        // __atomic_store_n(&readyB[1][warp_id], 1, __ATOMIC_RELEASE);
     }
     if (warp_leader && warp_id == 3) {
         while (prod_cntB[0][3] < 1) { __builtin_amdgcn_s_sleep(0); }
-        while (prod_cntB[1][3] < 1) { __builtin_amdgcn_s_sleep(0); }
+        // while (prod_cntB[1][3] < 1) { __builtin_amdgcn_s_sleep(0); }
         prod_cntB[0][3] = prod_cntB[1][3] = 0;
         __atomic_store_n(&readyB[0][3], 1, __ATOMIC_RELEASE);
-        __atomic_store_n(&readyB[1][3], 1, __ATOMIC_RELEASE);
+        // __atomic_store_n(&readyB[1][3], 1, __ATOMIC_RELEASE);
     }
+    asm volatile("s_waitcnt vmcnt(0)");
+    __syncthreads();
 
     int num_tiles = K / BLOCK_SIZE;
     constexpr int sleep_time = 0;
 
     if (warp_id < 3) {
         #pragma unroll
-        for (int tile = 2; tile < num_tiles; ++tile, toc^=1) {
+        for (int tile = 1; tile < num_tiles; ++tile) {
             // Wait for consumers to finish with buffer
-            const int tiles_in_that_buffer = tile / 2;
+            const int tiles_in_that_buffer = tile;
             const int needA = tiles_in_that_buffer * N_BLOCK; // 3 * tiles_in_that_buffer
             const int needB = tiles_in_that_buffer * M_BLOCK; // 3 * tiles_in_that_buffer
             while (doneA[toc][warp_id] < needA) { __builtin_amdgcn_s_sleep(sleep_time); }
@@ -174,9 +176,9 @@ void micro_tk(const micro_globals g) {
     }
     if (warp_id == 3) {
         #pragma unroll
-        for (int tile = 2; tile < num_tiles; ++tile, toc^=1) {
+        for (int tile = 1; tile < num_tiles; ++tile) {
             // Wait for consumers to finish with buffer
-            const int tiles_in_that_buffer = tile / 2;
+            const int tiles_in_that_buffer = tile;
             const int needB = tiles_in_that_buffer * M_BLOCK; // 3 * tiles_in_that_buffer
             while (doneB[toc][warp_id] < needB) { __builtin_amdgcn_s_sleep(sleep_time); }
             load<2,false>(Bs[toc][warp_id][0], g.b, {0,0, col*2 + 2*warp_id + 0, tile});
@@ -193,7 +195,7 @@ void micro_tk(const micro_globals g) {
         zero(C_accum[1][1]); 
         unsigned go = 0;
         // #pragma unroll
-        for (int tile = 0; tile < num_tiles; ++tile, tic^=1) {
+        for (int tile = 0; tile < num_tiles; ++tile) {
             do {
                 unsigned okA = 0, okB = 0;
                 // acquire load so LDS writes published by producers are visible
@@ -250,12 +252,10 @@ void micro_tk(const micro_globals g) {
 void dispatch_micro(micro_globals g) {
     const unsigned long mem_size = g.dynamic_shared_memory();
     hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    micro_tk<<<g.grid(), g.block(), mem_size>>>(g);
-    hipDeviceSynchronize();
+    micro_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
     m.doc() = "tk_kernel python module";
     py::bind_function<dispatch_micro>(m, "dispatch_micro", &micro_globals::a, &micro_globals::b, &micro_globals::c);
 }
-

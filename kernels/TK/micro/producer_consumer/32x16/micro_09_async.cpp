@@ -27,12 +27,13 @@ using B_slice = rt_bf<BLOCK_SIZE, DOT_SLICE, row_l, rt_32x16_s>;
 struct micro_globals {
     gl<bf16, -1, -1, -1, -1> a, b;
     gl<bf16, -1, -1, -1, -1> c;
+    hipStream_t stream;
     dim3 grid()  { return dim3((N / NEW_COL_BLOCK_SIZE) * ( M / NEW_ROW_BLOCK_SIZE)); } 
     dim3 block() { return dim3(NUM_THREADS); } 
     size_t dynamic_shared_memory() { return MAX_SHARED_MEMORY; } 
 };
 
-__global__ __launch_bounds__(NUM_THREADS, 1)
+__global__ __launch_bounds__(NUM_THREADS, 2)
 void micro_tk(const micro_globals g) {
 
     extern __shared__ alignment_dummy __shm[];
@@ -67,10 +68,10 @@ void micro_tk(const micro_globals g) {
     int warp_id = kittens::warpid();
     int local_warp_id = warp_id % 4;
     int warp_group_id = (warp_id - NUM_PRODUCER_WORKERS) / 4;
-    // kittens::warpgroupid();
     bool is_producer = (warp_id < NUM_PRODUCER_WORKERS);
     bool is_consumer = (warp_id >= NUM_PRODUCER_WORKERS && warp_group_id <= M_BLOCK);
-    int consumer_idx = is_consumer ? warp_group_id : 0;
+    int consumer_idx = is_consumer ? warp_group_id : -1;
+
 
     using T = typename st_bf<BLOCK_SIZE, BLOCK_SIZE, st_32x16_s>::dtype;
     constexpr int bytes_per_thread = st_32x16_s::template bytes_per_thread<T>();
@@ -108,7 +109,12 @@ void micro_tk(const micro_globals g) {
         if (warp_leader) atomicAdd((int*)&prod_cnt[0], 1);  
         asm volatile("s_waitcnt vmcnt(0)");
     }
-    if (is_consumer && consumer_idx == 0) {   
+    if (threadIdx.x == 0) {
+        while (prod_cnt[0] < NUM_PRODUCER_WORKERS) { __builtin_amdgcn_s_sleep(0); } 
+        prod_cnt[0] = 0; 
+        init_done = 1;
+    }
+    if (consumer_idx == 0) {   
         #pragma unroll
         for (int n=0; n<N_BLOCK; ++n) 
             G::load<2,false>(Bs[1][n], g.b, {0,0, col+n, 1}, swizzled_offsets_B);
@@ -116,11 +122,12 @@ void micro_tk(const micro_globals g) {
         for (int m=0; m<M_BLOCK; ++m) 
             G::load<2,false>(As[1][m], g.a, {0,0, row+m, 1}, swizzled_offsets_A);
         if (warp_leader) atomicAdd((int*)&prod_cnt[1], 1);
-        asm volatile("s_waitcnt vmcnt(0)");
+        asm volatile("s_waitcnt vmcnt(4)");
     }
-    __syncthreads();
+    __builtin_amdgcn_sched_barrier(0);
+    __builtin_amdgcn_s_barrier();
     if (threadIdx.x == 0) {
-        while (prod_cnt[0] < NUM_PRODUCER_WORKERS) { __builtin_amdgcn_s_sleep(0); } 
+        // while (prod_cnt[0] < NUM_PRODUCER_WORKERS) { __builtin_amdgcn_s_sleep(0); } 
         while (prod_cnt[1] < NUM_PRODUCER_WORKERS) { __builtin_amdgcn_s_sleep(0); } 
         __threadfence_block(); 
         ready[0] = 0; 
@@ -137,11 +144,12 @@ void micro_tk(const micro_globals g) {
 
     if (is_producer) {
         while (!init_done) { __builtin_amdgcn_s_sleep(0); } 
-        // #pragma unroll
+        #pragma unroll
         for (int tile = 2; tile < num_tiles; ++tile, toc^=1) {
         
             // Wait for consumers to finish with buffer
             const int target_1 = NUM_CONSUMER_WORKERS*(tile/2);
+            const int target_2 = NUM_PRODUCER_WORKERS*(tile/2);
             while (done[toc] < target_1) { 
                 __builtin_amdgcn_s_sleep(sleep_time); 
             }
@@ -154,16 +162,10 @@ void micro_tk(const micro_globals g) {
             for (int m=0; m<M_BLOCK; ++m) 
                 G::load<2,false>(As[toc][m], g.a, {0,0, row+m, tile}, swizzled_offsets_A);
             
-            if (warp_leader) atomicAdd((int*)&prod_cnt[toc], 1);
             asm volatile("s_waitcnt vmcnt(4)");
-
-            const int target_2 = NUM_PRODUCER_WORKERS*(tile/2);
-            while (prod_cnt[toc] < target_2) { 
-                __builtin_amdgcn_s_sleep(sleep_time);  
-            } 
-            if (warp_leader && warp_id == 0) { // First warp leader only
-                atomicExch((int*)&ready[toc], tile);
-            }
+            if (warp_leader) atomicAdd((int*)&prod_cnt[toc], 1);
+            while (prod_cnt[toc] < target_2) { __builtin_amdgcn_s_sleep(sleep_time); } 
+            if (warp_leader && warp_id == 0) { atomicExch((int*)&ready[toc], tile); }
             
         }
     }
@@ -171,12 +173,17 @@ void micro_tk(const micro_globals g) {
     if (is_consumer) {
         zero(C_accum);
         while (!init_done) { __builtin_amdgcn_s_sleep(0); } 
-        #pragma unroll
+        unsigned go = 0;
+        // #pragma unroll
         for (int tile = 0; tile < num_tiles; ++tile, tic^=1) {
-            unsigned int* ready_ptr = &ready[tic];
-            while (*ready_ptr < (unsigned)tile) { 
-                __builtin_amdgcn_s_sleep(sleep_time); 
-            }
+            do {
+                unsigned leader_sees_ready = 0;
+                // acquire load so LDS writes published by producers are visible
+                if (laneid() == 0) { leader_sees_ready = (__atomic_load_n(&ready[tic], __ATOMIC_ACQUIRE) >= (unsigned)tile); }
+                // broadcast lane0's decision to the whole warp
+                go = __builtin_amdgcn_readfirstlane(leader_sees_ready);
+                if (!go) __builtin_amdgcn_s_sleep(0);  
+            } while (!go);
 
             A_slice a0; 
             B_slice b0;
@@ -192,11 +199,11 @@ void micro_tk(const micro_globals g) {
             load(b0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(Bs[tic][local_warp_id], {0,1}));
             asm volatile("s_waitcnt lgkmcnt(0)");
 
-            if (warp_leader) atomicAdd((int*)&done[tic], 1);
-
             __builtin_amdgcn_s_setprio(1);
             mma_ABt(C_accum, a0, b0, C_accum);
             __builtin_amdgcn_s_setprio(0);
+
+            if (warp_leader) atomicAdd((int*)&done[tic], 1);
         }
 
         store(g.c, C_accum, {0,0, row + consumer_idx, col + local_warp_id});
@@ -206,8 +213,7 @@ void micro_tk(const micro_globals g) {
 void dispatch_micro(micro_globals g) {
     const unsigned long mem_size = g.dynamic_shared_memory();
     hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    micro_tk<<<g.grid(), g.block(), mem_size>>>(g);
-    hipDeviceSynchronize();
+    micro_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
 }
 
 PYBIND11_MODULE(tk_kernel, m) {

@@ -20,13 +20,14 @@ using A_slice = rt_bf<BLOCK_SIZE, DOT_SLICE, row_l, rt_32x16_s>;
 using B_slice = rt_bf<BLOCK_SIZE, DOT_SLICE, row_l, rt_32x16_s>;
 
 #define M 192*40
-#define K 192*40
-#define N 192*40
+#define K 8192
+#define N 8192
 
 
 struct micro_globals {
     gl<bf16, -1, -1, -1, -1> a, b;
     gl<bf16, -1, -1, -1, -1> c;
+    hipStream_t stream;
     dim3 grid()  { return dim3(N / NEW_COL_BLOCK_SIZE, M / NEW_ROW_BLOCK_SIZE); } 
     dim3 block() { return dim3(NUM_THREADS); } 
     size_t dynamic_shared_memory() { return MAX_SHARED_MEMORY; } 
@@ -38,8 +39,8 @@ void micro_tk(const micro_globals g) {
     // shared memory
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
-    st_bf<BLOCK_SIZE, BLOCK_SIZE, st_32x32_s> (&As)[2][M_BLOCK] = al.allocate<st_bf<BLOCK_SIZE, BLOCK_SIZE, st_32x32_s>, 2, M_BLOCK>();
-    st_bf<BLOCK_SIZE, BLOCK_SIZE, st_32x32_s> (&Bs)[2][N_BLOCK] = al.allocate<st_bf<BLOCK_SIZE, BLOCK_SIZE, st_32x32_s>, 2, N_BLOCK>();
+    st_bf<BLOCK_SIZE, BLOCK_SIZE, st_32x32_s> (&As)[3][M_BLOCK] = al.allocate<st_bf<BLOCK_SIZE, BLOCK_SIZE, st_32x32_s>, 3, M_BLOCK>();
+    st_bf<BLOCK_SIZE, BLOCK_SIZE, st_32x32_s> (&Bs)[3][N_BLOCK] = al.allocate<st_bf<BLOCK_SIZE, BLOCK_SIZE, st_32x32_s>, 3, N_BLOCK>();
     rt_fl<BLOCK_SIZE, BLOCK_SIZE, col_l, rt_32x32_s> C_accum;
 
     // int row = blockIdx.y * M_BLOCK;
@@ -90,32 +91,33 @@ void micro_tk(const micro_globals g) {
         }
         #pragma unroll
         for (int m = 0; m < M_BLOCK; m++) {
-            G::load<2, false>(As[n1][m], g.a, {0, 0, row + m, 0}, swizzled_offsets_A);
+            G::load<2, false>(As[n1][m], g.a, {0, 0, row + m, 1}, swizzled_offsets_A);
         }
         #pragma unroll
         for (int n = 0; n < N_BLOCK; n++) {
-            G::load<2, false>(Bs[n1][n], g.b, {0, 0, col + n, 0}, swizzled_offsets_B);
+            G::load<2, false>(Bs[n1][n], g.b, {0, 0, col + n, 1}, swizzled_offsets_B);
         }
-        __builtin_amdgcn_s_waitcnt(0);
     }
+    __builtin_amdgcn_s_waitcnt(0);
     __syncthreads();
 
 
     if (is_consumer) {zero(C_accum);}
     int num_tiles = K / BLOCK_SIZE;
-    #pragma unroll
+    // #pragma unroll
     for (int tile = 0; tile < num_tiles-2; ++tile) {
 
         if (is_producer) {
             #pragma unroll
             for (int m = 0; m < M_BLOCK; m++) {
-                G::load<2, false>(As[n2][m], g.a, {0, 0, row + m, tile + 1}, swizzled_offsets_A);
+                G::load<2, false>(As[n2][m], g.a, {0, 0, row + m, tile + 2}, swizzled_offsets_A);
             }
             #pragma unroll
             for (int n = 0; n < N_BLOCK; n++) {
-                G::load<2, false>(Bs[n2][n], g.b, {0, 0, col + n,tile + 1}, swizzled_offsets_B);
+                G::load<2, false>(Bs[n2][n], g.b, {0, 0, col + n,tile + 2}, swizzled_offsets_B);
             }
-            asm volatile("s_waitcnt vmcnt(2)");
+            // asm volatile("s_waitcnt vmcnt(2)");
+            __builtin_amdgcn_s_waitcnt(0);
         } else if (is_consumer) {
             A_slice a0;
             B_slice b0;
@@ -179,18 +181,7 @@ void micro_tk(const micro_globals g) {
 void dispatch_micro(micro_globals g) {
     const unsigned long mem_size = g.dynamic_shared_memory();
     hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-  
-    hipEvent_t start, stop;
-    hipEventCreate(&start); hipEventCreate(&stop);
-    hipEventRecord(start);
-    micro_tk<<<g.grid(), g.block(), mem_size>>>(g);
-    hipEventRecord(stop);
-    hipEventSynchronize(stop);
-    float ms=0.f; hipEventElapsedTime(&ms, start, stop);
-    hipEventDestroy(start); hipEventDestroy(stop);
-  
-    // printf("kernel_ms=%.3f\n", ms);
-    hipDeviceSynchronize();
+    micro_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
   }
 
 PYBIND11_MODULE(tk_kernel, m) {

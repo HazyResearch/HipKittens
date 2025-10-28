@@ -14,8 +14,8 @@ args = parser.parse_args()
 
 # Inputs
 M = 192*40    
-N = 192*40       
-K = 192*40       
+N = 8192
+K = 8192       
 # A = torch.randn(N, N, dtype=torch.bfloat16, device='cuda') / 10.0  
 # B = torch.randn(N, N, dtype=torch.bfloat16, device='cuda') / 10.0  
 # Bt = B.t().contiguous()  # Transpose B for the kernel

@@ -20,13 +20,14 @@ using A_slice = rt_bf<BLOCK_SIZE, DOT_SLICE, row_l, rt_32x32_s>;
 using B_slice = rt_bf<BLOCK_SIZE, DOT_SLICE, row_l, rt_32x32_s>;
 
 #define M 192*40
-#define K 192*40
-#define N 192*40 
+#define K 8192
+#define N 8192 
 
 
 struct micro_globals {
     gl<bf16, -1, -1, -1, -1> a, b;
     gl<bf16, -1, -1, -1, -1> c;
+    hipStream_t stream;
     dim3 grid()  { return dim3((N / NEW_COL_BLOCK_SIZE), ( M / NEW_ROW_BLOCK_SIZE)); } 
     dim3 block() { return dim3(NUM_THREADS); } 
     size_t dynamic_shared_memory() { return MAX_SHARED_MEMORY; } 
@@ -181,15 +182,7 @@ void micro_tk(const micro_globals g) {
 void dispatch_micro(micro_globals g) {
     const unsigned long mem_size = g.dynamic_shared_memory();
     hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    hipEvent_t start, stop;
-    hipEventCreate(&start); hipEventCreate(&stop);
-    hipEventRecord(start);
-    micro_tk<<<g.grid(), g.block(), mem_size>>>(g);
-    hipEventRecord(stop);
-    hipEventSynchronize(stop);
-    float ms=0.f; hipEventElapsedTime(&ms, start, stop);
-    hipEventDestroy(start); hipEventDestroy(stop);
-    hipDeviceSynchronize();
+    micro_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
