@@ -580,6 +580,21 @@ void pack(uint32_t *output, const din *input, int size) {
     }
 }
 
+constexpr int ROTATING_BUFFER_COUNT = 1; //((((1024*1024)/M)*512)/K)/2; // 500 MiB
+
+// Random initialization function
+void random_init(din* a_host, din* b_host, uint32_t seed = 42) {
+    std::mt19937 gen(seed); // Seed for reproducibility
+    std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+    // #pragma omp parallel for
+    for (int i = 0; i < M*K; i++) {
+        a_host[i] = din(dis(gen));
+    }   
+    // #pragma omp parallel for
+    for (int i = 0; i < N*K; i++) {
+        b_host[i] = din(dis(gen));
+    }   
+}
 
 int main() {
     std::cout << "=== FP6 Packed GEMM Test ===\n";
@@ -630,26 +645,50 @@ int main() {
     }
     std::cout << std::dec << "\n\n";
 
+    constexpr int block_count = ROTATING_BUFFER_COUNT;
+
     din *d_input_a_packed;
     din *d_input_b_packed;
     dout *d_output;
-    hipMalloc(&d_input_a_packed, total_bytes_a);
-    hipMalloc(&d_input_b_packed, total_bytes_b);
+    hipMalloc(&d_input_a_packed, block_count * total_bytes_a);
+    hipMalloc(&d_input_b_packed, block_count * total_bytes_b);
     hipMalloc(&d_output, M * N * sizeof(dout));
 
-    // Copy packed data to device
-    hipMemcpy(d_input_a_packed, h_input_a_packed, total_bytes_a, hipMemcpyHostToDevice);
-    hipMemcpy(d_input_b_packed, h_input_b_packed, total_bytes_b, hipMemcpyHostToDevice);
+    // Pre-initialize all buffer sections with random data on host
+    printf("Initializing %d rotating buffer sections (%zu MB total, A+B only)...\n",
+           block_count,
+           (block_count * (M*K*6/8 + N*K*6/8) + M*N*sizeof(bf16)) / (1024*1024));
 
-    _gl_A input_gl_a(d_input_a_packed, 1, 1, M, K);
-    _gl_B input_gl_b(d_input_b_packed, 1, 1, N, K);
-    _gl_C output_gl(d_output, 1, 1, M, N);
-    micro_globals globals{input_gl_a, input_gl_b, output_gl};
+    for (int block = 0; block < block_count; ++block) {
+        // Generate random data with different seed for each buffer
+        random_init(h_input_a, h_input_b, 42 + block);
+
+        pack(h_input_a_packed, h_input_a, M * K);
+        pack(h_input_b_packed, h_input_b, N * K);
+
+        // Copy to offset position in device memory
+        hipMemcpy(reinterpret_cast<uint32_t*>(d_input_a_packed) + block * total_words_a, h_input_a_packed, total_bytes_a, hipMemcpyHostToDevice);
+        hipMemcpy(reinterpret_cast<uint32_t*>(d_input_b_packed) + block * total_words_b, h_input_b_packed, total_bytes_b, hipMemcpyHostToDevice);
+    }
+    hipDeviceSynchronize();
+    printf("Buffer initialization complete.\n");
 
     // Warmup
     // Warmup
     const int WARMUP_REPS = 500;
     for (int r = 0; r < WARMUP_REPS; ++r) { 
+        int block_idx = r % block_count;
+        din* d_a_current = reinterpret_cast<din*>(reinterpret_cast<uint32_t*>(d_input_a_packed) + block_idx * total_words_a);
+        din* d_b_current = reinterpret_cast<din*>(reinterpret_cast<uint32_t*>(d_input_b_packed) + block_idx * total_words_b);
+
+        hipMemset(d_output, 0, M*N*sizeof(bf16));
+
+        _gl_A input_gl_a(d_a_current, 1, 1, M, K);
+        _gl_B input_gl_b(d_b_current, 1, 1, N, K);
+        _gl_C output_gl(d_output, 1, 1, M, N);
+
+        micro_globals globals{input_gl_a, input_gl_b, output_gl};
+
         micro_tk<<<globals.grid(), globals.block(), globals.dynamic_shared_memory(), stream>>>(globals);
     }
     hipDeviceSynchronize();
@@ -659,6 +698,18 @@ int main() {
     std::vector<float> times_ms;
     times_ms.reserve(REPS);
     for (int r = 0; r < REPS; ++r) {
+        int block_idx = r % block_count;
+        din* d_a_current = reinterpret_cast<din*>(reinterpret_cast<uint32_t*>(d_input_a_packed) + block_idx * total_words_a);
+        din* d_b_current = reinterpret_cast<din*>(reinterpret_cast<uint32_t*>(d_input_b_packed) + block_idx * total_words_b);
+
+        hipMemset(d_output, 0, M*N*sizeof(bf16));
+
+        _gl_A input_gl_a(d_a_current, 1, 1, M, K);
+        _gl_B input_gl_b(d_b_current, 1, 1, N, K);
+        _gl_C output_gl(d_output, 1, 1, M, N);
+
+        micro_globals globals{input_gl_a, input_gl_b, output_gl};
+
         HIP_CHECK( hipEventRecord(start, stream) );
         micro_tk<<<globals.grid(), globals.block(), globals.dynamic_shared_memory(), stream>>>(globals);
         HIP_CHECK( hipEventRecord(stop, stream) );
@@ -686,6 +737,9 @@ int main() {
         std::cerr << "Kernel launch failed: " << hipGetErrorString(err) << std::endl;
         return 1;
     }
+
+    int last_buffer_idx = (REPS - 1) % ROTATING_BUFFER_COUNT;
+    random_init(h_input_a, h_input_b, 42 + last_buffer_idx);
 
     // CPU reference: compute A * B^T
     std::cout << "Computing CPU reference...\n";
