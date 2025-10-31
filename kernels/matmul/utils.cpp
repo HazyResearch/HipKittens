@@ -90,7 +90,7 @@ __device__ inline void load_gl_to_st(ST& dst, const GL& src, const COORD& idx)
 template<int axis, bool assume_aligned,
          ducks::st::all ST, ducks::gl::all GL,
          int N_THREADS = WARP_THREADS>
-__device__ inline void prefill_swizzled_offsets(
+__device__ inline void prefill_swizzled_offsets_fp8(
     ST& dst, const GL& src, uint32_t* swizzled_offsets)
 {
 
