@@ -7,6 +7,7 @@ using namespace kittens;
 
 #include "../profile_utils.cpp"
 #include "../utils.cpp"
+#include "utils.cpp"
 
 #define SIZE 8192
 
@@ -17,156 +18,69 @@ using G = kittens::group<NUM_WARPS>;
 template<typename ST_GL, typename GL_GL, typename ST, typename RT, typename RT_A, typename RT_B, typename RT_C, ducks::coord::tile COORD=coord<ST_GL>>
 __device__ inline static void do_interleaved_cluster(ST_GL& dst_gl, const GL_GL& src_gl, COORD idx, RT& dst, const ST& src, RT_A& a, RT_B& b, RT_C& c) {
     __builtin_amdgcn_sched_barrier(0);
-    mma_ABt_base_wrapper(c, a, b, c, 0, 0, 0);
+    mma_ABt_one(c, a, b, c, 0, 0, 0);
     __builtin_amdgcn_sched_barrier(0);
-    constexpr int axis = 2;
-    constexpr int N_THREADS = NUM_WARPS*WARP_THREADS;
-    using T_GL = typename ST_GL::dtype;
-    static_assert(sizeof(T_GL) == 1, "only supporting 16 and 8-bit dtypes");
-    constexpr int memcpy_per_tile =  ST_GL::rows * ST_GL::cols * sizeof(T_GL) / (16 * N_THREADS); // 16 --> 32
-    static_assert(memcpy_per_tile > 0, "memcpy_per_tile must be greater than 0. Please decrease the number of threads.");
     
-    constexpr int elem_per_thread = 16 / sizeof(T_GL);  // 8 if bf16, 16 if fp8
-    constexpr int elem_per_warp = elem_per_thread * kittens::WARP_THREADS; // 512 if bf16, 1024 if fp8
-    const int laneid = kittens::laneid();
-    const int warp_id = warpid();
-    const int row_stride_gl = src_gl.template stride<axis>();
+    precomputed_addresses addresses = precompute_addresses(dst_gl, src_gl, idx);
 
-    coord<> unit_coord = idx.template unit_coord<axis, 3>();
-    T_GL* global_ptr = (T_GL*)&src_gl[unit_coord];
-    i32x4 srsrc = make_srsrc(global_ptr, row_stride_gl * ST_GL::rows * sizeof(T_GL));
-    const T_GL* lds_base = &dst_gl.data[0] + (warp_id * elem_per_warp);
+    __builtin_amdgcn_sched_barrier(0);
+    mma_ABt_one(c, a, b, c, 0, 1, 0);
+    __builtin_amdgcn_sched_barrier(0);
 
-    {
-        __builtin_amdgcn_sched_barrier(0);
-        mma_ABt_base_wrapper(c, a, b, c, 0, 1, 0);
-        __builtin_amdgcn_sched_barrier(0);
-        // auto b_subtile_1 = kittens::subtile_inplace<BLOCK_SIZE_COL / 2 / WARPS_COL, k_step>(Bs[curr][1], {warp_n, 0});
-        // load_st_to_rt(b[1], b_subtile_1);
-        static_assert(RT::rows == ST::rows, "register tile and shared tile must match rows");
-        static_assert(RT::cols  == ST::cols,  "register tile and shared tile must match cols");
+    uint32_t swizzled_offsets[2];
+    prefill_swizzled_offsets<2>(dst, src, swizzled_offsets);
 
-        using T2 = RT::dtype;
-        using T  = base_types::packing<T2>::unpacked_type;
-        using U  = ST::dtype;
-        using U2 = base_types::packing<U >::packed_type;
-        static_assert(sizeof(U) == 2 || sizeof(U) == 1, "only supporting 16 and 8-bit dtypes");
-        static_assert((!std::is_same_v<T, fp8e4m3>) || std::is_same_v<U, T>, "global and shared tile must have the same dtype if fp8");
+    load_one<0>(dst_gl, src_gl, addresses);
+    load_one<0, 0, 0>(dst, src, swizzled_offsets);
 
-        constexpr int subtile_stride = RT::base_tile_cols * sizeof(U) / 2;
-        const int tile_stride = subtile_stride * 2;
-        constexpr int row_stride = RT::base_tile_rows * ST::underlying_cols * sizeof(U);
+    __builtin_amdgcn_sched_barrier(0);
+    mma_ABt_one(c, a, b, c, 0, 2, 0);
+    __builtin_amdgcn_sched_barrier(0);
 
-        const int elem_per_thread = 16 / sizeof(U); // 8 if bf16, 16 if fp8e4m3
-        uint32_t st_offset = (kittens::laneid() % RT::base_tile_rows) * ST::underlying_cols + (kittens::laneid() / RT::base_tile_rows * 16 / sizeof(U));
-        uint32_t base_addr = reinterpret_cast<uintptr_t>(&src.data[st_offset]);
-        uint32_t addr0 = base_addr;
-        addr0 ^= (((addr0 % (256*8)) >> 8) << 4);
-        uint32_t addr1 = base_addr + subtile_stride;
-        addr1 ^= (((addr1 % (256*8)) >> 8) << 4);
+    load_one<0, 0, 1>(dst, src, swizzled_offsets);
 
-        {
+    __builtin_amdgcn_sched_barrier(0);
+    mma_ABt_one(c, a, b, c, 0, 3, 0);
+    __builtin_amdgcn_sched_barrier(0);
 
-            buffer_load_lds<T_GL, ST_GL, N_THREADS>(0, lds_base, srsrc, row_stride_gl);
-            constexpr int i = 0;
-            asm volatile(
-                "ds_read_b128 %0, %1 offset:%2\n"
-                : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][0].data[0]))
-                : "v"(addr0), "i"(i * row_stride)
-                : "memory"
-            );
+    load_one<1>(dst_gl, src_gl, addresses);
+    load_one<1, 0, 0>(dst, src, swizzled_offsets);
+    __builtin_amdgcn_sched_barrier(0);
+    mma_ABt_one(c, a, b, c, 1, 0, 0);
+    mma_ABt_one(c, a, b, c, 1, 1, 0);
+    __builtin_amdgcn_sched_barrier(0);
 
-            __builtin_amdgcn_sched_barrier(0);
-            mma_ABt_base_wrapper(c, a, b, c, 0, 2, 0);
-            __builtin_amdgcn_sched_barrier(0);
+    load_one<1, 0, 1>(dst, src, swizzled_offsets);
+    __builtin_amdgcn_sched_barrier(0);
+    mma_ABt_one(c, a, b, c, 1, 2, 0);
+    mma_ABt_one(c, a, b, c, 1, 3, 0);
+    __builtin_amdgcn_sched_barrier(0);
 
-            asm volatile(
-                "ds_read_b128 %0, %1 offset:%2\n"
-                : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][0].data[4]))
-                : "v"(addr1), "i"(i * row_stride)
-                : "memory"
-            );
+    load_one<2>(dst_gl, src_gl, addresses);
+    load_one<2, 0, 0>(dst, src, swizzled_offsets);
+    __builtin_amdgcn_sched_barrier(0);
+    mma_ABt_one(c, a, b, c, 2, 0, 0);
+    mma_ABt_one(c, a, b, c, 2, 1, 0);
+    __builtin_amdgcn_sched_barrier(0);
 
-            __builtin_amdgcn_sched_barrier(0);
-            mma_ABt_base_wrapper(c, a, b, c, 0, 3, 0);
-            __builtin_amdgcn_sched_barrier(0);
-        }
-        {
-            buffer_load_lds<T_GL, ST_GL, N_THREADS>(1, lds_base, srsrc, row_stride_gl);
-            constexpr int i = 1;
-            asm volatile(
-                "ds_read_b128 %0, %1 offset:%2\n"
-                : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][0].data[0]))
-                : "v"(addr0), "i"(i * row_stride)
-                : "memory"
-            );
-            __builtin_amdgcn_sched_barrier(0);
-            mma_ABt_base_wrapper(c, a, b, c, 1, 0, 0);
-            mma_ABt_base_wrapper(c, a, b, c, 1, 1, 0);
-            __builtin_amdgcn_sched_barrier(0);
+    load_one<2, 0, 1>(dst, src, swizzled_offsets);
+    __builtin_amdgcn_sched_barrier(0);
+    mma_ABt_one(c, a, b, c, 2, 2, 0);
+    mma_ABt_one(c, a, b, c, 2, 3, 0);
+    __builtin_amdgcn_sched_barrier(0);
 
-            asm volatile(
-                "ds_read_b128 %0, %1 offset:%2\n"
-                : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][0].data[4]))
-                : "v"(addr1), "i"(i * row_stride)
-                : "memory"
-            );
-            __builtin_amdgcn_sched_barrier(0);
-            mma_ABt_base_wrapper(c, a, b, c, 1, 2, 0);
-            mma_ABt_base_wrapper(c, a, b, c, 1, 3, 0);
-            __builtin_amdgcn_sched_barrier(0);
-        }
-        {
-            buffer_load_lds<T_GL, ST_GL, N_THREADS>(2, lds_base, srsrc, row_stride_gl);
-            constexpr int i = 2;
-            asm volatile(
-                "ds_read_b128 %0, %1 offset:%2\n"
-                : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][0].data[0]))
-                : "v"(addr0), "i"(i * row_stride)
-                : "memory"
-            );
-            __builtin_amdgcn_sched_barrier(0);
-            mma_ABt_base_wrapper(c, a, b, c, 2, 0, 0);
-            mma_ABt_base_wrapper(c, a, b, c, 2, 1, 0);
-            __builtin_amdgcn_sched_barrier(0);
+    load_one<3>(dst_gl, src_gl, addresses);
+    load_one<3, 0, 0>(dst, src, swizzled_offsets);
+    __builtin_amdgcn_sched_barrier(0);
+    mma_ABt_one(c, a, b, c, 3, 0, 0);
+    mma_ABt_one(c, a, b, c, 3, 1, 0);
+    __builtin_amdgcn_sched_barrier(0);
 
-            asm volatile(
-                "ds_read_b128 %0, %1 offset:%2\n"
-                : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][0].data[4]))
-                : "v"(addr1), "i"(i * row_stride)
-                : "memory"
-            );
-            __builtin_amdgcn_sched_barrier(0);
-            mma_ABt_base_wrapper(c, a, b, c, 2, 2, 0);
-            mma_ABt_base_wrapper(c, a, b, c, 2, 3, 0);
-            __builtin_amdgcn_sched_barrier(0);
-        }
-        {
-            buffer_load_lds<T_GL, ST_GL, N_THREADS>(3, lds_base, srsrc, row_stride_gl);
-            constexpr int i = 3;
-            asm volatile(
-                "ds_read_b128 %0, %1 offset:%2\n"
-                : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][0].data[0]))
-                : "v"(addr0), "i"(i * row_stride)
-                : "memory"
-            );
-            __builtin_amdgcn_sched_barrier(0);
-            mma_ABt_base_wrapper(c, a, b, c, 3, 0, 0);
-            mma_ABt_base_wrapper(c, a, b, c, 3, 1, 0);
-            __builtin_amdgcn_sched_barrier(0);
-
-            asm volatile(
-                "ds_read_b128 %0, %1 offset:%2\n"
-                : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][0].data[4]))
-                : "v"(addr1), "i"(i * row_stride)
-                : "memory"
-            );
-            __builtin_amdgcn_sched_barrier(0);
-            mma_ABt_base_wrapper(c, a, b, c, 3, 2, 0);
-            mma_ABt_base_wrapper(c, a, b, c, 3, 3, 0);
-            __builtin_amdgcn_sched_barrier(0);
-        }
-    }
+    load_one<3, 0, 1>(dst, src, swizzled_offsets);
+    __builtin_amdgcn_sched_barrier(0);
+    mma_ABt_one(c, a, b, c, 3, 2, 0);
+    mma_ABt_one(c, a, b, c, 3, 3, 0);
+    __builtin_amdgcn_sched_barrier(0);
 }
 
 template <int M, int N, int K>
@@ -278,7 +192,6 @@ __global__ __launch_bounds__(256, 1) void matmul_device(const kittens::gl<fp8e4m
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        // template<typename ST_GL, typename GL_GL, typename ST, typename RT, typename RT_A, typename RT_B, typename RT_C, ducks::coord::tile COORD=coord<ST_GL>>
         auto bs_subtile_1 = kittens::subtile_inplace<BLOCK_SIZE_COL / 2 / WARPS_COL, k_step>(Bs[curr][1], {warp_n, 0});
         do_interleaved_cluster(As[curr][0], A, {0, 0, block_row*WARPS_ROW, k + 2}, b[1], bs_subtile_1, a[0], b[0], c[0][0]);
 

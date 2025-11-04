@@ -30,26 +30,19 @@ namespace kittens {
  * @brief Constant representing number of threads in a warp.
  */
 constexpr int WARP_THREADS{64};
-/**
- * @brief Constant representing number of threads in a warpgroup of four warps.
- */
-constexpr int WARPGROUP_THREADS{256};
-/**
 
- * @brief Constant representing number of warps in a warpgroup of four warps.
- */
-constexpr int WARPGROUP_WARPS{4};
 /**
 
  * @brief Get the warp ID of the current thread.
  * @return The warp ID.
  */
 __device__ __forceinline__ int warpid() { return threadIdx.x >> 6; } 
+
 /**
- * @brief Get the warpgroup ID of the current thread.
- * @return The warpgroup ID.
+ * @brief Get the number of warps in the threadblock.
+ * @return The number of warps in the threadblock.
  */
-__device__ __forceinline__ int warpgroupid() { return threadIdx.x >> 8; } 
+ __device__ __forceinline__ int num_warps() { return blockDim.x / WARP_THREADS; }
 
 /**
  * @brief Get the lane ID of the current thread within its warp.
