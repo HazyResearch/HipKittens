@@ -1,20 +1,25 @@
 # HipKittens
 
-HipKittens is a repository in the ThunderKittens cinematic universe! This work provides minimal, opinionated C++ embedded programming primitives to help you write speedy AMD AI kernels. HipKittens is built from the hardware up -- we do what the silicon tells us. We support CDNA3 and CDNA 4. 
-
-HK uses:
-1. Tile primitives: sized according to the tensor core units. Tile memory ops are coalesced, bank conflict free, and eagerly use tensor core layouts. We focus on minimizing address computation costs. 
-2. Python-inspired functions: bulk compute functions that operate over tiles. These are lightweight, wrapping assembly and HIP.
-3. Asynchronous loads/stores: hide latencies and address generation using direct buffer loads to shared memory.
-4. Scheduling and overlapping: we show two core patterns for overlapping compute and memory -- 8-wave ping pong and 4-wave interelave -- that appear across kernels.
-
+HipKittens is a repository in the ThunderKittens cinematic universe! This work provides minimal, opinionated C++ embedded programming primitives to help you write speedy AMD AI kernels. HipKittens is built from the hardware up: we do what the silicon tells us. 
 
 <div align="center" >
     <img src="assets/hipkittens.png" height=250 alt="HipKittens logo" style="margin-bottom:px"/> 
+      <p><em>HipKittens surfing the ~wave~ (not warp).</em></p>
 </div>
 
 <br>
-<br>
+
+**AI has largely used a single hardware vendor in the past, but how can we enable a *multi-silicon* future?** Towards the dream of a single software framework that translates across hardware platforms, we explore whether the primitives used in prior DSLs (like TK) suffice for AMD, or whether we need entirely new primitives.
+
+We find that core tile and bulk compute interfaces carry over from TK to HK, but decisions around memory access patterns, scheduling compute and memory, and ordering thread blocks within the chiplet architecture differ. HipKittens features the following types of primitives. 
+1. **Tile primitives**: sized according to the tensor core units. Tile memory ops are coalesced, bank conflict free, and eagerly use tensor core layouts. We focus on minimizing address computation costs. 
+2. **Python-inspired functions**: bulk compute functions that operate over tiles. These are lightweight, wrapping assembly and HIP.
+3. **Asynchronous loads/stores**: hide latencies and address generation using direct buffer loads to shared memory.
+4. **Scheduling and overlapping**: we show two core patterns for overlapping compute and memory, 8-wave ping pong and 4-wave interelave, that appear across kernels.
+
+We support CDNA3 and CDNA 4. 
+
+
 
 ## Setup
 
@@ -57,11 +62,18 @@ make -j64
 
 ## Quick start: running kernels
 
+We assume you will run the following on an MI350X or MI355X unless otherwise specified. 
+
 1. **BF16 GEMM**
 ```bash
 # Defaults to 8192x8192x8192
 # This will compare to AITER and PyTorch automatically.
-cd kernels/gemm/bf16fp32/mi350x/8192_256_256_64_32/
+cd kernels/gemm/bf16fp32/mi350x/
+make clean && make
+python test_python.py
+
+# On the mi300x or mi325x run:
+cd kernels/gemm/bf16fp32/mi325x/
 make clean && make
 python test_python.py
 ```
