@@ -196,7 +196,10 @@ __device__ inline void prefill_swizzled_offsets_fp6(
     for (int i = 0; i < memcpy_per_tile; i++) {
 
         const int warp_byte_offset = (i * bytes_per_block) + (warp_id * bytes_per_warp);
-        const int lane_byte_offset = laneid * bytes_per_thread + warp_byte_offset;
+        int lane_byte_offset = laneid * bytes_per_thread + warp_byte_offset;
+        const int bottom = (lane_byte_offset % (16 * 96)) / (8 * 96);
+        const int right = (lane_byte_offset % (96)) / 48;
+        lane_byte_offset += bottom * 48 * (1 - (2 * right));
 
         const int row_offset = lane_byte_offset / bytes_per_row;
         const int col_byte_offset = lane_byte_offset % bytes_per_row;
@@ -248,52 +251,70 @@ __device__ inline void load_global_to_shared_direct_with_swizzled_offsets_fp6(
     }
 }
 
+template<ducks::rt::row_layout RT, ducks::st::all ST>
+__device__ inline static uint32_t prefill_swizzled_offset_fp6(RT &dst, const ST &src) {
+    static_assert(RT::height == ST::height, "register tile and shared tile must match height");
+    static_assert(RT::width  == ST::width,  "register tile and shared tile must match width");
+
+    using U  = ST::dtype;
+    const int laneid = kittens::laneid() % kittens::WARP_THREADS;
+    auto* lds_bytes = reinterpret_cast<const uint8_t*>(&src.data[0]);
+
+    const int row_offset = laneid % 16;
+    const int col_offset = 32 * (laneid / 16);
+
+    int elem_offset = row_offset * kittens::TILE_COL_DIM<U> + col_offset;
+    elem_offset ^= ((elem_offset % (16 * 128)) >> 10) << 6;
+
+    int byte_offset = (elem_offset) * 6 / 8;
+
+    // Alternate implementation:
+    // const int bottom = (byte_offset % (16 * 96)) / (8 * 96);
+    // const int right = (byte_offset % (96)) / 48;
+    // byte_offset += bottom * 48 * (1 - (2 * right));
+
+    const uint32_t addr = reinterpret_cast<uintptr_t>(lds_bytes + byte_offset);
+    return addr;
+}
+
 /**
- * @brief Load data from a shared tile into a register tile.
- *
- * @tparam RT The register tile type
- * @tparam ST The shared tile type
- * @param dst[out] The destination register tile.
- * @param src[in]  The source shared tile.
- */
- template<ducks::rt::row_layout RT, ducks::st::all ST>
- __device__ inline static void load_lds_reg_row_fp6(RT &dst, const ST &src) {
- 
-     static_assert(RT::height == ST::height, "register tile and shared tile must match height");
-     static_assert(RT::width  == ST::width,  "register tile and shared tile must match width");
- 
-     using U  = ST::dtype;
-     const int laneid = kittens::laneid() % kittens::WARP_THREADS;
-     auto* lds_bytes = reinterpret_cast<const uint8_t*>(&src.data[0]);
+* @brief Load data from a shared tile into a register tile.
+*
+* @tparam RT The register tile type
+* @tparam ST The shared tile type
+* @param dst[out] The destination register tile.
+* @param src[in]  The source shared tile.
+*/
+template<ducks::rt::row_layout RT, ducks::st::all ST>
+__device__ inline static void load_lds_reg_row_fp6(RT &dst, const ST &src, uint32_t addr) {
 
-     const int row_offset = laneid % 16;
-     const int col_offset = 32 * (laneid / 16);
+    using U  = ST::dtype;
 
-     const int byte_offset = (row_offset * kittens::TILE_COL_DIM<U> + col_offset) * 6 / 8;
-     const uint32_t addr = reinterpret_cast<uintptr_t>(lds_bytes + byte_offset);
+    const int tile_stride = (kittens::TILE_ROW_DIM<U> * kittens::TILE_COL_DIM<U> * 6 / 8);
+    const int row_stride = tile_stride * src.underlying_width;
 
-     const int tile_stride = (kittens::TILE_ROW_DIM<U> * kittens::TILE_COL_DIM<U> * 6 / 8);
-     const int row_stride = tile_stride * src.underlying_width;
- 
-     #pragma unroll
-     for(int i = 0; i < dst.height; i++) {
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
 
         #pragma unroll
         for(int j = 0; j < dst.width; j++) {
 
             asm volatile(
-                "ds_read_b128 %0, %2 offset:%3\n"
-                "ds_read_b64 %1, %2 offset:%4\n"
-                : "=v"(*reinterpret_cast<__uint128_t*>(&dst.tiles[i][j].data[0])),
-                  "=v"(*reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(&dst.tiles[i][j].data[0]) + 16))
+                "ds_read_b64 %0, %3 offset:%4\n"
+                "ds_read_b64 %1, %3 offset:%5\n"
+                "ds_read_b64 %2, %3 offset:%6\n"
+                : "=v"(*reinterpret_cast<uint64_t*>(&dst.tiles[i][j].data[0])),
+                    "=v"(*reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(&dst.tiles[i][j].data[0]) + 8)),
+                    "=v"(*reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(&dst.tiles[i][j].data[0]) + 16))
                 : "v"(addr),
                 "i"(i * row_stride + j * tile_stride),
+                "i"(i * row_stride + j * tile_stride + 8),
                 "i"(i * row_stride + j * tile_stride + 16)
                 : "memory"
             );
         }
     }
- }
+}
 
  template<int axis, ducks::rt::row_layout RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
 __device__ inline static void store_fp6(const GL &dst, const RT &src, const COORD &idx) {
