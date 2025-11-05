@@ -1,0 +1,4 @@
+Kernel_Name,Count,Sum(ns),Mean(ns),Median(ns),Pct
+"ref_kernel(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, int, int, int) [clone .kd]",1,216411668.0,216411668.0,216411668.0,75.29688816444786
+"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",16,70947467.0,4434216.6875,4428440.5,24.685006763359244
+__amd_rocclr_copyBuffer.kd,17,52036.0,3060.9411764705883,3045.0,0.018105072192896775

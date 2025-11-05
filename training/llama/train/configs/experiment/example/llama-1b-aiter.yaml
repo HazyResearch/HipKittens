@@ -1,0 +1,72 @@
+# @package _global_
+defaults:
+  - /experiment/pile/gpt3m-flash.yaml
+  - override /datamodule: wikitext103
+
+train: 
+  optimizer:
+    lr: 0.0008
+    betas: [0.9, 0.95]
+    _target_: apex.optimizers.FusedAdam
+    adam_w_mode: true
+    weight_decay: 0.1
+  
+  scheduler: 
+    lr_min: 0.00008
+    _target_: train.optim.timm_lr_scheduler.TimmCosineLRScheduler
+    warmup_t: 200
+    t_initial: 19800
+    t_in_epochs: false
+    warmup_prefix: true
+    warmup_lr_init: 0.000001
+
+trainer: 
+  # this interval is in terms of batch_idx not in terms of global_step, so we need 
+  # to multiply by accumulate_grad_batches
+  val_check_interval: ${eval:1000 * ${.accumulate_grad_batches}}
+  max_steps: 20000
+
+expt_name: llama-1b-aiter-head=64-hkv=8-bs=8-n=2048-d=2048
+name: ${.expt_name}
+
+resume: true
+
+callbacks:
+  model_checkpoint:
+    dirpath: ./${expt_name}
+
+datamodule:
+  batch_size: 8  # per gpu
+  batch_size_eval: 8
+
+model:
+  config:
+    n_embd: 2048
+    n_head: 64
+    n_head_kv: 8
+    n_layer: 6
+    _target_: "transformers.GPT2Config"
+    rms_norm: true
+    fused_mlp: false
+    attn_pdrop: 0
+    embd_pdrop: 0
+    n_positions: 2048
+    resid_pdrop: 0
+    mlp_fc1_bias: false
+    mlp_fc2_bias: false
+    fused_bias_fc: false
+    out_proj_bias: false
+    qkv_proj_bias: false
+    residual_in_fp32: true
+    activation_function: "swiglu"
+    rotary_emb_fraction: 0.5
+    fused_dropout_add_ln: false
+    max_position_embeddings: 0
+    pad_vocab_size_multiple: 16
+    reorder_and_upcast_attn: false
+    scale_attn_by_inverse_layer_idx: false
+
+    use_aiter_attn: true
+    use_hip_attn: false
+
+    

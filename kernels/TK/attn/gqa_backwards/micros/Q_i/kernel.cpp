@@ -1,0 +1,94 @@
+#include "kittens.cuh"
+#include "pyutils/pyutils.cuh"
+using namespace kittens;
+
+constexpr int ATTN_D = 128; // dimension
+constexpr int SLICE_QO = 32;
+constexpr int DOT_SLICE_QO = 16;
+
+template<int D, typename T=bf16, typename L=row_l, typename M=mfma_16x16x32> using qo_tile = rt<T, DOT_SLICE_QO, D, L, M>;
+
+#define NUM_WARPS 8
+#define NUM_THREADS (kittens::WARP_THREADS * NUM_WARPS)
+
+using G = kittens::group<NUM_WARPS>;
+
+template<int D> struct micro_globals {
+    gl<bf16, -1, -1, -1, -1> in;
+    gl<bf16, -1, -1, -1, -1> out;
+    dim3 grid()  { return dim3(1); } 
+    dim3 block() { return dim3(NUM_THREADS); } 
+    size_t dynamic_shared_memory() { return MAX_SHARED_MEMORY; }
+};
+
+#define COL
+
+template<int D> __global__ __launch_bounds__(NUM_THREADS, 1)
+void micro_tk(const micro_globals<D> g) {
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+
+    st_bf<SLICE_QO, D, ducks::st_layout::classical, ducks::st_matrix::mfma_16x16x32> (&Q_i_smem) = al.allocate<st_bf<SLICE_QO, D, ducks::st_layout::classical, ducks::st_matrix::mfma_16x16x32>>();
+
+    // Register tiles
+    qo_tile<D, bf16, row_l, mfma_16x16x32> Q_i;
+    qo_tile<D, bf16, col_l, mfma_32x32x16> Q_i_col;
+
+    const int warpid = kittens::warpid();
+
+    G::load<1, false>(Q_i_smem, g.in, {0, 0, 0, 0});
+
+    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_sched_barrier(0);
+
+    #ifdef COL
+    load(Q_i_col, subtile_inplace<DOT_SLICE_QO, D>(Q_i_smem, {0, 0}));
+    #else
+    load(Q_i, subtile_inplace<DOT_SLICE_QO, D>(Q_i_smem, {0, 0}));
+    #endif
+
+    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_sched_barrier(0);
+
+    #ifdef COL
+    store<1>(g.out, Q_i_col, {0, 0, 0, 0});
+    #else
+    store<1>(g.out, Q_i, {0, 0, 0, 0});
+    #endif
+
+    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_sched_barrier(0);
+
+    #ifdef COL
+    load(Q_i_col, subtile_inplace<DOT_SLICE_QO, D>(Q_i_smem, {1, 0}));
+    #else
+    load(Q_i, subtile_inplace<DOT_SLICE_QO, D>(Q_i_smem, {1, 0}));
+    #endif
+
+    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_sched_barrier(0);
+
+    #ifdef COL
+    store<1>(g.out, Q_i_col, {0, 1, 0, 0});
+    #else
+    store<1>(g.out, Q_i, {0, 1, 0, 0});
+    #endif
+}
+
+template<int D>
+void dispatch_micro(micro_globals<D> g) {
+    unsigned long mem_size = g.dynamic_shared_memory();
+    hipFuncSetAttribute((void*)micro_tk<D>, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    micro_tk<D><<<g.grid(), g.block(), mem_size>>>(g);
+    hipDeviceSynchronize();
+}
+
+PYBIND11_MODULE(tk_kernel, m) {
+    m.doc() = "tk_kernel python module";
+    py::bind_function<dispatch_micro<ATTN_D>>(m, "dispatch_micro", &micro_globals<ATTN_D>::in, &micro_globals<ATTN_D>::out);
+}
+

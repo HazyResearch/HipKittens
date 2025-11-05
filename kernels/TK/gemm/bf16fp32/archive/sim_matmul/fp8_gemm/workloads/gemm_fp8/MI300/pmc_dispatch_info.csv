@@ -1,0 +1,35 @@
+Dispatch_ID,Kernel_Name,GPU_ID
+0,__amd_rocclr_copyBuffer.kd,2
+1,__amd_rocclr_copyBuffer.kd,2
+2,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+3,__amd_rocclr_copyBuffer.kd,2
+4,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+5,__amd_rocclr_copyBuffer.kd,2
+6,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+7,__amd_rocclr_copyBuffer.kd,2
+8,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+9,__amd_rocclr_copyBuffer.kd,2
+10,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+11,__amd_rocclr_copyBuffer.kd,2
+12,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+13,__amd_rocclr_copyBuffer.kd,2
+14,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+15,__amd_rocclr_copyBuffer.kd,2
+16,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+17,__amd_rocclr_copyBuffer.kd,2
+18,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+19,__amd_rocclr_copyBuffer.kd,2
+20,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+21,__amd_rocclr_copyBuffer.kd,2
+22,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+23,__amd_rocclr_copyBuffer.kd,2
+24,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+25,__amd_rocclr_copyBuffer.kd,2
+26,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+27,__amd_rocclr_copyBuffer.kd,2
+28,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+29,__amd_rocclr_copyBuffer.kd,2
+30,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+31,__amd_rocclr_copyBuffer.kd,2
+32,"void custom_kernel<1, false, false>(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, float*, int, int, int) [clone .kd]",2
+33,"ref_kernel(__hip_fp8_e4m3_fnuz const*, __hip_fp8_e4m3_fnuz const*, float const*, float const*, __hip_bfloat16*, int, int, int) [clone .kd]",2

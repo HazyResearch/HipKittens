@@ -1,0 +1,254 @@
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2025, Modular Inc. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+# mojo build --debug-level=full --mcmodel=medium --large-data-threshold=1048576
+# to build this file if running into linking issues with large PTX kernels.
+
+from random import random_si64
+
+# import vendor_blas
+from benchmark import Bench, BenchConfig, Bencher, BenchId, BenchMetric, ThroughputMeasure
+from buffer.dimlist import DimList
+from gpu.host import DeviceContext
+from internal_utils import DeviceNDBuffer, HostNDBuffer
+from internal_utils._utils import ValOrDim, dynamic, static
+from matmul_gpu import _matmul_gpu, matmul_kernel_naive
+
+from utils import IndexList
+
+from buffer import NDBuffer
+from math import align_down, ceildiv
+
+alias epilogue_func_type = fn[dtype: DType, width: Int, *, alignment: Int = 1] (
+    IndexList[2], IndexList[2], SIMD[dtype, width]
+) capturing -> SIMD[dtype, width]
+
+
+@parameter
+@always_inline
+fn epilogue_test_fn[
+    dtype: DType, width: Int, *, alignment: Int = 1
+](
+    idx: IndexList[2],
+    dim_space: IndexList[2],
+    val: SIMD[dtype, width],
+) -> SIMD[
+    dtype, width
+]:
+    var bias = SIMD[dtype, width](0)
+
+    @parameter
+    for i in range(width):
+        bias[i] = (
+            0.5
+            + ((idx[0] + idx[1] + i) / (dim_space[0] + dim_space[1])).cast[
+                dtype
+            ]()
+        )
+
+    return val + bias
+
+
+fn test[
+    in_type: DType,
+    out_type: DType,
+    transpose_b: Bool,
+    *,
+    # backend: vendor_blas.Backend = vendor_blas.Backend.AUTOMATIC,
+](
+    mut bench: Bench,
+    ctx: DeviceContext,
+    m: ValOrDim,
+    n: ValOrDim,
+    k: ValOrDim,
+) raises:
+    constrained[
+        Int(n.dim) > 0 and Int(k.dim) > 0,
+        "This test currently requires static N and K.",
+    ]()
+
+    var M = m.value
+    var N = n.value
+    var K = k.value
+    print(M, "x", N, "x", K)
+
+    alias static_a_shape = DimList(m.dim, k.dim)
+    alias static_b_shape = DimList(n.dim, k.dim) if transpose_b else DimList(
+        k.dim, n.dim
+    )
+    alias static_c_shape = DimList(m.dim, n.dim)
+
+    var dynamic_a_shape = DimList(m.value, k.value)
+    var dynamic_b_shape = DimList(n.value, k.value) if transpose_b else DimList(
+        k.value, n.value
+    )
+
+    var dynamic_c_shape = DimList(m.value, n.value)
+
+    var a_host = HostNDBuffer[in_type, 2, static_a_shape](dynamic_a_shape)
+    var b_host = HostNDBuffer[in_type, 2, static_b_shape](dynamic_b_shape)
+    var c_host = HostNDBuffer[out_type, 2, static_c_shape](dynamic_c_shape)
+    var c_host_ref = HostNDBuffer[out_type, 2, static_c_shape](dynamic_c_shape)
+
+    var a_device = DeviceNDBuffer[in_type, 2, static_a_shape](
+        dynamic_a_shape, ctx=ctx
+    )
+    var b_device = DeviceNDBuffer[in_type, 2, static_b_shape](
+        dynamic_b_shape, ctx=ctx
+    )
+    var c_device = DeviceNDBuffer[out_type, 2, static_c_shape](
+        dynamic_c_shape, ctx=ctx
+    )
+    var c_device_ref = DeviceNDBuffer[out_type, 2, static_c_shape](
+        dynamic_c_shape, ctx=ctx
+    )
+
+    alias rand_min = -100
+    alias rand_max = 100
+
+    for i in range(M * K):
+        var val = random_si64(rand_min, rand_max)
+        a_host.tensor.data[i] = val.cast[in_type]()
+
+    for i in range(K * N):
+        var val = random_si64(rand_min, rand_max)
+        b_host.tensor.data[i] = val.cast[in_type]()
+
+    for i in range(M * N):
+        c_host.tensor.data[i] = 0
+        c_host_ref.tensor.data[i] = 0
+
+    # Move operands to the Device
+
+    ctx.enqueue_copy(a_device.buffer, a_host.tensor.data)
+    ctx.enqueue_copy(b_device.buffer, b_host.tensor.data)
+    ctx.enqueue_copy(c_device.buffer, c_host.tensor.data)
+
+    _matmul_gpu[use_tensor_core=True, transpose_b=transpose_b](
+        c_device.tensor,
+        a_device.tensor,
+        b_device.tensor,
+        ctx,
+    )
+
+    ctx.synchronize()
+
+    ctx.enqueue_copy(c_host.tensor.data, c_device.buffer)
+
+    # print("Starting reference kernel... transpose_b = ", transpose_b)
+    alias BLOCK_DIM = 16 
+    ctx.enqueue_function[
+        matmul_kernel_naive[
+            out_type,
+            in_type,
+            in_type,
+            BLOCK_DIM,
+            transpose_b,
+            s_type = DType.float32,
+    ]](
+        c_device_ref.tensor.data,
+        a_device.tensor.data,
+        b_device.tensor.data,
+        M,
+        N,
+        K,
+        grid_dim=(ceildiv(M, BLOCK_DIM), ceildiv(N, BLOCK_DIM)),
+        block_dim=(BLOCK_DIM, BLOCK_DIM),
+    )
+
+    ctx.enqueue_copy(c_host_ref.tensor.data, c_device_ref.buffer)
+
+    ctx.synchronize()
+    var errors = 0
+    for i in range(M * N):
+        # print(i // N, i % N, c_host.tensor.data[i], c_host_ref.tensor.data[i])
+        if c_host.tensor.data[i] != c_host_ref.tensor.data[i]:
+            # if (i < 10):
+            #     print(c_host.tensor.data[i], c_host_ref.tensor.data[i])
+            errors += 1
+
+    print("errors", errors)
+
+    @parameter
+    fn bench_func(mut m: Bencher):
+        @parameter
+        @always_inline
+        fn kernel_launch(ctx: DeviceContext) raises:
+            _matmul_gpu[use_tensor_core=True, transpose_b=transpose_b](
+                c_device.tensor,
+                a_device.tensor,
+                b_device.tensor,
+                ctx,
+            )
+
+        m.iter_custom[kernel_launch](ctx)
+
+    bench.bench_function[bench_func](
+        BenchId("Mojo matmul"),
+        ThroughputMeasure(BenchMetric.flops, 2 * M * N * K),
+    )
+
+    _ = c_device
+    _ = c_device_ref
+    _ = a_host
+    _ = b_host
+    _ = c_host_ref
+    _ = c_host
+    _ = a_device
+    _ = b_device
+
+
+def main():
+    import os
+    from pathlib import Path
+
+    var bench = Bench(
+        BenchConfig(
+            out_file=Path("out.txt"),
+            num_warmup_iters=100, max_iters=100,
+        )
+    )
+
+    with DeviceContext() as ctx:
+
+        test[
+            in_type = DType.bfloat16,
+            out_type = DType.bfloat16,
+            transpose_b=True,
+        ](bench, ctx, static[1024](), static[1024](), static[1024]())
+
+        test[
+            in_type = DType.bfloat16,
+            out_type = DType.bfloat16,
+            transpose_b=True,
+        ](bench, ctx, static[2048](), static[2048](), static[2048]())
+
+        test[
+            in_type = DType.bfloat16,
+            out_type = DType.bfloat16,
+            transpose_b=True,
+        ](bench, ctx, static[4096](), static[4096](), static[4096]())
+
+        test[
+            in_type = DType.bfloat16,
+            out_type = DType.bfloat16,
+            transpose_b=True,
+        ](bench, ctx, static[8192](), static[8192](), static[8192]())
+
+        test[
+            in_type = DType.bfloat16,
+            out_type = DType.bfloat16,
+            transpose_b=True,
+        ](bench, ctx, static[16384](), static[16384](), static[16384]())
+
+    bench.dump_report()
+

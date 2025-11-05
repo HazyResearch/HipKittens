@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - /experiment/pile/gpt3m-flash.yaml
+
+train: 
+  max_steps: 20000
+
+trainer: 
+  # this interval is in terms of batch_idx not in terms of global_step, so we need 
+  # to multiply by accumulate_grad_batches
+  val_check_interval: ${eval:1000 * ${.accumulate_grad_batches}}
+
+
+datamodule:
+  _target_: train.datamodules.language_modeling_neox.NeoxLMDataModule   
+  batch_size: 8  # per gpu
+  batch_size_eval: 16
+  global_batch_size: ${..train.global_batch_size}
+  max_steps: ${..train.max_steps}
+  num_test_samples: 1000
+  num_valid_samples: 1000
+
+model:
+  config:
+    max_position_embeddings: 0  # Disable absolute position embedding
+    rotary_emb_fraction: 0.5

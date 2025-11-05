@@ -1,0 +1,5 @@
+"Correlation_Id","Dispatch_Id","Agent_Id","Queue_Id","Process_Id","Thread_Id","Grid_Size","Kernel_Id","Kernel_Name","Workgroup_Size","LDS_Block_Size","Scratch_Size","VGPR_Count","Accum_VGPR_Count","SGPR_Count","Counter_Name","Counter_Value","Start_Timestamp","End_Timestamp"
+1,1,"Agent 2",1,179777,179777,16384,11,"micro_tk(micro_globals)",512,0,0,28,0,32,"SQ_ACTIVE_INST_ANY",4240128.000000,2005606659752888,2005606660161768
+1,1,"Agent 2",1,179777,179777,16384,11,"micro_tk(micro_globals)",512,0,0,28,0,32,"SQ_BUSY_CYCLES",30890746.000000,2005606659752888,2005606660161768
+1,1,"Agent 2",1,179777,179777,16384,11,"micro_tk(micro_globals)",512,0,0,28,0,32,"SQ_INSTS_SALU",1495296.000000,2005606659752888,2005606660161768
+1,1,"Agent 2",1,179777,179777,16384,11,"micro_tk(micro_globals)",512,0,0,28,0,32,"SQ_INSTS_VALU",1826048.000000,2005606659752888,2005606660161768
