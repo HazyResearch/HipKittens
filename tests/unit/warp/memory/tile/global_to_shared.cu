@@ -9,7 +9,6 @@ static __global__ void g2s_global_wrapper_2d(const GL input, const GL output) {
 template<typename test, typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NUM_WORKERS, typename axis, typename... args>
 struct g2s_wrapper_2d {
     using dtype = gmem_dtype<test>; // defaults to bf16 in global memory if the test doesn't specify.
-    using rt_dtype = test::rt_dtype;
     static void run(test_data& results) {
         test_info this_result;
         this_result.label = generate_test_name<RT_SHAPE, ST_SHAPE, H, W, NUM_WORKERS, args...>(test::test_identifier);
