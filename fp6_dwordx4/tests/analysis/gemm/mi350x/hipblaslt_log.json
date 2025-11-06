@@ -1,0 +1,17 @@
+{
+    "1024": {
+        "tflops_hipblaslt": 201.452
+    },
+    "2048": {
+        "tflops_hipblaslt": 597.104
+    },
+    "4096": {
+        "tflops_hipblaslt": 1111.09
+    },
+    "8192": {
+        "tflops_hipblaslt": 1313.99
+    },
+    "16384": {
+        "tflops_hipblaslt": 1323.31
+    }
+}
