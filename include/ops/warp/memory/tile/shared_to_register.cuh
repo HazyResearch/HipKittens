@@ -77,6 +77,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                 if constexpr (RT::base_tile_stride == 8) {
                                     asm volatile(
                                         "ds_read_b128 %0, %1 offset:%2\n"
+                                        // "s_waitcnt lgkmcnt(0)\n"
                                         : "=v"(*reinterpret_cast<float4*>(&dst.tiles[register_row][register_col].data[idx]))
                                         : "v"(addr), "i"(offset)
                                         : "memory"
@@ -85,6 +86,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                 } else if constexpr (RT::base_tile_stride == 4) {
                                     asm volatile(
                                         "ds_read_b64 %0, %1 offset:%2\n"
+                                        // "s_waitcnt lgkmcnt(0)\n"
                                         : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx]))
                                         : "v"(addr), "i"(offset)
                                         : "memory"
@@ -245,6 +247,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                     asm volatile(
                                         "ds_read_b64_tr_b16 %0, %2 offset:%3\n"
                                         "ds_read_b64_tr_b16 %1, %2 offset:%4\n"
+                                        // "s_waitcnt lgkmcnt(0)\n"
                                         : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])), 
                                         "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx + 2]))
                                         : "v"(addr), "i"(offset), "i"(offset + 4 * ST::underlying_subtile_row_bytes)
@@ -255,6 +258,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                     asm volatile(
                                         "ds_read_b64_tr_b16 %0, %2 offset:%4\n"
                                         "ds_read_b64_tr_b16 %1, %3 offset:%4\n"
+                                        // "s_waitcnt lgkmcnt(0)\n"
                                         : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])), 
                                         "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx + 2]))
                                         : "v"(addr), "v"(next_addr), "i"(offset)
@@ -264,6 +268,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                 } else if constexpr (RT::base_tile_stride == 4) {
                                     asm volatile(
                                         "ds_read_b64_tr_b16 %0, %1 offset:%2\n"
+                                        // "s_waitcnt lgkmcnt(0)\n"
                                         : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx]))
                                         : "v"(addr), "i"(offset)
                                         : "memory"
@@ -408,181 +413,6 @@ __device__ inline static void load(RT &dst, const ST &src) {
         static_assert(false, "Unsupported subtile sizes");
     }
 }
-
-// template<ducks::rt::row_layout RT, ducks::st::all ST>
-// __device__ inline static void load(RT &dst, const ST &src) {
-
-//     static_assert(RT::rows == ST::rows, "register tile and shared tile must match rows");
-//     static_assert(RT::cols == ST::cols,  "register tile and shared tile must match cols");
-
-//     using T2 = RT::dtype;
-//     using T  = base_types::packing<T2>::unpacked_type;
-//     using U  = ST::dtype;
-//     using U2 = base_types::packing<U >::packed_type;
-//     constexpr int packing = base_types::packing<typename RT::dtype>::num();
-
-//     const int laneid = kittens::laneid();
-
-//     const int row_offset = laneid % dst.base_tile_rows;
-//     const int col_offset = dst.base_tile_stride * (laneid / dst.base_tile_rows);
-
-//     const uint32_t src_ptr = reinterpret_cast<uintptr_t>(&src.data[0]);
-
-//     if constexpr (std::is_same_v<typename ST::shape, st_16x16_s> && std::is_same_v<typename RT::shape, rt_16x32_s>) {
-//         const int shared_tile_stride = 16 * 16 * sizeof(U);
-//         const int row_stride = shared_tile_stride * ST::underlying_subtiles_per_row;
-//         const int register_tile_stride = shared_tile_stride * 2;
-
-//         const int shared_tile_offset = (laneid / 32) * shared_tile_stride;
-//         const int lane_col_offset = ((laneid % 32) / 16) * 8;
-//         const int lane_row_offset = (laneid % 16);
-
-//         const int lane_byte_offset = (lane_row_offset * 16 + lane_col_offset) * sizeof(U) + shared_tile_offset;
-
-//         const uint32_t addr = reinterpret_cast<uintptr_t>(&src.data[0]) + lane_byte_offset;
-
-//         #pragma unroll
-//         for(int i = 0; i < dst.height; i++) {
-    
-//             #pragma unroll
-//             for(int j = 0; j < dst.width; j++) {
-    
-//                 asm volatile(
-//                     "ds_read_b128 %0, %1 offset:%2\n"
-//                     : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][j].data[0]))
-//                     : "v"(addr), "i"(i * row_stride + j * register_tile_stride)
-//                     : "memory"
-//                 );
-//             }
-//         }
-
-//     } else if constexpr (std::is_same_v<typename ST::shape, st_16x32_s> && std::is_same_v<typename RT::shape, rt_16x32_s>) {
-//         const int tile_stride = 16 * 32 * sizeof(U);
-//         const int row_stride = tile_stride * ST::underlying_subtiles_per_row;
-//         const int lane_col_offset = (laneid / 16) * 8;
-//         const int lane_row_offset = (laneid % 16);
-
-//         const int lane_byte_offset = (lane_row_offset * 32 + lane_col_offset) * sizeof(U);
-//         const int swizzled_lane_byte_offset = lane_byte_offset ^ ((lane_byte_offset >> 9) << 5);
-//         const uint32_t addr = reinterpret_cast<uintptr_t>(&src.data[0]) + swizzled_lane_byte_offset;
-
-//         #pragma unroll
-//         for(int i = 0; i < dst.height; i++) {
-    
-//             #pragma unroll
-//             for(int j = 0; j < dst.width; j++) {
-    
-//                 asm volatile(
-//                     "ds_read_b128 %0, %1 offset:%2\n"
-//                     : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][j].data[0]))
-//                     : "v"(addr), "i"(i * row_stride + j * tile_stride)
-//                     : "memory"
-//                 );
-//             }
-//         }
-//     }
-
-// }
-
-// template<ducks::rt::col_layout RT, ducks::st::all ST>
-// __device__ inline static void load(RT &dst, const ST &src) {
-
-//     static_assert(RT::rows == ST::rows, "register tile and shared tile must match rows");
-//     static_assert(RT::cols == ST::cols,  "register tile and shared tile must match cols");
-
-//     using T2 = RT::dtype;
-//     using T  = base_types::packing<T2>::unpacked_type;
-//     using U  = ST::dtype;
-//     using U2 = base_types::packing<U >::packed_type;
-//     constexpr int packing = base_types::packing<typename RT::dtype>::num();
-
-//     const int laneid = kittens::laneid();
-
-//     const int row_offset = ((laneid % 16) / 4) + ((laneid / dst.base_tile_cols) * dst.base_tile_stride);
-//     const int col_offset = ((laneid % 4) * 4) + (16 * ((laneid % dst.base_tile_cols) / 16));
-
-//     const uint32_t src_ptr = reinterpret_cast<uintptr_t>(&src.data[0]);
-    
-//     if constexpr (std::is_same_v<typename ST::shape, st_16x16_swizzled_s> && std::is_same_v<typename RT::shape, rt_32x16_4_s>) {
-//         const int tile_stride = 16 * 16 * sizeof(U);
-//         const int shared_tile_offset = 16 * 16 * ST::underlying_subtiles_per_row * sizeof(U);
-//         const int row_stride = shared_tile_offset * 2;
-//         const int row_offset = (laneid % 16) / 4 + (laneid / 16) * 4;
-//         const int col_offset = ((laneid % 4) * 4);
-//         const int lane_byte_offset = (row_offset * 16 + col_offset) * sizeof(U);
-//         const int swizzled_lane_byte_offset = lane_byte_offset ^ ((lane_byte_offset >> 7) << 3);
-
-//         const uint32_t addr = reinterpret_cast<uintptr_t>(&src.data[0]) + swizzled_lane_byte_offset;
-
-//         #pragma unroll
-//         for(int i = 0; i < dst.height; i++) {
-//             #pragma unroll
-//             for(int j = 0; j < dst.width; j++) {
-//                 asm volatile(
-//                     "ds_read_b64_tr_b16 %0, %2 offset:%3\n"
-//                     "ds_read_b64_tr_b16 %1, %2 offset:%4\n"
-//                     : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[0])), 
-//                     "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[2]))
-//                     : "v"(addr),
-//                     "i"(i * row_stride + j * tile_stride),
-//                     "i"(i * row_stride + j * tile_stride + shared_tile_offset)
-//                     : "memory"
-//                 ); 
-//             }
-//         }
-//     } else if constexpr (std::is_same_v<typename ST::shape, st_16x16_s> && std::is_same_v<typename RT::shape, rt_32x16_4_s>) {
-//         const int tile_stride = 16 * 16 * sizeof(U);
-//         const int row_stride = tile_stride * ST::underlying_subtiles_per_row;
-//         const int row_offset = (laneid % 16) / 4 + (laneid / 16) * 4;
-//         const int col_offset = ((laneid % 4) * 4);
-//         const int lane_byte_offset = (row_offset * 16 + col_offset) * sizeof(U);
-
-//         const uint32_t addr = reinterpret_cast<uintptr_t>(&src.data[0]) + lane_byte_offset;
-
-//         #pragma unroll
-//         for(int i = 0; i < dst.height; i++) {
-//             #pragma unroll
-//             for(int j = 0; j < dst.width; j++) {
-//                 asm volatile(
-//                     "ds_read_b64_tr_b16 %0, %2 offset:%3\n"
-//                     "ds_read_b64_tr_b16 %1, %2 offset:%4\n"
-//                     : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[0])), 
-//                     "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[2]))
-//                     : "v"(addr),
-//                     "i"(i * (2 * row_stride) + j * tile_stride),
-//                     "i"(i * (2 * row_stride) + j * tile_stride + row_stride)
-//                     : "memory"
-//                 ); 
-//             }
-//         }
-//     } else if constexpr (std::is_same_v<typename ST::shape, st_16x32_s> && std::is_same_v<typename RT::shape, rt_16x32_s>) {
-//         const int tile_stride = 16 * 32 * sizeof(U);
-//         const int row_stride = tile_stride * ST::underlying_subtiles_per_row;
-//         const int row_offset = (laneid % 16) / 4 + (laneid / 32) * 8;
-//         const int col_offset = ((laneid % 4) * 4) + 16*((laneid % 32)/16);
-//         const int lane_byte_offset = (row_offset * 32 + col_offset) * sizeof(U);
-//         const int swizzled_lane_byte_offset = lane_byte_offset ^ ((lane_byte_offset >> 9) << 5);
-
-//         const uint32_t addr = reinterpret_cast<uintptr_t>(&src.data[0]) + swizzled_lane_byte_offset;
-
-//         #pragma unroll
-//         for(int i = 0; i < dst.height; i++) {
-//             #pragma unroll
-//             for(int j = 0; j < dst.width; j++) {
-//                 asm volatile(
-//                     "ds_read_b64_tr_b16 %0, %2 offset:%3\n"
-//                     "ds_read_b64_tr_b16 %1, %2 offset:%4\n"
-//                     : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[0])), 
-//                     "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[2]))
-//                     : "v"(addr),
-//                     "i"(i * row_stride + j * tile_stride),
-//                     "i"(i * row_stride + j * tile_stride + 4 * 32 * sizeof(U))
-//                     : "memory"
-//                 ); 
-//             }
-//         }
-//     }
-// }
 
 /**
  * @brief Store data into a shared tile from a register tile.
@@ -857,42 +687,5 @@ __device__ inline static void store(ST &dst, const RT &src) {
         static_assert(false, "Unsupported subtile sizes");
     }
 }
-// using int32x4_t = int32_t __attribute__((ext_vector_type(4)));
-// template<ducks::rt::all RT, ducks::st::all ST>
-// __device__ inline static void store(ST &dst, const RT &src) {
-
-//     using T2 = RT::dtype;
-//     using T  = base_types::packing<T2>::unpacked_type;
-//     using U  = ST::dtype;
-//     using U2 = base_types::packing<U >::packed_type;
-
-//     const int laneid = kittens::laneid();
-//     const int col_offset = (laneid / 16) * 4;
-//     const int row_offset = (laneid % 16);
-//     // const int lane_offset = (row_offset * ST::underlying_tile_cols + col_offset);
-//     const int lane_byte_offset = (row_offset * ST::underlying_subtile_cols + col_offset) * sizeof(U);
-//     const int swizzled_lane_byte_offset = lane_byte_offset ^ ((lane_byte_offset >> 7) << 3);
-//     const uint32_t addr = reinterpret_cast<uintptr_t>(&dst.data[0]) + swizzled_lane_byte_offset;
-
-//     const int tile_stride = ST::underlying_subtile_rows * ST::underlying_subtile_cols;
-//     const int subtile_stride = RT::base_tile_rows * RT::base_tile_cols;
-//     const int row_stride = tile_stride * ST::underlying_subtiles_per_row;
-
-//     #pragma unroll
-//     for(int i = 0; i < dst.subtiles_per_col; i++) {
-//         #pragma unroll
-//         for(int j = 0; j < dst.subtiles_per_row; j++) {
-
-//             asm volatile(
-//                 "ds_write_b64 %0, %1 offset:%2\n"
-//                 : 
-//                 : "v"(addr), "v"(*reinterpret_cast<const float2*>(&src.tiles[i][j].data[0])),
-//                 "i"((i * row_stride + j * tile_stride) * sizeof(U))
-//             );
-//         }
-//     }
-// } 
-
-
 
 } // namespace kittens

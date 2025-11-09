@@ -339,7 +339,7 @@ template<template<typename> typename test, typename RT_SHAPE, typename ST_SHAPE,
 // ----- 2D Wrappers -----
 
 template<typename Ker, typename RT_SHAPE, typename ST_SHAPE, typename dtype, int H, int W, int NW, typename G, typename... args>
-static __global__ void global_wrapper_2d(const G input, const G output) {
+static __global__ __launch_bounds__(NW*kittens::WARP_THREADS, 1) void global_wrapper_2d(const G input, const G output) {
     Ker::template device_func<RT_SHAPE, ST_SHAPE, dtype, H, W, NW, G, args...>(input, output);
 }
 template<typename test, typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NUM_WORKERS=1, typename... args>
