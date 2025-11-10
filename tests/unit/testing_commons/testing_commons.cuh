@@ -26,28 +26,28 @@ template<int S, int NW> std::string generate_test_name(std::string test_id) {
     if constexpr (NW > 1) {label += "_["+std::to_string(NW)+"warps]";}
     return label;
 }
+
+template<typename T2, typename U2> std::string generate_copy_name() {
+    std::string label = "";
+    if constexpr (std::is_same_v<U2, float>) label += "_[float->";
+    else if constexpr (std::is_same_v<U2, kittens::bf16>) label += "_[bf16->";
+    else label += "_[half->";
+    if constexpr (std::is_same_v<T2, float>) label += "float]";
+    else if constexpr (std::is_same_v<T2, kittens::bf16>) label += "bf16]";
+    else label += "half]";
+    return label;
+}
 /**
 * @brief Generate a test name for a 1D test with a row or column layout for 16x32 shapes. 
 */
 template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int S, int NW> std::string generate_test_name(std::string test_id) {
     std::string label = generate_test_name<S,NW>(test_id);
-    return label;
-}
-/**
-* @brief Generate a test name for a 1D test with a row or column layout for 16x32 shapes. 
-*/
-template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int S, int NW, kittens::ducks::rt_layout::all L> std::string generate_test_name(std::string test_id) {
-    std::string label = generate_test_name<S,NW>(test_id);
-
-    // layouts
-    if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
-    else label += "_[rt_col_layout]";
 
     // do we want this? 
     static_assert(RT_SHAPE::cols / ST_SHAPE::cols >= 1 , "RT_SHAPE::cols must be a positive factor of ST_SHAPE::cols");
     static_assert(RT_SHAPE::rows / ST_SHAPE::rows >= 1 , "RT_SHAPE::rows must be a positive factor of ST_SHAPE::rows");
 
-    // shapes
+    // rt shapes
     if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x16, RT_SHAPE>) label += "_[rt_16x16]";
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32, RT_SHAPE>) label += "_[rt_32x32]";
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32_8, RT_SHAPE>) label += "_[rt_32x32_8]";
@@ -56,65 +56,32 @@ template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all S
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16_4, RT_SHAPE>) label += "_[rt_32x16_4]";
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32_4, RT_SHAPE>) label += "_[rt_16x32_4]";
     else static_assert(false, "Unknown shape");
-    return label;
-}
-template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int S, int NW, kittens::ducks::rt_layout::all L1, kittens::ducks::rt_layout::all L2> std::string generate_test_name(std::string test_id) {
-    std::string label = generate_test_name<S,NW,L1>(test_id);
-    if constexpr (std::is_same_v<L2, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
-    else label += "_[rt_col_layout]";
 
-    static_assert(RT_SHAPE::cols / ST_SHAPE::cols >= 1 , "RT_SHAPE::cols must be a positive factor of ST_SHAPE::cols");
-    static_assert(RT_SHAPE::rows / ST_SHAPE::rows >= 1 , "RT_SHAPE::rows must be a positive factor of ST_SHAPE::rows");
-
-    // shapes
-    if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x16, RT_SHAPE>) label += "_[rt_16x16]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32, RT_SHAPE>) label += "_[rt_32x32]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32_8, RT_SHAPE>) label += "_[rt_32x32_8]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32, RT_SHAPE>) label += "_[rt_16x32]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16, RT_SHAPE>) label += "_[rt_32x16]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16_4, RT_SHAPE>) label += "_[rt_32x16_4]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32_4, RT_SHAPE>) label += "_[rt_16x32_4]";
+    // st shapes
+    if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_16x16, ST_SHAPE>) label += "_[st_16x16]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_16x16_swizzled, ST_SHAPE>) label += "_[st_16x16_swizzled]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_32x32, ST_SHAPE>) label += "_[st_32x32]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_16x32, ST_SHAPE>) label += "_[st_16x32]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_32x16, ST_SHAPE>) label += "_[st_32x16]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_8x32, ST_SHAPE>) label += "_[st_8x32]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_16x128, ST_SHAPE>) label += "_[st_16x128]";
     else static_assert(false, "Unknown shape");
     return label;
 }
+/**
+* @brief Generate a test name for a 1D test with a row or column layout for 16x32 shapes. 
+*/
 template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int S, int NW, kittens::ducks::rv_layout::all L> std::string generate_test_name(std::string test_id) {
-    std::string label = generate_test_name<S,NW>(test_id);
+    std::string label = generate_test_name<RT_SHAPE,ST_SHAPE,S,NW>(test_id);
+
     if constexpr (std::is_same_v<L, kittens::naive_l>) label += "_[rv_naive_layout]";
     else if constexpr (std::is_same_v<L, kittens::ortho_l>) label += "_[rv_ortho_layout]";
     else label += "_[rv_align_layout]";
-
-    static_assert(RT_SHAPE::cols / ST_SHAPE::cols >= 1 , "RT_SHAPE::cols must be a positive factor of ST_SHAPE::cols");
-    static_assert(RT_SHAPE::rows / ST_SHAPE::rows >= 1 , "RT_SHAPE::rows must be a positive factor of ST_SHAPE::rows");
-
-    // shapes
-    if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x16, RT_SHAPE>) label += "_[rt_16x16]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32, RT_SHAPE>) label += "_[rt_32x32]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32_8, RT_SHAPE>) label += "_[rt_32x32_8]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32, RT_SHAPE>) label += "_[rt_16x32]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16, RT_SHAPE>) label += "_[rt_32x16]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16_4, RT_SHAPE>) label += "_[rt_32x16_4]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32_4, RT_SHAPE>) label += "_[rt_16x32_4]";
-    else static_assert(false, "Unknown shape");
     return label;
 }
-template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int S, int NW, kittens::ducks::rv_layout::all L1, kittens::ducks::rv_layout::all L2> std::string generate_test_name(std::string test_id) {
-    std::string label = generate_test_name<S,NW,L1>(test_id);
-    if constexpr (std::is_same_v<L2, kittens::naive_l>) label += "_[rv_naive_layout]";
-    else if constexpr (std::is_same_v<L2, kittens::ortho_l>) label += "_[rv_ortho_layout]";
-    else label += "_[rv_align_layout]";
-
-    static_assert(RT_SHAPE::cols / ST_SHAPE::cols >= 1 , "RT_SHAPE::cols must be a positive factor of ST_SHAPE::cols");
-    static_assert(RT_SHAPE::rows / ST_SHAPE::rows >= 1 , "RT_SHAPE::rows must be a positive factor of ST_SHAPE::rows");
-
-    // shapes
-    if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x16, RT_SHAPE>) label += "_[rt_16x16]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32, RT_SHAPE>) label += "_[rt_32x32]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32_8, RT_SHAPE>) label += "_[rt_32x32_8]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32, RT_SHAPE>) label += "_[rt_16x32]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16, RT_SHAPE>) label += "_[rt_32x16]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16_4, RT_SHAPE>) label += "_[rt_32x16_4]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32_4, RT_SHAPE>) label += "_[rt_16x32_4]";
-    else static_assert(false, "Unknown shape");
+template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int S, int NW, kittens::ducks::rv_layout::all L1, typename T2, typename U2> std::string generate_test_name(std::string test_id) {
+    std::string label = generate_test_name<RT_SHAPE,ST_SHAPE,S,NW,L1>(test_id);
+    label += generate_copy_name<T2, U2>();
     return label;
 }
 
@@ -127,46 +94,14 @@ template<int H, int W, int NW> std::string generate_test_name(std::string test_i
     }
     return label;
 }
-template <typename T> concept integral_wrapper = std::is_integral_v<decltype(T::value)>;
-template<kittens::ducks::rt_shape::all RT_SHAPE, int H, int W, int NW, integral_wrapper _K> std::string generate_test_name(std::string test_id) {
-    constexpr int K = _K::value;
-    std::string label = test_id+"_["+std::to_string(H)+"x"+std::to_string(W)+"]x"+std::to_string(K);
-    if constexpr (std::is_same_v<RT_SHAPE, kittens::ducks::rt_shape::rt_32x32>) label += "_[mfma_32x32x16]";
-    else if constexpr (std::is_same_v<RT_SHAPE, kittens::ducks::rt_shape::rt_16x16>) label += "_[mfma_16x16x32]";
-    else static_assert(false, "Unknown shape");
-    if constexpr (NW > 1) {
-        label += "_["+std::to_string(NW)+"warps]";
-    }
-    return label;
-}
-template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int H, int W, int NW, kittens::ducks::rt_layout::all L> std::string generate_test_name(std::string test_id) {
-    std::string label = generate_test_name<H,W,NW>(test_id);
 
-    // layouts
-    if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
-    else label += "_[rt_col_layout]";
-
-    static_assert(RT_SHAPE::cols / ST_SHAPE::cols >= 1 , "RT_SHAPE::cols must be a positive factor of ST_SHAPE::cols");
-    static_assert(RT_SHAPE::rows / ST_SHAPE::rows >= 1 , "RT_SHAPE::rows must be a positive factor of ST_SHAPE::rows");
-
-    // shapes
-    if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x16, RT_SHAPE>) label += "_[rt_16x16]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32, RT_SHAPE>) label += "_[rt_32x32]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32_8, RT_SHAPE>) label += "_[rt_32x32_8]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32, RT_SHAPE>) label += "_[rt_16x32]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16, RT_SHAPE>) label += "_[rt_32x16]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16_4, RT_SHAPE>) label += "_[rt_32x16_4]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32_4, RT_SHAPE>) label += "_[rt_16x32_4]";
-    else static_assert(false, "Unknown shape");
-    return label;
-}
 template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int H, int W, int NW> std::string generate_test_name(std::string test_id) {
     std::string label = generate_test_name<H,W,NW>(test_id);
 
     static_assert(RT_SHAPE::cols / ST_SHAPE::cols >= 1 , "RT_SHAPE::cols must be a positive factor of ST_SHAPE::cols");
     static_assert(RT_SHAPE::rows / ST_SHAPE::rows >= 1 , "RT_SHAPE::rows must be a positive factor of ST_SHAPE::rows");
 
-    // shapes
+    // rt shapes
     if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x16, RT_SHAPE>) label += "_[rt_16x16]";
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32, RT_SHAPE>) label += "_[rt_32x32]";
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32_8, RT_SHAPE>) label += "_[rt_32x32_8]";
@@ -175,35 +110,31 @@ template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all S
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16_4, RT_SHAPE>) label += "_[rt_32x16_4]";
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32_4, RT_SHAPE>) label += "_[rt_16x32_4]";
     else static_assert(false, "Unknown shape");
+
+    // st shapes
+    if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_16x16, ST_SHAPE>) label += "_[st_16x16]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_16x16_swizzled, ST_SHAPE>) label += "_[st_16x16_swizzled]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_32x32, ST_SHAPE>) label += "_[st_32x32]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_16x32, ST_SHAPE>) label += "_[st_16x32]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_32x16, ST_SHAPE>) label += "_[st_32x16]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_8x32, ST_SHAPE>) label += "_[st_8x32]";
+    else if constexpr (std::is_same_v<typename kittens::ducks::st_shape::st_16x128, ST_SHAPE>) label += "_[st_16x128]";
+    else static_assert(false, "Unknown shape");
     return label;
 }
-template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int H, int W, int NW, kittens::ducks::rt_layout::all L1, kittens::ducks::rt_layout::all L2> std::string generate_test_name(std::string test_id) {
-    std::string label = generate_test_name<H,W,NW>(test_id);
+
+template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int H, int W, int NW, kittens::ducks::rt_layout::all L> std::string generate_test_name(std::string test_id) {
+    std::string label = generate_test_name<RT_SHAPE,ST_SHAPE,H,W,NW>(test_id);
 
     // layouts
-    if constexpr (std::is_same_v<L1, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
-    else label += "_[rt_col_layout]";
-    if constexpr (std::is_same_v<L2, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
+    if constexpr (std::is_same_v<L, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
     else label += "_[rt_col_layout]";
 
-    static_assert(RT_SHAPE::cols / ST_SHAPE::cols >= 1 , "RT_SHAPE::cols must be a positive factor of ST_SHAPE::cols");
-    static_assert(RT_SHAPE::rows / ST_SHAPE::rows >= 1 , "RT_SHAPE::rows must be a positive factor of ST_SHAPE::rows");
-
-    // shapes
-    if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x16, RT_SHAPE>) label += "_[rt_16x16]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32, RT_SHAPE>) label += "_[rt_32x32]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x32_8, RT_SHAPE>) label += "_[rt_32x32_8]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32, RT_SHAPE>) label += "_[rt_16x32]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16, RT_SHAPE>) label += "_[rt_32x16]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16_4, RT_SHAPE>) label += "_[rt_32x16_4]";
-    else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32_4, RT_SHAPE>) label += "_[rt_16x32_4]";
-    else static_assert(false, "Unknown shape");
     return label;
 }
+
 template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int H, int W, int NW, kittens::ducks::rt_layout::all L1, kittens::ducks::rt_shape::all RT_SHAPE2, kittens::ducks::rt_layout::all L2> std::string generate_test_name(std::string test_id) {
     std::string label = generate_test_name<RT_SHAPE,ST_SHAPE,H,W,NW,L1>(test_id);
-    if constexpr (std::is_same_v<L2, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
-    else label += "_[rt_col_layout]";
 
     // shapes
     if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x16, RT_SHAPE2>) label += "_[rt_16x16]";
@@ -214,8 +145,13 @@ template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all S
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16_4, RT_SHAPE2>) label += "_[rt_32x16_4]";
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32_4, RT_SHAPE2>) label += "_[rt_16x32_4]";
     else static_assert(false, "Unknown shape");
+
+    if constexpr (std::is_same_v<L2, kittens::ducks::rt_layout::row>) label += "_[rt_row_layout]";
+    else label += "_[rt_col_layout]";
+
     return label;
 }
+template <typename T> concept integral_wrapper = std::is_integral_v<decltype(T::value)>;
 template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int H, int W, int NW, integral_wrapper _ST_H> std::string generate_test_name(std::string test_id) {
     constexpr int ST_H = _ST_H::value;
     std::string label = test_id+"_["+std::to_string(H)+"x"+std::to_string(W)+"_"+std::to_string(ST_H)+"x"+std::to_string(W)+"]";
@@ -226,13 +162,6 @@ template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all S
 }
 template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all ST_SHAPE, int H, int W, int NW, kittens::ducks::base_types::T1 T2, kittens::ducks::base_types::T1 U2> std::string generate_test_name(std::string test_id) {
     std::string label = generate_test_name<H,W,NW>(test_id);
-    if constexpr (std::is_same_v<U2, float>) label += "_[float->";
-    else if constexpr (std::is_same_v<U2, kittens::bf16>) label += "_[bf16->";
-    else label += "_[half->";
-    if constexpr (std::is_same_v<T2, float>) label += "float]";
-    else if constexpr (std::is_same_v<T2, kittens::bf16>) label += "bf16]";
-    else label += "half]";
-    return label;
 
     static_assert(RT_SHAPE::cols / ST_SHAPE::cols >= 1 , "RT_SHAPE::cols must be a positive factor of ST_SHAPE::cols");
     static_assert(RT_SHAPE::rows / ST_SHAPE::rows >= 1 , "RT_SHAPE::rows must be a positive factor of ST_SHAPE::rows");
@@ -246,6 +175,9 @@ template<kittens::ducks::rt_shape::all RT_SHAPE, kittens::ducks::st_shape::all S
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_32x16_4, RT_SHAPE>) label += "_[rt_32x16_4]";
     else if constexpr (std::is_same_v<typename kittens::ducks::rt_shape::rt_16x32_4, RT_SHAPE>) label += "_[rt_16x32_4]";
     else static_assert(false, "Unknown shape");
+
+    // copy
+    label += generate_copy_name<T2, U2>();
     return label;
 }
 
@@ -329,8 +261,8 @@ template<typename test, typename RT_SHAPE, typename ST_SHAPE, int MAX_S=8, int N
 template<template<typename> typename test, typename RT_SHAPE, typename ST_SHAPE, int MAX_S=8, int NUM_WORKERS=1, typename... args>
 struct sweep_gmem_type_1d {
     static void run(test_data &results) {
-        // sweep_size_1d<test<float>, RT_SHAPE, ST_SHAPE, MAX_S, NUM_WORKERS, args...>::run(results);
-        // sweep_size_1d<test<kittens::bf16>, RT_SHAPE, ST_SHAPE, MAX_S, NUM_WORKERS, args...>::run(results);
+        sweep_size_1d<test<float>, RT_SHAPE, ST_SHAPE, MAX_S, NUM_WORKERS, args...>::run(results);
+        sweep_size_1d<test<kittens::bf16>, RT_SHAPE, ST_SHAPE, MAX_S, NUM_WORKERS, args...>::run(results);
         sweep_size_1d<test<kittens::half>, RT_SHAPE, ST_SHAPE, MAX_S, NUM_WORKERS, args...>::run(results);
     }
 };
@@ -339,7 +271,7 @@ template<template<typename> typename test, typename RT_SHAPE, typename ST_SHAPE,
 // ----- 2D Wrappers -----
 
 template<typename Ker, typename RT_SHAPE, typename ST_SHAPE, typename dtype, int H, int W, int NW, typename G, typename... args>
-static __global__ __launch_bounds__(NW*kittens::WARP_THREADS, 1) void global_wrapper_2d(const G input, const G output) {
+static __global__ void global_wrapper_2d(const G input, const G output) {
     Ker::template device_func<RT_SHAPE, ST_SHAPE, dtype, H, W, NW, G, args...>(input, output);
 }
 template<typename test, typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NUM_WORKERS=1, typename... args>

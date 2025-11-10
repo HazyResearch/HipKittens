@@ -56,7 +56,7 @@ __device__ inline static void load(RV &dst, const GL &src, const COORD &idx) {
         for(auto w = 0; w < RV::outer_dim; w++) {
             int idx = w * RV::reductions + (laneid % RV::reductions);
             // this should be a maximally coalesced load.
-            dst[w][0] = base_types::convertor<U, T>::convert(src_ptr[idx]);
+            dst[w][0] = base_types::convertor<T, U>::convert(src_ptr[idx]);
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, naive_l>) {
