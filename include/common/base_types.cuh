@@ -241,12 +241,12 @@ template<> struct packing<int4> {
     static __host__ __device__ inline constexpr int num() { return 4; }
 };
 template<> struct packing<fp8e4m3> {
-    static __device__ inline constexpr int num() { return 1; }
+    static __host__ __device__ inline constexpr int num() { return 1; }
     using unpacked_type = fp8e4m3;
     using packed_type = fp8e4m3_4;
 };
 template<> struct packing<fp8e4m3_4> {
-    static __device__ inline constexpr int num() { return 4; }
+    static __host__ __device__ inline constexpr int num() { return 4; }
     using unpacked_type = fp8e4m3;
     using packed_type = fp8e4m3_4;
 };
