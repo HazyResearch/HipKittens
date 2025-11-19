@@ -21,10 +21,6 @@ using _gl_C = gl<bf16, -1, -1, -1, -1>;
 
 using G = kittens::group<NUM_WARPS>;
 
-__host__ __device__ inline int ceil_div(int a, int b) {
-  return (a + b - 1) / b;
-}
-
 struct micro_globals {
     _gl_A a;
     _gl_B b;
