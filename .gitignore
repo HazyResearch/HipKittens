@@ -27,3 +27,6 @@ utils/__pycache__/
 *amdhsa.hipfb
 *amd-amdhsa-gfx950.hipi
 *amd-amdhsa-gfx950.bc
+
+
+!CMakeLists.txt
