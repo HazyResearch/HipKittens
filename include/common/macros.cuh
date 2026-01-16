@@ -655,9 +655,8 @@ struct exp2 {
 }; 
 
 struct zero {
-  template<int GPR0, int GPR1>
+  template<int GPR0>
   static __device__ inline void op() {
-    static_assert(GPR0 == GPR1, "GPR0 and GPR1 must be the same");
     if constexpr (GPR0 < 256) {
       asm volatile("v_mov_b32 v[%0], 0"
         : 
