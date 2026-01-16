@@ -95,13 +95,13 @@ We assume you will run the following on an MI350X or MI355X unless otherwise spe
 ```bash
 # Defaults to 8192x8192x8192
 # This will compare to AITER and PyTorch automatically.
-cd kernels/gemm/bf16fp32/
+cd kernels/gemm/bf16/
 make clean && make
 python bench.py
 
 # On the mi300x or mi325x run:
 git checkout cdna3 # not the main branch!
-cd kernels/gemm/bf16fp32/mi325x/8192_256_256_64_16/
+cd kernels/gemm/bf16/mi325x/8192_256_256_64_16/
 make clean && make
 python test_python.py
 ```
