@@ -13,7 +13,6 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
-#include <hip/hip_fp8.h>
 #include <hip/hip_runtime.h>
 #include <string>
 #include <bit>

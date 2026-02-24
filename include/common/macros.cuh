@@ -959,6 +959,12 @@ struct mul {
     }
   }
 
+  template<int GPR0, int GPR1> 
+  static __device__ inline void op_pk2(const float &param) {
+    op<GPR0, GPR1>(param);
+    op<GPR0 + 1, GPR1 + 1>(param);
+  }
+
   template<int GPR0, int GPR1, int GPR2>
   static __device__ inline void op() {
     if constexpr (GPR0 < 256 && GPR1 < 256 && GPR2 < 256) {
@@ -969,7 +975,43 @@ struct mul {
       static_assert(false, "Invalid operand for instruction: v_mul_f32_e32");
     }
   }
+
+  template<int GPR0, int GPR1, int GPR2>
+  static __device__ inline void op_pk2() {
+    if constexpr (GPR0 < (256 - 1) && GPR1 < (256 - 1) && GPR2 < (256 - 1)) {
+      asm volatile("v_pk_mul_f32 v[%0:%1], v[%4:%5], v[%2:%3]"
+        : 
+        : "n"(GPR0), "n"(GPR0 + 1), "n"(GPR1), "n"(GPR1 + 1), "n"(GPR2), "n"(GPR2 + 1));
+    } else {
+      static_assert(false, "Invalid operand for instruction: v_pk_mul_f32");
+    }
+  }
 }; 
+
+struct mul_vgpr {
+  template<int GPR0, int GPR1> 
+  static __device__ inline void op(const float &param) {
+    if constexpr (GPR0 < 256 && GPR1 < 256) {
+      asm volatile("v_mul_f32_e32 v[%0], %2, v[%1]"
+        : 
+        : "n"(GPR0), "n"(GPR1), "v"(param));
+    } else {
+      static_assert(false, "Invalid operand for instruction: v_mul_f32_e32");
+    }
+  }
+
+  template<int GPR0, int GPR1> 
+  static __device__ inline void op_pk2(const float &param) {
+    if constexpr (GPR0 < (256 - 1) && GPR1 < (256 - 1)) {
+      const float2 param2 = {param, param};
+      asm volatile("v_pk_mul_f32 v[%0:%1], %4, v[%2:%3]"
+        : 
+        : "n"(GPR0), "n"(GPR0 + 1), "n"(GPR1), "n"(GPR1 + 1), "v"(param2));
+    } else {
+      static_assert(false, "Invalid operand for instruction: v_pk_mul_f32");
+    }
+  }
+};
 
 struct exp2 {
   template<int GPR0, int GPR1> 

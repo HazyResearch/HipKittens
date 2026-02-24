@@ -111,6 +111,15 @@ __device__ void llvm_amdgcn_raw_buffer_store_b64(uint64_t vdata, i32x4 srsrc, ui
 __device__ void llvm_amdgcn_raw_buffer_store_b128(__uint128_t vdata, i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
     __asm("llvm.amdgcn.raw.buffer.store.i128");
 
+__device__ int32_t llvm_amdgcn_raw_buffer_load_i32(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t glc_slc)
+    __asm("llvm.amdgcn.raw.buffer.load.i32");
+
+__device__ int2 llvm_amdgcn_raw_buffer_load_i32x2(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t glc_slc)
+    __asm("llvm.amdgcn.raw.buffer.load.v2i32");
+
+__device__ int4 llvm_amdgcn_raw_buffer_load_i32x4(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t glc_slc)
+    __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+
 using as3_uint32_ptr = uint32_t __attribute__((address_space(3)))*;
 using int32x4_t = int32_t __attribute__((ext_vector_type(4)));
 
