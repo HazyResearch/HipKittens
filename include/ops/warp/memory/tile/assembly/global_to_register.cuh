@@ -56,21 +56,61 @@
          constexpr int offset_in_bytes = (elem_offset + col) * sizeof(U);
          constexpr int start_gpr = tile_range::lo + register_offset;
 
-         if constexpr (stride_in_bytes == (sizeof(int32_t) * 4))
-         {
-             macros::buffer_load_dwordx4<start_gpr>(br, thr_offset + k_row_offset, 0, offset_in_bytes);
+         if constexpr ((offset_in_bytes + k_row_offset) <= macros::max_mubuf_inst_offset()) {
+            if constexpr (stride_in_bytes == (sizeof(int32_t) * 4)) {
+                macros::buffer_load_dwordx4<start_gpr>(br, thr_offset, 0, offset_in_bytes + k_row_offset);
+            }
+            else if constexpr (stride_in_bytes == (sizeof(int32_t) * 2)) {
+                macros::buffer_load_dwordx2<start_gpr>(br, thr_offset, 0, offset_in_bytes + k_row_offset);
+            }
+            else if constexpr (stride_in_bytes == sizeof(int32_t)) {
+                macros::buffer_load_dword<start_gpr>(br, thr_offset, 0, offset_in_bytes + k_row_offset);
+            }
+            else {
+                static_assert(false, "Encounter unsupported format in ops/warp/memory/tile/assembly/global_to_register.cuh\n");
+            }
          }
-         else if constexpr (stride_in_bytes == (sizeof(int32_t) * 2))
-         {
-             macros::buffer_load_dwordx2<start_gpr>(br, thr_offset + k_row_offset, 0, offset_in_bytes);
+         else if constexpr (offset_in_bytes <= macros::max_mubuf_inst_offset()) {
+            if constexpr (stride_in_bytes == (sizeof(int32_t) * 4)) {
+                macros::buffer_load_dwordx4<start_gpr>(br, thr_offset + k_row_offset, 0, offset_in_bytes);
+            }
+            else if constexpr (stride_in_bytes == (sizeof(int32_t) * 2)) {
+                macros::buffer_load_dwordx2<start_gpr>(br, thr_offset + k_row_offset, 0, offset_in_bytes);
+            }
+            else if constexpr (stride_in_bytes == sizeof(int32_t)) {
+                macros::buffer_load_dword<start_gpr>(br, thr_offset + k_row_offset, 0, offset_in_bytes);
+            }
+            else {
+                static_assert(false, "Encounter unsupported format in ops/warp/memory/tile/assembly/global_to_register.cuh\n");
+            }
          }
-         else if constexpr (stride_in_bytes == sizeof(int32_t))
-         {
-             macros::buffer_load_dword<start_gpr>(br, thr_offset + k_row_offset, 0, offset_in_bytes);
+         else if constexpr (k_row_offset <= macros::max_mubuf_inst_offset()) {
+            if constexpr (stride_in_bytes == (sizeof(int32_t) * 4)) {
+                macros::buffer_load_dwordx4<start_gpr>(br, thr_offset + offset_in_bytes, 0, k_row_offset);
+            }
+            else if constexpr (stride_in_bytes == (sizeof(int32_t) * 2)) {
+                macros::buffer_load_dwordx2<start_gpr>(br, thr_offset + offset_in_bytes, 0, k_row_offset);
+            }
+            else if constexpr (stride_in_bytes == sizeof(int32_t)) {
+                macros::buffer_load_dword<start_gpr>(br, thr_offset + offset_in_bytes, 0, k_row_offset);
+            }
+            else {
+                static_assert(false, "Encounter unsupported format in ops/warp/memory/tile/assembly/global_to_register.cuh\n");
+            }
          }
-         else
-         {
-            static_assert(false, "Encounter unsupported format in ops/warp/memory/tile/assembly/global_to_register.cuh\n");
+         else {
+            if constexpr (stride_in_bytes == (sizeof(int32_t) * 4)) {
+                macros::buffer_load_dwordx4<start_gpr>(br, thr_offset + offset_in_bytes + k_row_offset, 0, 0);
+            }
+            else if constexpr (stride_in_bytes == (sizeof(int32_t) * 2)) {
+                macros::buffer_load_dwordx2<start_gpr>(br, thr_offset + offset_in_bytes + k_row_offset, 0, 0);
+            }
+            else if constexpr (stride_in_bytes == sizeof(int32_t)) {
+                macros::buffer_load_dword<start_gpr>(br, thr_offset + offset_in_bytes + k_row_offset, 0, 0);
+            }
+            else {
+                static_assert(false, "Encounter unsupported format in ops/warp/memory/tile/assembly/global_to_register.cuh\n");
+            }
          }
      };
  

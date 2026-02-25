@@ -158,6 +158,28 @@ __device__ __forceinline__ void clobber_gpr() {
 #undef CLOBBER_AREG_CASE
 #undef CLOBBER_VREG_CASE
 
+__device__ __forceinline__ constexpr uint32_t max_ds_inst_offset()
+{
+  // DS ops contain 2 8-bits instruction offset.
+  // For non-pk2 instructions like ds_read_b32, the 2 fields are regarded as 1.
+  // For pk2 instructions like ds_read2_b32, max offset is limited by 8 bits.
+  return (1u << 16) - 1;
+}
+
+__device__ __forceinline__ constexpr uint32_t max_ds_pk2_inst_offset()
+{
+  // DS ops contain 2 8-bits instruction offset.
+  // For non-pk2 instructions like ds_read_b32, the 2 fields are regarded as a whole.
+  // For pk2 instructions like ds_read2_b32, max offset is limited by 8 bits.
+  return (1u << 8) - 1;
+}
+
+__device__ __forceinline__ constexpr uint32_t max_mubuf_inst_offset()
+{
+  // MUBUF ops contain 1 12-bits instruction offset.
+  return (1u << 12) - 1;
+}
+
 template<int GPR_START>
 __device__ __forceinline__ void ds_read_b32(const uint32_t smem_ptr, const int i_offset) {
   // AGPRS
@@ -197,7 +219,6 @@ __device__ __forceinline__ T ds_read_b64(const uint32_t smem_ptr, const int i_of
 
 template<int GPR_START>
 __device__ __forceinline__ void ds_read_b64(const uint32_t smem_ptr, const int i_offset) {
-
   constexpr int GPR_END = GPR_START + 1;
   // AGPRS
   if constexpr (GPR_START >= 256) {
@@ -217,7 +238,6 @@ __device__ __forceinline__ void ds_read_b64(const uint32_t smem_ptr, const int i
 template<int GPR_START>
 __device__ __forceinline__ void ds_read_b64_tr_b16(const uint32_t smem_ptr, const int i_offset) {
   constexpr int GPR_END = GPR_START + 1;
-
   if constexpr (GPR_START >= 256) {
     asm volatile("ds_read_b64_tr_b16 a[%0:%1], %2 offset:%3"
       :
@@ -244,7 +264,6 @@ __device__ __forceinline__ T ds_read_b128(const uint32_t smem_ptr, const int i_o
 
 template<int GPR_START>
 __device__ __forceinline__ void ds_read_b128(const uint32_t smem_ptr, const int i_offset) {
-
   constexpr int GPR_END = GPR_START + 3;
   // AGPRS
   if constexpr (GPR_START >= 256) {
@@ -277,8 +296,7 @@ __device__ __forceinline__ void ds_write_b32(const uint32_t smem_ptr, const int 
 }
 
 template <typename T>
-__device__ __forceinline__ void ds_write_b32(const T& val, const uint32_t smem_ptr, const int i_offset = 0)
-{
+__device__ __forceinline__ void ds_write_b32(const T& val, const uint32_t smem_ptr, const int i_offset = 0) {
   static_assert(sizeof(T) == sizeof(uint32_t));
   asm volatile("ds_write_b32 %0, %1 offset:%2"
     :
@@ -302,8 +320,7 @@ __device__ __forceinline__ void ds_write_b64(const uint32_t smem_ptr, const int 
 }
 
 template <typename T>
-__device__ __forceinline__ void ds_write_b64(const T& val, const uint32_t smem_ptr, const int i_offset = 0)
-{
+__device__ __forceinline__ void ds_write_b64(const T& val, const uint32_t smem_ptr, const int i_offset = 0) {
   static_assert(sizeof(T) == 2 * sizeof(uint32_t));
   asm volatile("ds_write_b64 %0, %1 offset:%2"
     :
@@ -418,7 +435,6 @@ __device__ __forceinline__ T buffer_load_dwordx4(
 
 template<int GPR>
 __device__ __forceinline__ void buffer_store_dword(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
-
   // AGPRS
   if constexpr (GPR >= 256) {
     asm volatile("buffer_store_dword a[%0], %1, %2, %3 offen offset:%4"
@@ -446,7 +462,6 @@ __device__ __forceinline__ void buffer_store_dword(
 
 template<int GPR_START>
 __device__ __forceinline__ void buffer_store_dwordx2(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
-
   // AGPRS
   if constexpr (GPR_START >= 256) {
     asm volatile("buffer_store_dwordx2 a[%0:%1], %2, %3, %4 offen offset:%5"
@@ -474,7 +489,6 @@ __device__ __forceinline__ void buffer_store_dwordx2(
 
 template<int GPR_START>
 __device__ __forceinline__ void buffer_store_dwordx4(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
-
   // AGPRS
   if constexpr (GPR_START >= 256) {
     asm volatile("buffer_store_dwordx4 a[%0:%1], %2, %3, %4 offen offset:%5"
@@ -943,8 +957,9 @@ __device__ __forceinline__ void v_cndmask_b32_e64(uint64_t mask) {
     : 
     : "n"(GPR0), "n"(GPR1), "n"(GPR2), "s"(mask));
 }
+
 /**
- * @brief Multiplication operation on explicit registers.
+ * @brief Multiplication operation on explicit registers and immediate operand.
  */
 struct mul {
   template<int GPR0, int GPR1> 
@@ -988,7 +1003,7 @@ struct mul {
   }
 }; 
 
-struct mul_vgpr {
+ struct mul_vgpr {
   template<int GPR0, int GPR1> 
   static __device__ inline void op(const float &param) {
     if constexpr (GPR0 < 256 && GPR1 < 256) {
