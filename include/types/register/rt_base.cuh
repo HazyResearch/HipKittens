@@ -52,12 +52,12 @@ template<typename _T, ducks::rt_layout::all _layout> struct rt_base {
     using dtype = T2; ///< Data type of the matrix elements
 
     static_assert(
-        std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2>,
+        std::is_same_v<dtype, bf16_2> || std::is_same_v<dtype, float2> || std::is_same_v<dtype, half_2> || std::is_same_v<dtype, fp8e4m3_4>,
         "rt_base was provided an unsupported type."
     );
 
-    static constexpr int tile_size_row        = kittens::TILE_ROW_DIM<T>;
-    static constexpr int tile_size_col        = kittens::TILE_COL_DIM<T>;
+    static constexpr int tile_size_row        = kittens::TILE_ROW_DIM<T, layout>;
+    static constexpr int tile_size_col        = kittens::TILE_COL_DIM<T, layout>;
     static constexpr int rows                 = tile_size_row; ///< Number of rows.
     static constexpr int cols                 = tile_size_col; ///< Number of cols.
     static constexpr int num_elements         = rows*cols;
