@@ -34,6 +34,8 @@ template<typename _T, int b, int d, int r, int c, typename... TMA_Types>
 struct gl {
     using identifier = ducks::gl::identifier;
 
+    static_assert(!std::is_same_v<_T, fp4e2m1>, "For FP4 types, you must use a packed type (fp4e2m1_2 or fp4e2m1_4).");
+
     using T     = base_types::packing<_T>::unpacked_type;
     using T2    = base_types::packing<_T>::packed_type;
     using dtype = T;

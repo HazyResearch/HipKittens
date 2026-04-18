@@ -49,6 +49,7 @@ struct st_subtile;
 template<typename _T, int _rows, int _cols, ducks::st_shape::all _shape>
 struct KITTENS_DEFAULT_ALIGN st {
     using identifier = ducks::st::identifier; ///< Type identifier for shared memory tile.
+    static_assert(!std::is_same_v<_T, fp4e2m1>, "For FP4 types, you must use a packed type (fp4e2m1_2 or fp4e2m1_4).");
     using T = base_types::packing<_T>::unpacked_type;
     using T2 = base_types::packing<_T>::packed_type;
     using dtype = T; ///< Data type of the elements in the tile.
@@ -76,7 +77,7 @@ struct KITTENS_DEFAULT_ALIGN st {
     static constexpr int subtiles_per_row    = cols / underlying_subtile_cols;
     static constexpr int subtiles_per_col    = rows / underlying_subtile_rows;
 
-    static_assert(base_types::packing<dtype>::num() == 1); // must be a 1-packed type (e.g. float, bf16, etc)
+    static_assert(base_types::packing<dtype>::num() == 1 || std::is_same_v<dtype, fp4e2m1_2>); // must be a 1-packed type (e.g. float, bf16, etc) -- fp4e2m1_2 is allowed as the canonical sub-byte tile dtype
 
     dtype data[rows*cols]; ///< Raw data storage for the tile.
 
