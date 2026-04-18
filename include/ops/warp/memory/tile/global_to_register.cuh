@@ -27,7 +27,8 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     using U = typename GL::dtype;
     using U2 = base_types::packing<U>::packed_type;
 
-    static_assert(!std::is_same_v<typename kittens::base_types::packing<typename RT::dtype>::unpacked_type, fp8e4m3>, "Unsupported type for load");
+    using unpacked = typename kittens::base_types::packing<typename RT::dtype>::unpacked_type;
+    static_assert(!std::is_same_v<unpacked, fp8e4m3> && !std::is_same_v<unpacked, fp4e2m1_2>, "Unsupported type for load");
 
     U *src_ptr = (U*)&src[(idx.template unit_coord<axis, 3>())];
     const int row_stride = src.template stride<axis>();
@@ -136,7 +137,7 @@ __device__ inline static void load(RT &dst, const GL &src, const COORD &idx) {
     using T2 = base_types::packing<typename RT::dtype>::packed_type;
     using U = typename GL::dtype;
 
-    static_assert(!std::is_same_v<T, fp8e4m3>, "Unsupported type for load/store");
+    static_assert(!std::is_same_v<T, fp8e4m3> && !std::is_same_v<T, fp4e2m1_2>, "Unsupported type for load/store");
 
     constexpr int packing = base_types::packing<typename RT::dtype>::num();
     
@@ -301,7 +302,7 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
     using U = typename GL::dtype;
     constexpr int packing = base_types::packing<typename RT::dtype>::num();
 
-    static_assert(!std::is_same_v<T, fp8e4m3>, "Unsupported type for load/store");
+    static_assert(!std::is_same_v<T, fp8e4m3> && !std::is_same_v<T, fp4e2m1_2>, "Unsupported type for load/store");
 
     U *dst_ptr = (U*)&dst[(idx.template unit_coord<axis, 3>())];
     const int row_stride = dst.template stride<axis>();

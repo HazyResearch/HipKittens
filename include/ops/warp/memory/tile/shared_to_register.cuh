@@ -38,6 +38,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
     constexpr int packing = base_types::packing<typename RT::dtype>::num();
 
     static_assert(std::is_same_v<T, U>, "register and shared tile must have the same dtype");
+    static_assert(!std::is_same_v<T, fp4e2m1>, "fp4e2m1 scalar is not supported as a tile dtype; use fp4e2m1_2");
 
     const int laneid = kittens::laneid();
 
@@ -95,6 +96,17 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                     static_assert(false, "Unsupported stride");
                                 }
                             } else if constexpr (std::is_same_v<U2, fp8e4m3_4>) {
+                                if constexpr (RT::base_tile_stride == 16) {
+                                    asm volatile(
+                                        "ds_read_b128 %0, %1 offset:%2\n"
+                                        : "=v"(*reinterpret_cast<float4*>(&dst.tiles[register_row][register_col].data[idx]))
+                                        : "v"(addr), "i"(offset)
+                                        : "memory"
+                                    );
+                                } else {
+                                    static_assert(false, "Unsupported stride");
+                                }
+                            } else if constexpr (std::is_same_v<U2, fp4e2m1_4>) {
                                 if constexpr (RT::base_tile_stride == 16) {
                                     asm volatile(
                                         "ds_read_b128 %0, %1 offset:%2\n"
@@ -175,6 +187,13 @@ __device__ inline static void load(RT &dst, const ST &src) {
                             static_assert(false, "Unsupported stride");
                         }
                     } else if constexpr (std::is_same_v<U2, fp8e4m3_4> && RT::base_tile_stride == 16) {
+                        asm volatile(
+                            "ds_read_b128 %0, %1 offset:%2\n"
+                            : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][j].data[idx]))
+                            : "v"(addr), "i"(offset)
+                            : "memory"
+                        );
+                    } else if constexpr (std::is_same_v<U2, fp4e2m1_4> && RT::base_tile_stride == 16) {
                         asm volatile(
                             "ds_read_b128 %0, %1 offset:%2\n"
                             : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][j].data[idx]))
@@ -434,7 +453,7 @@ __device__ inline static void store(ST &dst, const RT &src) {
     using U2 = base_types::packing<U >::packed_type;
     constexpr int packing = base_types::packing<typename RT::dtype>::num();
 
-    static_assert(!std::is_same_v<T, fp8e4m3> && !std::is_same_v<U, fp8e4m3>, "Unsupported type for store");
+    static_assert(!std::is_same_v<T, fp8e4m3> && !std::is_same_v<U, fp8e4m3> && !std::is_same_v<T, fp4e2m1_2> && !std::is_same_v<U, fp4e2m1_2>, "Unsupported type for store");
 
     const int laneid = kittens::laneid();
 
@@ -584,7 +603,7 @@ __device__ inline static void store(ST &dst, const RT &src) {
     using U2 = base_types::packing<U >::packed_type;
     constexpr int packing = base_types::packing<typename RT::dtype>::num();
 
-    static_assert(!std::is_same_v<T, fp8e4m3> && !std::is_same_v<U, fp8e4m3>, "Unsupported type for store");
+    static_assert(!std::is_same_v<T, fp8e4m3> && !std::is_same_v<U, fp8e4m3> && !std::is_same_v<T, fp4e2m1_2> && !std::is_same_v<U, fp4e2m1_2>, "Unsupported type for store");
 
     const int laneid = kittens::laneid();
 
