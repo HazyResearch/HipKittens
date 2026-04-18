@@ -7,6 +7,7 @@
 #include "global_to_register.cuh"
 #include "global_to_shared.cuh"
 #include "shared_to_register.cuh"
+#include "fp4_load.cuh"
 
 namespace warp {
 namespace memory {

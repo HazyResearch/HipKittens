@@ -13,6 +13,7 @@ struct st_load_store {
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "shared_loadstore_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "shared_loadstore_gmem=half" :
                                                       std::is_same_v<T, kittens::fp8e4m3> ? "shared_loadstore_gmem=fp8e4m3" :
+                                                      std::is_same_v<T, kittens::fp4e2m1_2> ? "shared_loadstore_gmem=fp4e2m1_2" :
                                                                                               "shared_loadstore_gmem=float";
     template<int H, int W, int NW, kittens::ducks::gl::all GL, typename axis> __host__ static void host_func(const std::vector<float> &i_ref, std::vector<float> &o_ref) {
         o_ref = i_ref; // overwrite the whole thing
@@ -61,6 +62,10 @@ void test_generator(test_data &results) {
     g2s_sweep_size_2d_warp<st_load_store<float>, RT_SHAPE, ST_SHAPE, SIZE, SIZE, I0_t>::run(results);
     g2s_sweep_size_2d_warp<st_load_store<float>, RT_SHAPE, ST_SHAPE, SIZE, SIZE, I1_t>::run(results);
     g2s_sweep_size_2d_warp<st_load_store<float>, RT_SHAPE, ST_SHAPE, SIZE, SIZE, I2_t>::run(results);
+
+    g2s_sweep_size_2d_warp<st_load_store<kittens::fp4e2m1_2>, RT_SHAPE, ST_SHAPE, SIZE, SIZE, I0_t>::run(results);
+    g2s_sweep_size_2d_warp<st_load_store<kittens::fp4e2m1_2>, RT_SHAPE, ST_SHAPE, SIZE, SIZE, I1_t>::run(results);
+    g2s_sweep_size_2d_warp<st_load_store<kittens::fp4e2m1_2>, RT_SHAPE, ST_SHAPE, SIZE, SIZE, I2_t>::run(results);
 }
 
 
