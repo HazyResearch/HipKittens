@@ -31,6 +31,19 @@ using bf16 = __hip_bfloat16;
  * @brief Half-precision floating-point type.
  */
 using half = __half;
+/**
+ * @brief 8-bit signed integer type.
+ *
+ * Defined as plain `char` (not `signed char`) so the C++ type system can
+ * distinguish it from other `signed char` typedefs already used in this header
+ * (notably `fp8e8m0` / `__amd_scale_t = int8_t = signed char`). On all
+ * supported HIP targets `char` is signed, so the arithmetic matches.
+ */
+using int8 = char;
+/**
+ * @brief 8-bit unsigned integer type.
+ */
+using uint8 = unsigned char;
 // /**
 //  * @brief Packed word of two bfloat16 floating-point values.
 //  */
@@ -39,6 +52,16 @@ using bf16_2 = __hip_bfloat162;
  * @brief Packed word of two half-precision floating-point values.
  */
 using half_2 = __half2;
+/**
+ * @brief Packed 8-bit signed integer types.
+ */
+using int8_2 = char2;
+using int8_4 = char4;
+/**
+ * @brief Packed 8-bit unsigned integer types.
+ */
+using uint8_2 = uchar2;
+using uint8_4 = uchar4;
 /**
  * @brief float8 floating-point type.
  */
@@ -86,10 +109,12 @@ namespace base_types {
 
 template<typename T>
 concept T2 = std::is_same_v<T, float2> || std::is_same_v<T, bf16_2> || std::is_same_v<T, half_2> || std::is_same_v<T, fp8e4m3_4>
-    || std::is_same_v<T, fp4e2m1_4>;
+    || std::is_same_v<T, fp4e2m1_4>
+    || std::is_same_v<T, int8_4>  || std::is_same_v<T, uint8_4> || std::is_same_v<T, int2>;
 template<typename T>
 concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3>
-    || std::is_same_v<T, fp4e2m1>;
+    || std::is_same_v<T, fp4e2m1>
+    || std::is_same_v<T, int8>    || std::is_same_v<T, uint8>   || std::is_same_v<T, int>;
 
 } // namespace base_types
 } // namespace ducks
@@ -198,6 +223,22 @@ template<> struct constants<int2> {
     static __device__ inline constexpr int2 zero()      { return int2{0, 0}; }
     static __device__ inline constexpr int2 ones()       { return int2{1, 1}; }
 };
+template<> struct constants<int8> {
+    static __device__ inline constexpr int8 zero()      { return int8{0}; }
+    static __device__ inline constexpr int8 ones()      { return int8{1}; }
+};
+template<> struct constants<uint8> {
+    static __device__ inline constexpr uint8 zero()     { return uint8{0}; }
+    static __device__ inline constexpr uint8 ones()     { return uint8{1}; }
+};
+template<> struct constants<int8_4> {
+    static __device__ inline constexpr int8_4 zero()    { return int8_4{0, 0, 0, 0}; }
+    static __device__ inline constexpr int8_4 ones()    { return int8_4{1, 1, 1, 1}; }
+};
+template<> struct constants<uint8_4> {
+    static __device__ inline constexpr uint8_4 zero()   { return uint8_4{0, 0, 0, 0}; }
+    static __device__ inline constexpr uint8_4 ones()   { return uint8_4{1, 1, 1, 1}; }
+};
 
 /**
  * @brief Provides information about packing of elements for a given type.
@@ -272,6 +313,30 @@ template<> struct packing<float4> {
 };
 template<> struct packing<int4> {
     static __host__ __device__ inline constexpr int num() { return 4; }
+};
+template<> struct packing<int8> {
+    static __host__ __device__ inline constexpr int num() { return 1; }
+    using unpacked_type = int8;
+    using packed_type = int8_4;
+    static __device__ inline constexpr int8_4 pack(const int8 &i) { return int8_4{i, i, i, i}; }
+};
+template<> struct packing<int8_4> {
+    static __host__ __device__ inline constexpr int num() { return 4; }
+    using unpacked_type = int8;
+    using packed_type = int8_4;
+    static __device__ inline constexpr int8_4 pack(const int8 &i) { return int8_4{i, i, i, i}; }
+};
+template<> struct packing<uint8> {
+    static __host__ __device__ inline constexpr int num() { return 1; }
+    using unpacked_type = uint8;
+    using packed_type = uint8_4;
+    static __device__ inline constexpr uint8_4 pack(const uint8 &i) { return uint8_4{i, i, i, i}; }
+};
+template<> struct packing<uint8_4> {
+    static __host__ __device__ inline constexpr int num() { return 4; }
+    using unpacked_type = uint8;
+    using packed_type = uint8_4;
+    static __device__ inline constexpr uint8_4 pack(const uint8 &i) { return uint8_4{i, i, i, i}; }
 };
 template<> struct packing<fp8e4m3> {
     static __host__ __device__ inline constexpr int num() { return 1; }

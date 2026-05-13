@@ -124,6 +124,21 @@ __device__ static inline void mfma1616128(      float2 (&D)[2],
     )};
 }
 
+// CDNA4 INT8 MFMA: 16x16x64, signed int8 inputs, int32 accumulator.
+// Per lane: A,B = 16 int8 (= 4 int8_4 = v4i32); C,D = 4 int32 (= 2 int2 = v4i32).
+__device__ static inline void mfma161664(      int2    (&D)[2],
+                                         const int8_4 (&A)[4],
+                                         const int8_4 (&B)[4],
+                                         const int2   (&C)[2]) {
+    typedef __attribute__((__vector_size__(4 * sizeof(int)))) int intx4_t;
+    *(intx4_t*)D = __builtin_amdgcn_mfma_i32_16x16x64_i8(
+        *(intx4_t*)A,
+        *(intx4_t*)B,
+        *(intx4_t*)C,
+        0, 0, 0
+    );
+}
+
 template<int opsel_a, int opsel_b, int cbsz = 0, int blgp = 0>
 __device__ static inline void mfma1616128_scaled(      float2 (&D)[2],
                                          const fp8e4m3_4 (&A)[8],
@@ -238,6 +253,32 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col,
                   B_rows == 32 && B_cols == 64 &&
                   std::is_same_v<C_shape, typename ducks::rt_shape::rt_32x32>) {
         mfma323264(d.data, a.data, b.data, c.data);
+    } else {
+        static_assert(false, "Unsupported shape combination");
+    }
+}
+
+// INT8 mma_ABt_base: D, C = int (col layout); A, B = int8 (row layout).
+template<ducks::rt_shape::all D_shape, ducks::rt_shape::all A_shape, ducks::rt_shape::all B_shape, ducks::rt_shape::all C_shape, typename MM_Operand_T=int8>
+__device__ static inline void mma_ABt_base(rt_base<int, ducks::rt_layout::col, D_shape> &d,
+    const rt_base<MM_Operand_T, ducks::rt_layout::row, A_shape> &a,
+    const rt_base<MM_Operand_T, ducks::rt_layout::row, B_shape> &b,
+    const rt_base<int, ducks::rt_layout::col, C_shape> &c) {
+
+    static_assert(std::is_same_v<MM_Operand_T, int8>,
+                  "INT8 mma_ABt_base only supports signed int8 operands on CDNA4");
+    static_assert(std::is_same_v<D_shape, C_shape>, "D and C must have the same shape");
+
+    constexpr int A_rows = A_shape::rows;
+    constexpr int A_cols = A_shape::cols;
+    constexpr int B_rows = B_shape::rows;
+    constexpr int B_cols = B_shape::cols;
+
+    if constexpr (std::is_same_v<D_shape, typename ducks::rt_shape::rt_16x16> &&
+                  A_rows == 16 && A_cols == 64 &&
+                  B_rows == 16 && B_cols == 64 &&
+                  std::is_same_v<C_shape, typename ducks::rt_shape::rt_16x16>) {
+        mfma161664(d.data, a.data, b.data, c.data);
     } else {
         static_assert(false, "Unsupported shape combination");
     }
@@ -457,7 +498,9 @@ __device__ static inline void mma_ABt(D &d,
         (std::is_same_v<typename D::T, half> && std::is_same_v<typename A::T, half> &&
             std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, half>) ||
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, fp8e4m3> &&
-            std::is_same_v<typename B::T, fp8e4m3> && std::is_same_v<typename C::T, float>)
+            std::is_same_v<typename B::T, fp8e4m3> && std::is_same_v<typename C::T, float>) ||
+        (std::is_same_v<typename D::T, int> && std::is_same_v<typename A::T, int8> &&
+            std::is_same_v<typename B::T, int8> && std::is_same_v<typename C::T, int>)
     );
 
     #pragma unroll

@@ -94,7 +94,9 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                 } else {
                                     static_assert(false, "Unsupported stride");
                                 }
-                            } else if constexpr (std::is_same_v<U2, fp8e4m3_4>) {
+                            } else if constexpr (std::is_same_v<U2, fp8e4m3_4> ||
+                                                 std::is_same_v<U2, int8_4> ||
+                                                 std::is_same_v<U2, uint8_4>) {
                                 if constexpr (RT::base_tile_stride == 16) {
                                     asm volatile(
                                         "ds_read_b128 %0, %1 offset:%2\n"
@@ -174,7 +176,9 @@ __device__ inline static void load(RT &dst, const ST &src) {
                         } else {
                             static_assert(false, "Unsupported stride");
                         }
-                    } else if constexpr (std::is_same_v<U2, fp8e4m3_4> && RT::base_tile_stride == 16) {
+                    } else if constexpr ((std::is_same_v<U2, fp8e4m3_4> ||
+                                          std::is_same_v<U2, int8_4> ||
+                                          std::is_same_v<U2, uint8_4>) && RT::base_tile_stride == 16) {
                         asm volatile(
                             "ds_read_b128 %0, %1 offset:%2\n"
                             : "=v"(*reinterpret_cast<float4*>(&dst.tiles[i][j].data[idx]))

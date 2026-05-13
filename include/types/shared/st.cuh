@@ -183,5 +183,8 @@ template<typename T> concept all = requires {
 template<int _height, int _width, ducks::st_shape::all _shape> using st_bf = st<bf16,  _height, _width, _shape>;
 template<int _height, int _width, ducks::st_shape::all _shape> using st_hf = st<half,  _height, _width, _shape>;
 template<int _height, int _width, ducks::st_shape::all _shape> using st_fl = st<float, _height, _width, _shape>;
+template<int _height, int _width, ducks::st_shape::all _shape> using st_int8 = st<int8, _height, _width, _shape>;
+template<int _height, int _width, ducks::st_shape::all _shape> using st_uint8 = st<uint8, _height, _width, _shape>;
+template<int _height, int _width, ducks::st_shape::all _shape> using st_int = st<int, _height, _width, _shape>;
 template<int _height, int _width, ducks::st_shape::all _shape> using st_fp8e4m3 = st<fp8e4m3, _height, _width, _shape>;
 }

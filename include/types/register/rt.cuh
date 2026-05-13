@@ -138,6 +138,9 @@ concept col_layout = all<T> && std::is_same_v<typename T::layout, ducks::rt_layo
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x16> using rt_fl = rt<float, _r, _c, layout, shape>;
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x16> using rt_bf = rt<bf16,  _r, _c, layout, shape>;
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x16> using rt_hf = rt<half,  _r, _c, layout, shape>;
+template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x64> using rt_int8 = rt<int8, _r, _c, layout, shape>;
+template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x64> using rt_uint8 = rt<uint8, _r, _c, layout, shape>;
+template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x16> using rt_int = rt<int, _r, _c, layout, shape>;
 template<int _r, int _c, ducks::rt_layout::all layout=ducks::rt_layout::row, ducks::rt_shape::all shape=ducks::rt_shape::rt_16x128> using rt_fp8e4m3 = rt<fp8e4m3, _r, _c, layout, shape>;
 
 } // namespace kittens
