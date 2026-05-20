@@ -89,7 +89,7 @@ concept T2 = std::is_same_v<T, float2> || std::is_same_v<T, bf16_2> || std::is_s
     || std::is_same_v<T, fp4e2m1_4>;
 template<typename T>
 concept T1 = std::is_same_v<T, float>  || std::is_same_v<T, bf16  > || std::is_same_v<T, half> || std::is_same_v<T, fp8e4m3>
-    || std::is_same_v<T, fp4e2m1>;
+    || std::is_same_v<T, fp4e2m1_2>;
 
 } // namespace base_types
 } // namespace ducks
@@ -298,9 +298,14 @@ template<> struct packing<fp4e2m1> {
     using unpacked_type = fp4e2m1;
     using packed_type = fp4e2m1_4;
 };
+template<> struct packing<fp4e2m1_2> {
+    static __host__ __device__ inline constexpr int num() { return 1; }
+    using unpacked_type = fp4e2m1_2;
+    using packed_type = fp4e2m1_4;
+};
 template<> struct packing<fp4e2m1_4> {
-    static __host__ __device__ inline constexpr int num() { return 4; }
-    using unpacked_type = fp4e2m1;
+    static __host__ __device__ inline constexpr int num() { return 2; }
+    using unpacked_type = fp4e2m1_2;
     using packed_type = fp4e2m1_4;
 };
 
@@ -448,6 +453,16 @@ template<> struct convertor<fp4e2m1_4, float4> {
 template<> struct convertor<float4, fp4e2m1_4> {
     static __host__ __device__ inline float4 convert(const fp4e2m1_4& u) {
         return float4(u);
+    }
+};
+template<> struct convertor<fp4e2m1_2, float2> {
+    static __host__ __device__ inline fp4e2m1_2 convert(const float2& u) {
+        return fp4e2m1_2(u);
+    }
+};
+template<> struct convertor<float2, fp4e2m1_2> {
+    static __host__ __device__ inline float2 convert(const fp4e2m1_2& u) {
+        return float2(u);
     }
 };
 }

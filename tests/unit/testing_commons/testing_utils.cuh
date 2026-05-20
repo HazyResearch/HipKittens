@@ -101,6 +101,30 @@ void initialize(T1 **d_i, T2 **d_o, std::vector<float> &i_ref, std::vector<float
     const int input_size  = i_ref.size();
     const int output_size = o_ref.size();
 
+    if constexpr (std::is_same_v<T1, fp4e2m1_2>) {
+        // FP4: i_ref is sized in pair units (matches device element count); each pair packs
+        // two FP4 values. We sample one float per pair and pack both halves to the same
+        // value, so i_ref[idx] holds the single quantized value seen by both halves.
+        std::vector<T1> i_t(input_size);
+        std::mt19937 gen(SEED);
+        std::uniform_real_distribution<float> dis(-1.0, 1.0);
+        for (int idx = 0; idx < input_size; idx++) {
+            float f;
+            if constexpr (initializer == initializers::RANDOM)      f = dis(gen);
+            else if constexpr (initializer == initializers::ARANGE) f = float(idx);
+            else                                                    f = i_ref[idx];
+            i_t[idx] = fp4e2m1_2(float2{f, f});
+            float2 dequant = float2(i_t[idx]);
+            i_ref[idx] = dequant.x; // both halves are identical
+        }
+        hipMalloc(d_i, input_size  * sizeof(T1));
+        hipMalloc(d_o, output_size * sizeof(T2));
+        HipCheckError();
+        hipMemcpy(*d_i, i_t.data(), input_size * sizeof(T1), hipMemcpyHostToDevice);
+        HipCheckError();
+        return;
+    }
+
     // Initialize matrices
     std::vector<T1> i_t(input_size);
 
@@ -157,32 +181,52 @@ test_result validate(T *d_i, T *d_o, const std::vector<float> &i_ref, std::vecto
     const int input_size  = i_ref.size();
     const int output_size = o_ref.size();
     // copy back
-    T* o_t = new T[output_size];
     float *o = new float[output_size];
     hipDeviceSynchronize();
     HipCheckError();
-    hipMemcpy(o_t, d_o, output_size * sizeof(T), hipMemcpyDeviceToHost);
-    HipCheckError();
-    for(int idx = 0; idx < output_size; idx++) {
-        if constexpr (std::is_same_v<T, bf16>) {
-            o[idx] = __bfloat162float(o_t[idx]);
-            o_ref[idx] = __bfloat162float(__float2bfloat16(o_ref[idx]));
+
+    if constexpr (std::is_same_v<T, fp4e2m1_2>) {
+        // FP4: device buffer holds output_size pairs (one byte per pair). We compare the
+        // low half of each pair — matches initialize's (f,f) pack convention.
+        T* o_t = new T[output_size];
+        hipMemcpy(o_t, d_o, output_size * sizeof(T), hipMemcpyDeviceToHost);
+        HipCheckError();
+        for (int idx = 0; idx < output_size; idx++) {
+            float2 dequant = float2(o_t[idx]);
+            o[idx] = dequant.x;
+            float2 refquant = float2(fp4e2m1_2(float2{o_ref[idx], o_ref[idx]}));
+            o_ref[idx] = refquant.x;
         }
-        else if constexpr (std::is_same_v<T, half>) {
-            o[idx] = __half2float(o_t[idx]);
-            o_ref[idx] = __half2float(__float2half(o_ref[idx]));
+        delete[] o_t;
+        // FP4's representable grid has coarse spacing; use absolute tolerance sized to the grid.
+        atol = 0.5f;
+        rtol = 0.0f;
+    } else {
+        T* o_t = new T[output_size];
+        hipMemcpy(o_t, d_o, output_size * sizeof(T), hipMemcpyDeviceToHost);
+        HipCheckError();
+        for(int idx = 0; idx < output_size; idx++) {
+            if constexpr (std::is_same_v<T, bf16>) {
+                o[idx] = __bfloat162float(o_t[idx]);
+                o_ref[idx] = __bfloat162float(__float2bfloat16(o_ref[idx]));
+            }
+            else if constexpr (std::is_same_v<T, half>) {
+                o[idx] = __half2float(o_t[idx]);
+                o_ref[idx] = __half2float(__float2half(o_ref[idx]));
+            }
+            else if constexpr(std::is_same_v<T, float>) {
+                o[idx] = o_t[idx];
+                o_ref[idx] = o_ref[idx];
+            }
+            else if constexpr (std::is_same_v<T, fp8e4m3>) {
+                o[idx] = float(o_t[idx]);
+                o_ref[idx] = float(fp8e4m3(o_ref[idx]));
+            }
+            else {
+                assert(false && "Unsupported data type");
+            }
         }
-        else if constexpr(std::is_same_v<T, float>) {
-            o[idx] = o_t[idx];
-            o_ref[idx] = o_ref[idx];
-        }
-        else if constexpr (std::is_same_v<T, fp8e4m3>) {
-            o[idx] = float(o_t[idx]);
-            o_ref[idx] = float(fp8e4m3(o_ref[idx]));
-        }
-        else {
-            assert(false && "Unsupported data type");
-        }
+        delete[] o_t;
     }
     // check
     std::cout << "test `" << test_name << "` ";
@@ -249,7 +293,7 @@ test_result validate(T *d_i, T *d_o, const std::vector<float> &i_ref, std::vecto
     }
     hipFree(d_i);
     hipFree(d_o);
-    delete[] o_t, o;
+    delete[] o;
     HipCheckError();
     return good ? test_result::PASSED : test_result::FAILED;
 }

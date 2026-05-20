@@ -26,6 +26,7 @@ HIPFLAGS+= -DTEST_INTENSITY=2
 # You can also specify subsections, e.g. -DTEST_WARP_MEMORY
 # Or individual tests, like -DTEST_WARP_MEMORY_VEC_DSMEM. Useful for debugging!
 HIPFLAGS+= -DTEST_WARP_MEMORY_TILE_SHARED_TO_REGISTER
+HIPFLAGS+= -DTEST_WARP_MEMORY_TILE_FP4_LOAD
 
 ifeq ($(COMP_LEVEL),safe)
 HIPFLAGS+= -O0

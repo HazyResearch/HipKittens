@@ -91,5 +91,6 @@ template<size_t _length> using sv_bf = sv<bf16,  _length>;
 template<size_t _length> using sv_hf = sv<half,  _length>;
 template<size_t _length> using sv_fl = sv<float, _length>;
 template<size_t _length> using sv_fp8e4m3 = sv<fp8e4m3, _length>;
+template<size_t _length> using sv_fp4e2m1_2 = sv<fp4e2m1_2, _length>;
 
 } // namespace kittens
