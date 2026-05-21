@@ -32,9 +32,9 @@ void gemm_double_buf_kernel(const gemm_globals g, int M, int N, int K)
     const int warp_c  = wid % WARPS_N;
     const int k_iters = K / K_STEP;
 
-    kittens::g2s::load<lds_nopad, BLOCK_M, K_STEP, NUM_THREADS>(
+    kittens::load<lds_nopad, BLOCK_M, K_STEP, NUM_THREADS>(
         A_lds[0], g.a, {0, 0, tile_m, 0}, K);
-    kittens::g2s::load<lds_nopad, BLOCK_N, K_STEP, NUM_THREADS>(
+    kittens::load<lds_nopad, BLOCK_N, K_STEP, NUM_THREADS>(
         B_lds[0], g.b, {0, 0, tile_n, 0}, K);
     kittens::sync::sync();
 
@@ -42,9 +42,9 @@ void gemm_double_buf_kernel(const gemm_globals g, int M, int N, int K)
         const int cur = k & 1, nxt = 1 - cur;
 
         if (k + 1 < k_iters) {
-            kittens::g2s::load<lds_nopad, BLOCK_M, K_STEP, NUM_THREADS>(
+            kittens::load<lds_nopad, BLOCK_M, K_STEP, NUM_THREADS>(
                 A_lds[nxt], g.a, {0, 0, tile_m, k + 1}, K);
-            kittens::g2s::load<lds_nopad, BLOCK_N, K_STEP, NUM_THREADS>(
+            kittens::load<lds_nopad, BLOCK_N, K_STEP, NUM_THREADS>(
                 B_lds[nxt], g.b, {0, 0, tile_n, k + 1}, K);
         }
 

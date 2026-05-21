@@ -5,11 +5,11 @@
  * Correctness baseline. Single-buffered LDS, register-mediated global -> LDS
  * copy, narrow `ds_load_b32` shared -> register, plain WMMA via `mma_ABt`.
  * Uses only:
- *   - `kittens::g2s::load`     : register-mediated copy.
+ *   - `kittens::load`          : cooperative register-mediated G -> LDS copy.
  *   - `kittens::sync::sync`    : block-wide split barrier.
  *   - `kittens::sync::wait_ds` : drain LDS reads before WMMA.
  *   - `kittens::load_b32`      : narrow shared -> register load.
- *   - `kittens::mma_ABt`       : 16x16x32 WMMA via the bf16 builtin.
+ *   - `kittens::mma_ABt`       : 16 x 16 x 32 WMMA via the bf16 builtin.
  */
 
 #include "common.h"
@@ -39,9 +39,9 @@ void gemm_naive_kernel(const gemm_globals g, int M, int N, int K)
     const int k_iters = K / K_STEP;
 
     for (int k = 0; k < k_iters; ++k) {
-        kittens::g2s::load<lds_nopad, BLOCK_M, K_STEP, NUM_THREADS>(
+        kittens::load<lds_nopad, BLOCK_M, K_STEP, NUM_THREADS>(
             A_lds, g.a, {0, 0, tile_m, k}, K);
-        kittens::g2s::load<lds_nopad, BLOCK_N, K_STEP, NUM_THREADS>(
+        kittens::load<lds_nopad, BLOCK_N, K_STEP, NUM_THREADS>(
             B_lds, g.b, {0, 0, tile_n, k}, K);
 
         kittens::sync::sync();
