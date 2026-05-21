@@ -417,23 +417,21 @@ __device__ static inline void store(const GL &dst, const ST &src, const COORD &i
 }
 
 /* ========================================================================== *
- * gfx1250 raw-pointer global <-> LDS transfers
+ * gfx1250 raw-pointer global -> LDS cooperative copy
  *
  * The gfx1250 family relies on `global_load_async_to_lds_*`,
  * `cluster_load_async_to_lds_*`, and `tensor_load_to_lds` (TDM) which all take
- * raw 16B-aligned LDS pointers and emit single 16B requests per lane (or per
+ * raw 16 B-aligned LDS pointers and emit single 16 B requests per lane (or per
  * warp, for TDM). Padded LDS layouts further complicate offset math, so the
  * gfx1250 path takes raw `T*` LDS slabs plus a compile-time padding descriptor.
  * Kernels allocate the slab via `shared_allocator::allocate_in<segment<I>>`
- * and call these helpers to populate it.
- *
- * Lives in `kittens::g2s::` to avoid colliding with the CDNA `load(ST&, ...)`
- * overloads in the parent `kittens::` namespace.
+ * and call the helpers in this file (the cooperative `load` below) or in the
+ * sibling headers (`async.cuh`, `tdm.cuh`) to populate it.
  * ========================================================================== */
 #ifdef KITTENS_UDNA1
 
 /**
- * @brief Compile-time LDS padding descriptor for gfx1250.
+ * @brief Compile-time LDS padding descriptor.
  *
  * Encodes the "insert `AMOUNT` pad elements every `INTERVAL` elements" rule
  * used to break bank-conflict hotspots on gfx1250 LDS. The defaults
@@ -460,23 +458,18 @@ struct lds_nopad {
     static constexpr int padded_elems(int total) { return total; }
 };
 
-/// @brief Default LDS padding for bf16 GEMMs on gfx1250.
+/// @brief Default LDS padding for bf16 GEMMs.
 using lds_pad_default = lds_padded<128, 8>;
 
-namespace g2s {
 namespace detail {
-/// @brief 16B (`int4`) vector types tagged with the address spaces the
-///        gfx1250 `*_load_async_to_lds_b128` builtins require.
-using i32x4_vec   = int __attribute__((__vector_size__(16)));
-using i32x4_gvec  = int __attribute__((__vector_size__(16))) __attribute__((address_space(1)));
-using i32x4_lvec  = int __attribute__((__vector_size__(16))) __attribute__((address_space(3)));
-
 /**
  * @brief Subtile-major flat index helper for gfx1250 LDS layouts.
  *
- * Mirrors the indexing used by `ops/warp/memory/tile/shared_to_register.cuh`
- * gfx1250 path: rows/cols within a subtile are stored row-major, subtiles are
- * laid out row-major across the tile.
+ * Mirrors the indexing used by the gfx1250 path in
+ * `ops/warp/memory/tile/shared_to_register.cuh`: rows/cols within a subtile
+ * are stored row-major, subtiles are laid out row-major across the tile.
+ * Used by both the cooperative `kittens::load` below and the per-lane async
+ * load in `async.cuh`.
  */
 template<int ROWS, int COLS, int SUB_ROWS, int SUB_COLS>
 __device__ __forceinline__ int subtile_flat(int flat) {
@@ -493,14 +486,21 @@ __device__ __forceinline__ int subtile_flat(int flat) {
          + local_row * COLS
          + local_col;
 }
-} // namespace detail (g2s)
+} // namespace detail
 
 /**
- * @brief Cooperative register-mediated global -> LDS tile copy (gfx1250 baseline).
+ * @brief Cooperative register-mediated global -> LDS tile copy.
  *
- * Plain `global_load` -> VGPR -> `ds_store` path. Use this when no async
- * intrinsic is available or for correctness baselines. The `Pad` parameter
- * controls the per-element LDS placement; pass `lds_nopad` for flat layouts.
+ * Plain `global_load` -> VGPR -> `ds_store` path. Use this for correctness
+ * baselines and for kernels that do not yet exercise the async or TDM paths.
+ * The `Pad` parameter controls the per-element LDS placement; pass
+ * `lds_nopad` for flat layouts and `lds_padded<INTERVAL, AMOUNT>` to insert
+ * bank-conflict-avoiding pads at the LDS side.
+ *
+ * The `T*` first-argument signature distinguishes this from the CDNA
+ * `load(ST&, ...)` overload above; the two coexist via overload resolution
+ * but the gfx1250 path is the one selected when LDS storage is a raw `T*`
+ * slab (the layout used by all gfx1250 async/TDM helpers).
  */
 template<typename Pad = lds_nopad, int ROWS = 0, int COLS = 0, int N_THREADS = WARP_THREADS,
          typename T, ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
@@ -522,283 +522,11 @@ __device__ inline void load(T* __restrict__ lds_dst, const GL& src, const COORD&
     for (int i = tid; i < total_elems; i += N_THREADS) {
         const int row = i / COLS;
         const int col = i % COLS;
-        // Subtile-major LDS layout (rows of 16x32 subtiles).
+        // Subtile-major LDS layout (rows of 16 x 32 subtiles).
         const int lds_flat = detail::subtile_flat<ROWS, COLS, 16, 32>(i);
         lds_dst[Pad::padded(lds_flat)] = base[row * row_stride + col];
     }
 }
 
-/**
- * @brief Cooperative async global -> LDS tile copy on gfx1250.
- *
- * Lowers to `global_load_async_to_lds_b128` (single-WG) when `cluster_mask == 0`,
- * and to `cluster_load_async_to_lds_b128` (multicast) when non-zero. Each lane
- * issues one 16-byte transfer; the warp covers `8 * N_THREADS` elements per
- * iteration. Drain with `kittens::sync::wait_async()` before consuming.
- *
- * @tparam Pad      LDS padding descriptor.
- * @tparam ROWS,COLS  Tile shape (elements).
- * @tparam N_THREADS  Number of threads participating in the load.
- * @param  lds_dst    16B-aligned LDS pointer (typically `bf16*`).
- * @param  src        Global tile descriptor.
- * @param  idx        Tile coordinate inside `src`.
- * @param  row_stride Element stride between rows in `src`.
- * @param  cluster_mask `M0` cluster multicast mask (0 for single-WG, non-zero for CGA).
- */
-template<typename Pad = lds_nopad, int ROWS = 0, int COLS = 0, int N_THREADS = WARP_THREADS,
-         typename T, ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
-__device__ inline void load_async(T* __restrict__ lds_dst, const GL& src, const COORD& idx,
-                                  int row_stride, uint32_t cluster_mask = 0)
-{
-    static_assert(ROWS > 0 && COLS > 0, "ROWS and COLS must be specified");
-    static_assert(sizeof(T) * 8 == 16, "load_async issues one b128 (16B) per lane");
-    constexpr int elems_per_load = 16 / sizeof(T);
-    constexpr int total_elems    = ROWS * COLS;
-    const int tid = threadIdx.x;
-    const int gr_base = idx.r * ROWS;
-    const int gc_base = idx.c * COLS;
-    const T* base = src.raw_ptr
-                  + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
-                     * src.cols() + gc_base);
-
-    #pragma unroll
-    for (int i = tid * elems_per_load; i < total_elems;
-         i += N_THREADS * elems_per_load)
-    {
-        const int row = i / COLS;
-        const int col = i % COLS;
-        const int lds_flat = detail::subtile_flat<ROWS, COLS, 16, 32>(i);
-
-        // The gfx1250 async-to-LDS builtins want address-space-qualified
-        // pointers (AS(1) global, AS(3) LDS). `reinterpret_cast` cannot add
-        // an address space, so route through `uintptr_t` + a C-style cast,
-        // matching the pattern used elsewhere in this file for AS(3).
-        uintptr_t g_uint = reinterpret_cast<uintptr_t>(base + row * row_stride + col);
-        uintptr_t l_uint = reinterpret_cast<uintptr_t>(lds_dst + Pad::padded(lds_flat));
-        auto* g_ptr = (detail::i32x4_gvec*)(g_uint);
-        auto* l_ptr = (detail::i32x4_lvec*)(l_uint);
-
-        if (cluster_mask) {
-            __builtin_amdgcn_cluster_load_async_to_lds_b128(
-                g_ptr, l_ptr, 0, 0, static_cast<int>(cluster_mask));
-        } else {
-            __builtin_amdgcn_global_load_async_to_lds_b128(g_ptr, l_ptr, 0, 0);
-        }
-    }
-}
-
-/**
- * @brief Hardware tile DMA (TDM) global -> LDS load on gfx1250.
- *
- * Issues a single `tensor_load_to_lds` instruction whose D# descriptor
- * encodes the 2D tile shape, source tensor extents, row stride, and optional
- * LDS padding. The instruction is issued by every lane of the wave (`EXEC`
- * is ignored) but only `wave 0` of the group should call this -- TDM unit
- * arbitration is per-SIMD-pair, not per-lane.
- *
- * Drain with `kittens::sync::wait_tensor()`.
- *
- * @tparam Pad      LDS padding descriptor.
- * @tparam ROWS,COLS  Tile shape (elements).
- * @param  lds_dst     16B-aligned LDS pointer.
- * @param  src         Global tile descriptor.
- * @param  idx         Tile coordinate.
- * @param  row_stride  Source row stride (elements).
- * @param  cluster_mask Optional `workgroup_mask` (0 for single-WG, non-zero
- *                     to switch the load into `CLUSTER_LOAD_ASYNC` micro-ops).
- */
-namespace detail {
-
-using v4u32 = unsigned int __attribute__((ext_vector_type(4)));
-using v8u32 = unsigned int __attribute__((ext_vector_type(8)));
-
-/**
- * @brief Build the 12-DWord TDM D# (groups 0 + 1) for a 2D tile transfer.
- *
- * Encapsulates the bit-packing shared by `load_tdm` and `load_tdm_arrive`.
- * `bar_lds_addr` is the LDS byte address of a `barrier_lds` cell when the
- * caller wants the TDM unit to auto-arrive at completion (sets the
- * `atomic_barrier_enable` bit and stuffs the address into group 1). Pass 0
- * for the no-barrier path.
- */
-template<typename Pad, int ROWS, int COLS, typename T>
-__device__ __forceinline__ void build_tdm_d_2d(
-    v4u32& g0, v8u32& g1,
-    const T* base, T* lds_dst,
-    int tensor_rows, int tensor_cols, int row_stride,
-    uint32_t cluster_mask, uint32_t bar_lds_addr)
-{
-    // ---- Group 0: count, lds_addr, global_addr, type ----
-    const uint32_t lds_addr = static_cast<uint32_t>(
-        reinterpret_cast<uintptr_t>(lds_dst));
-    const uint64_t gaddr    = reinterpret_cast<uint64_t>(base);
-
-    g0[0] = 1u;                                                  // count
-    g0[1] = lds_addr;
-    g0[2] = static_cast<uint32_t>(gaddr);
-    g0[3] = (static_cast<uint32_t>(gaddr >> 32) & 0x01FFFFFFu) | (2u << 30);
-
-    // ---- Group 1: data_size, padding, dims, stride, optional barrier ----
-    // data_size encoded as log2(bytes_per_element).
-    constexpr uint32_t data_size_enc = (sizeof(T) == 1) ? 0
-                                     : (sizeof(T) == 2) ? 1
-                                     : (sizeof(T) == 4) ? 2
-                                     : 3;
-    constexpr uint32_t pad_enable   = (Pad::interval > 0) ? 1u : 0u;
-    constexpr uint32_t pad_int_enc  = (Pad::interval > 0)
-        ? ( __builtin_ctz(Pad::interval * sizeof(T) / 4) ) : 0;
-    constexpr uint32_t pad_amt_enc  = (Pad::amount > 0)
-        ? ( (Pad::amount * sizeof(T) / 4) - 1 ) : 0;
-
-    // atomic_barrier_enable lives at bit 18 of group 1 word 0
-    // (per the MI400 TDM D# layout: w0 = multicast_mask[15:0],
-    // data_size[17:16], atomic_barrier_enable[18], iterate_enable[19],
-    // pad_enable[20], pad_interval[24:22], pad_amount[31:25]).
-    const uint32_t atomic_bar_enable = (bar_lds_addr != 0) ? (1u << 18) : 0u;
-
-    uint32_t w0 = (data_size_enc << 16)
-                | (pad_enable    << 20)
-                |  atomic_bar_enable
-                | (pad_int_enc   << 22)
-                | (pad_amt_enc   << 25)
-                | (cluster_mask  & 0xFFFFu);
-
-    const uint32_t tdim0    = static_cast<uint32_t>(tensor_cols);
-    const uint32_t tdim1    = static_cast<uint32_t>(tensor_rows);
-    const uint32_t tiledim0 = static_cast<uint32_t>(COLS);
-    const uint32_t tiledim1 = static_cast<uint32_t>(ROWS);
-
-    // barrier_addr occupies w1[15:0]; tensor_dim0 lo16 occupies w1[31:16].
-    uint32_t w1 = (bar_lds_addr & 0xFFFFu) | (tdim0 << 16);
-    uint32_t w2 = (tdim0 >> 16) | (tdim1 << 16);
-    uint32_t w3 = (tdim1 >> 16) | (tiledim0 << 16);
-    uint32_t w4 = tiledim1;
-
-    const uint64_t stride0 = static_cast<uint64_t>(
-        static_cast<uint32_t>(row_stride * sizeof(T)));
-    uint32_t w5 = static_cast<uint32_t>(stride0);
-    uint32_t w6 = static_cast<uint32_t>(stride0 >> 32);
-    uint32_t w7 = 0;
-
-    g1[0] = w0; g1[1] = w1; g1[2] = w2; g1[3] = w3;
-    g1[4] = w4; g1[5] = w5; g1[6] = w6; g1[7] = w7;
-}
-
-} // namespace detail (g2s)
-
-template<typename Pad = lds_nopad, int ROWS = 0, int COLS = 0,
-         typename T, ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
-__device__ inline void load_tdm(T* __restrict__ lds_dst, const GL& src, const COORD& idx,
-                                int tensor_rows, int tensor_cols, int row_stride,
-                                uint32_t cluster_mask = 0)
-{
-    static_assert(ROWS > 0 && COLS > 0, "ROWS and COLS must be specified");
-
-    const int gr_base = idx.r * ROWS;
-    const int gc_base = idx.c * COLS;
-    const T* base = src.raw_ptr
-                  + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
-                     * src.cols() + gc_base);
-
-    detail::v4u32 g0;
-    detail::v8u32 g1;
-    detail::build_tdm_d_2d<Pad, ROWS, COLS, T>(
-        g0, g1, base, lds_dst, tensor_rows, tensor_cols, row_stride,
-        cluster_mask, /*bar_lds_addr=*/ 0);
-
-    detail::v4u32 g2 = {0, 0, 0, 0};
-    detail::v4u32 g3 = {0, 0, 0, 0};
-    __builtin_amdgcn_tensor_load_to_lds(g0, g1, g2, g3, 0);
-}
-
-/**
- * @brief TDM load that auto-arrives at an LDS barrier on completion.
- * @experimental
- *
- * Sets `atomic_barrier_enable` in the D# so the TDM unit emits a
- * `DS_ATOMIC_ASYNC_BARRIER_ARRIVE_B64` on `bar` after the transfer retires.
- * The consumer waits on `bar`'s phase flip via
- * `kittens::sync::wait_barrier(bar, phase)` instead of draining the global
- * `tensorcnt`, leaving unrelated TDM transfers in flight.
- *
- * The barrier must be primed via `kittens::sync::init_barrier(bar, count)`
- * before the first call referencing it. `count` is the number of
- * `load_tdm_arrive` invocations that target this barrier per phase.
- *
- * @note The D# bit positions for `atomic_barrier_enable` (`w0` bit 18) and
- * `atomic_barrier_address` (`w1[15:0]`) match the field table documented
- * in the Triton AMD backend (third_party/amd/lib/TritonAMDGPUToLLVM/
- * TDMUtility.cpp lines 224-264). The Triton lowering itself does not use
- * the D# auto-arrive path -- it follows `load_tdm` with an explicit
- * `wait_tensor()` + `async_barrier_arrive()` sequence (see
- * `gemm_tdm_arrive.cpp` for that pattern). This overload is provided for
- * runtimes that model TDM auto-arrive natively; on simulators that don't,
- * use the explicit-arrive pattern instead.
- *
- * @param bar  Pointer to a 64-bit LDS barrier counter (a `sync::barrier_lds`
- *             cell). Must point at LDS storage; must be 8-byte aligned.
- */
-template<typename Pad = lds_nopad, int ROWS = 0, int COLS = 0,
-         typename T, ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
-__device__ inline void load_tdm_arrive(
-    T* __restrict__ lds_dst, const GL& src, const COORD& idx,
-    int tensor_rows, int tensor_cols, int row_stride,
-    uint64_t* bar, uint32_t cluster_mask = 0)
-{
-    static_assert(ROWS > 0 && COLS > 0, "ROWS and COLS must be specified");
-
-    const int gr_base = idx.r * ROWS;
-    const int gc_base = idx.c * COLS;
-    const T* base = src.raw_ptr
-                  + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
-                     * src.cols() + gc_base);
-
-    const uint32_t bar_lds_addr = static_cast<uint32_t>(
-        reinterpret_cast<uintptr_t>(bar));
-
-    detail::v4u32 g0;
-    detail::v8u32 g1;
-    detail::build_tdm_d_2d<Pad, ROWS, COLS, T>(
-        g0, g1, base, lds_dst, tensor_rows, tensor_cols, row_stride,
-        cluster_mask, bar_lds_addr);
-
-    detail::v4u32 g2 = {0, 0, 0, 0};
-    detail::v4u32 g3 = {0, 0, 0, 0};
-    __builtin_amdgcn_tensor_load_to_lds(g0, g1, g2, g3, 0);
-}
-
-/**
- * @brief Cooperative L2 prefetch for an upcoming tile.
- *
- * Lowers to `__builtin_amdgcn_global_prefetch` issued from every participating
- * lane. The hint = 0 selects the default cache policy.
- */
-template<int ROWS = 0, int COLS = 0, int N_THREADS = WARP_THREADS,
-         typename T, ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
-__device__ inline void prefetch_l2(const GL& src, const COORD& idx, int row_stride)
-{
-    static_assert(ROWS > 0 && COLS > 0, "ROWS and COLS must be specified");
-    constexpr int elems_per_pf = 16 / sizeof(T);
-    constexpr int total_elems  = ROWS * COLS;
-    const int tid = threadIdx.x;
-    const int gr_base = idx.r * ROWS;
-    const int gc_base = idx.c * COLS;
-    const T* base = src.raw_ptr
-                  + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
-                     * src.cols() + gc_base);
-
-    #pragma unroll
-    for (int i = tid * elems_per_pf; i < total_elems;
-         i += N_THREADS * elems_per_pf)
-    {
-        const int row = i / COLS;
-        const int col = i % COLS;
-        const T* addr = base + row * row_stride + col;
-        __builtin_amdgcn_global_prefetch(
-            (const void __attribute__((address_space(1)))*)addr, 0);
-    }
-}
-
-} // namespace g2s
 #endif // KITTENS_UDNA1
 }
