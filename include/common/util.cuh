@@ -134,9 +134,9 @@ constexpr int MAX_SHARED_MEMORY = 65536;
 constexpr int LDS_SEGMENT_BYTES = 65536;
 constexpr int LDS_NUM_SEGMENTS  = 5;
 constexpr int LDS_TOTAL_BYTES   = LDS_SEGMENT_BYTES * LDS_NUM_SEGMENTS;
-constexpr int NUM_XCDS = 1;
-constexpr int CUS_PER_XCD = 64;
-constexpr int NUM_CUS = CUS_PER_XCD * NUM_XCDS;
+constexpr int NUM_XCDS = 1; // PLACEHOLDER
+constexpr int CUS_PER_XCD = 64; // PLACEHOLDER
+constexpr int NUM_CUS = CUS_PER_XCD * NUM_XCDS; // PLACEHOLDER
 #else
 constexpr int MAX_SHARED_MEMORY = 160000;
 constexpr int NUM_XCDS = 8;
