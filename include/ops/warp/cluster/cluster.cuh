@@ -33,8 +33,11 @@ namespace cluster {
  *                       issue a follow-up transaction. Useful when a few stragglers
  *                       would otherwise stall fast WGs.
  *
- * @return The `M0` value to pass as the `cluster_mask` argument of
- *         `kittens::load_async`/`kittens::load_tdm`.
+ * @return The `M0` value to pass as the `mask` argument of
+ *         `kittens::tdm::cluster::load_async` / `kittens::async::cluster::load`.
+ *         Note: the TDM path consumes only the low 16 bits; the `early_timeout`
+ *         flag at bit 16 is honored by the async (per-lane) path but dropped by
+ *         the TDM (descriptor-driven) path.
  */
 __device__ __host__ __forceinline__ constexpr uint32_t mask(
     uint16_t wg_bits,

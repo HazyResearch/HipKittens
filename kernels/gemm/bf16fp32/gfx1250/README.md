@@ -15,14 +15,14 @@ Output dtype is bf16; accumulation is in fp32; default tile is 64x64 with
 
 | File                  | New feature                                                                                    |
 |-----------------------|------------------------------------------------------------------------------------------------|
-| `gemm_naive.cpp`      | Baseline: `kittens::g2s::load`, `kittens::sync::sync`, `mma_ABt`, register-mediated copy.      |
+| `gemm_naive.cpp`      | Baseline: `kittens::load`, `kittens::sync::sync`, `mma_ABt`, register-mediated copy.           |
 | `gemm_double_buf.cpp` | Double-buffered LDS.                                                                           |
-| `gemm_async.cpp`      | `__builtin_amdgcn_global_load_async_to_lds_b128` via `kittens::g2s::load_async`.               |
+| `gemm_async.cpp`      | `__builtin_amdgcn_global_load_async_to_lds_b128` via `kittens::async::load`.                   |
 | `gemm_padded.cpp`     | `lds_padded<128, 8>` LDS layout (bank-conflict avoidance) + wide `ds_load_b128` s2r.           |
 | `gemm_split_bar.cpp`  | Explicit `sync::arrive()` / `sync::wait()` split.                                              |
 | `gemm_segment.cpp`    | A in `segment<0>`, B in `segment<1>` (distinct LDS read ports).                                |
 | `gemm_expert.cpp`     | `sched::expert` + `mma_ABt_burst` reuse-B.                                                     |
-| `gemm_tdm_arrive.cpp` | `load_tdm` + per-operand `barrier_lds`: fine-grained TDM ordering via `DS_ATOMIC_ASYNC_BARRIER_ARRIVE_B64` and a phase-flip wait. Excluded from the default smoke-test sweep -- LDS async-barrier semantics need a runtime that honors them. |
+| `gemm_tdm_arrive.cpp` | `tdm::load_async` + per-operand `kittens::semaphore`: fine-grained TDM ordering via `DS_ATOMIC_ASYNC_BARRIER_ARRIVE_B64` and a phase-flip wait. Excluded from the default smoke-test sweep -- LDS async-barrier semantics need a runtime that honors them. |
 
 ## Build
 
