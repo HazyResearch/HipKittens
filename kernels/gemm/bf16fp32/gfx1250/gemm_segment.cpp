@@ -35,20 +35,20 @@ void gemm_segment_kernel(const gemm_globals g, int M, int N, int K)
     const int warp_c  = wid % WARPS_N;
     const int k_iters = K / K_STEP;
 
-    kittens::g2s::load_async<Pad, BLOCK_M, K_STEP, NUM_THREADS>(
+    kittens::async::load<Pad, BLOCK_M, K_STEP, NUM_THREADS>(
         A_lds[0], g.a, {0, 0, tile_m, 0}, K);
-    kittens::g2s::load_async<Pad, BLOCK_N, K_STEP, NUM_THREADS>(
+    kittens::async::load<Pad, BLOCK_N, K_STEP, NUM_THREADS>(
         B_lds[0], g.b, {0, 0, tile_n, 0}, K);
-    kittens::sync::wait_async();
+    kittens::async::load_wait();
     kittens::sync::arrive(); kittens::sync::wait();
 
     for (int k = 0; k < k_iters; ++k) {
         const int cur = k & 1, nxt = 1 - cur;
 
         if (k + 1 < k_iters) {
-            kittens::g2s::load_async<Pad, BLOCK_M, K_STEP, NUM_THREADS>(
+            kittens::async::load<Pad, BLOCK_M, K_STEP, NUM_THREADS>(
                 A_lds[nxt], g.a, {0, 0, tile_m, k + 1}, K);
-            kittens::g2s::load_async<Pad, BLOCK_N, K_STEP, NUM_THREADS>(
+            kittens::async::load<Pad, BLOCK_N, K_STEP, NUM_THREADS>(
                 B_lds[nxt], g.b, {0, 0, tile_n, k + 1}, K);
         }
         kittens::sync::arrive();
@@ -64,7 +64,7 @@ void gemm_segment_kernel(const gemm_globals g, int M, int N, int K)
         kittens::sync::wait_ds();
         mma_ABt(C_acc, A_reg, B_reg, C_acc);
 
-        kittens::sync::wait_async();
+        kittens::async::load_wait();
     }
 
     bf16* c_base = reinterpret_cast<bf16*>(&g.c[{0, 0, 0, 0}]);

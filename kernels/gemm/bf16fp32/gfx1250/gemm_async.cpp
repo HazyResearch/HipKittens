@@ -3,9 +3,9 @@
  * @brief Rung 3 -- async global -> LDS for gfx1250.
  *
  * Diff vs `gemm_double_buf`: replace the register-mediated copy with
- * `kittens::g2s::load_async`, which emits `global_load_async_to_lds_b128`
+ * `kittens::async::load`, which emits `global_load_async_to_lds_b128`
  * (or the cluster multicast variant when given a mask). Producers drain
- * via `kittens::sync::wait_async`.
+ * via `kittens::async::load_wait`.
  */
 
 #include "common.h"
@@ -34,20 +34,20 @@ void gemm_async_kernel(const gemm_globals g, int M, int N, int K)
     const int warp_c  = wid % WARPS_N;
     const int k_iters = K / K_STEP;
 
-    kittens::g2s::load_async<lds_nopad, BLOCK_M, K_STEP, NUM_THREADS>(
+    kittens::async::load<lds_nopad, BLOCK_M, K_STEP, NUM_THREADS>(
         A_lds[0], g.a, {0, 0, tile_m, 0}, K);
-    kittens::g2s::load_async<lds_nopad, BLOCK_N, K_STEP, NUM_THREADS>(
+    kittens::async::load<lds_nopad, BLOCK_N, K_STEP, NUM_THREADS>(
         B_lds[0], g.b, {0, 0, tile_n, 0}, K);
-    kittens::sync::wait_async();
+    kittens::async::load_wait();
     kittens::sync::sync();
 
     for (int k = 0; k < k_iters; ++k) {
         const int cur = k & 1, nxt = 1 - cur;
 
         if (k + 1 < k_iters) {
-            kittens::g2s::load_async<lds_nopad, BLOCK_M, K_STEP, NUM_THREADS>(
+            kittens::async::load<lds_nopad, BLOCK_M, K_STEP, NUM_THREADS>(
                 A_lds[nxt], g.a, {0, 0, tile_m, k + 1}, K);
-            kittens::g2s::load_async<lds_nopad, BLOCK_N, K_STEP, NUM_THREADS>(
+            kittens::async::load<lds_nopad, BLOCK_N, K_STEP, NUM_THREADS>(
                 B_lds[nxt], g.b, {0, 0, tile_n, k + 1}, K);
         }
 
@@ -59,7 +59,7 @@ void gemm_async_kernel(const gemm_globals g, int M, int N, int K)
         kittens::sync::wait_ds();
         mma_ABt(C_acc, A_reg, B_reg, C_acc);
 
-        kittens::sync::wait_async();
+        kittens::async::load_wait();
         kittens::sync::sync();
     }
 
