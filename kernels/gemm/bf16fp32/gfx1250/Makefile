@@ -10,7 +10,7 @@
 # the make inside the `rocm/dev-ubuntu-24.04:7.2` docker image -- the
 # `docker_make.sh` wrapper in this directory does that automatically.
 
-LADDER := gemm_naive gemm_double_buf gemm_async gemm_padded gemm_split_bar gemm_segment gemm_expert gemm_tdm_arrive
+LADDER := gemm_naive gemm_double_buf gemm_async gemm_padded gemm_split_bar gemm_segment gemm_expert gemm_tdm gemm_tdm_arrive
 
 KERNEL ?= gemm_naive
 SRC    := $(KERNEL).cpp

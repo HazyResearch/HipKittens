@@ -1,4 +1,4 @@
-# gfx1250 GEMM optimization ladder
+# `gfx1250` GEMM optimization ladder
 
 A progressive series of bf16 -> fp32 GEMM kernels for gfx1250. Each
 rung adds one gfx1250-specific feature on top of the previous, written
@@ -22,7 +22,8 @@ Output dtype is bf16; accumulation is in fp32; default tile is 64x64 with
 | `gemm_split_bar.cpp`  | Explicit `sync::arrive()` / `sync::wait()` split.                                              |
 | `gemm_segment.cpp`    | A in `segment<0>`, B in `segment<1>` (distinct LDS read ports).                                |
 | `gemm_expert.cpp`     | `sched::expert` + `mma_ABt_burst` reuse-B.                                                     |
-| `gemm_tdm_arrive.cpp` | `tdm::load_async` + per-operand `kittens::semaphore`: fine-grained TDM ordering via `DS_ATOMIC_ASYNC_BARRIER_ARRIVE_B64` and a phase-flip wait. Excluded from the default smoke-test sweep -- LDS async-barrier semantics need a runtime that honors them. |
+| `gemm_tdm.cpp`        | `tdm::load_async<tile<...>>` -- fire-and-drain TDM via `TENSORcnt`. |
+| `gemm_tdm_arrive.cpp` | `tdm::load_async` + per-operand `kittens::semaphore`: fine-grained TDM ordering via `DS_ATOMIC_ASYNC_BARRIER_ARRIVE_B64` and a phase-flip wait. |
 
 ## Build
 
@@ -37,6 +38,3 @@ automatically. From inside this directory:
 make KERNEL=gemm_naive               # build one rung
 make ladder                          # build every rung
 ```
-
-See the wiki at `wiki/gfx1250-integration.md` for the full API reference and
-the rationale behind each rung.
