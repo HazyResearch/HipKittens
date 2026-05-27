@@ -800,12 +800,19 @@ __device__ inline void load_b32(
                                 + row * detail::GFX1250_SUB_COLS
                                 + half * 16;
 
-            const bf16_2* lds_p = reinterpret_cast<const bf16_2*>(
-                warp_lds_base + base_flat);
+            // Coerce to a uint32_t AS(3) pointer and load the bit-pattern
+            // (one bf16_2 = 4 bytes = one u32), forcing the compiler to
+            // emit `ds_load_b32` instead of a generic flat load. bf16_2's
+            // copy assignment is not address-space-qualified, so we
+            // round-trip through uint32_t.
+            using lds_u32 = const uint32_t __attribute__((address_space(3)));
+            auto* lds_p = (lds_u32*)(reinterpret_cast<uintptr_t>(
+                warp_lds_base + base_flat));
 
             #pragma unroll
             for (int k = 0; k < 8; k++) {
-                dst.tiles[ti][tj].data[k] = lds_p[k];
+                const uint32_t bits = lds_p[k];
+                dst.tiles[ti][tj].data[k] = *reinterpret_cast<const bf16_2*>(&bits);
             }
         }
     }

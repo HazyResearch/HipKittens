@@ -504,7 +504,7 @@ __device__ __forceinline__ int subtile_flat(int flat) {
  */
 template<typename Pad = lds_nopad, int ROWS = 0, int COLS = 0, int N_THREADS = WARP_THREADS,
          typename T, ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
-__device__ inline void load(T* __restrict__ lds_dst, const GL& src, const COORD& idx,
+__device__ inline void load(T* __restrict__ lds_dst_raw, const GL& src, const COORD& idx,
                             int row_stride)
 {
     static_assert(ROWS > 0 && COLS > 0, "ROWS and COLS must be specified");
@@ -518,13 +518,30 @@ __device__ inline void load(T* __restrict__ lds_dst, const GL& src, const COORD&
                   + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
                      * src.cols() + gc_base);
 
+    // Coerce the LDS destination to a sizeof(T)-wide AS(3) integer pointer
+    // and write the source bit-pattern, forcing the compiler to emit
+    // `ds_store_b{8,16,32,64}` instead of a generic flat store. We round-trip
+    // through an integer of matching width because element types like
+    // `__hip_bfloat16` do not provide address-space-qualified `operator=`,
+    // so direct assignment through an AS(3)-qualified `T*` fails to compile.
+    static_assert(sizeof(T) == 1 || sizeof(T) == 2 ||
+                  sizeof(T) == 4 || sizeof(T) == 8,
+                  "cooperative load expects sizeof(T) in {1, 2, 4, 8}");
+    using lds_int = std::conditional_t<sizeof(T) == 1, uint8_t,
+                    std::conditional_t<sizeof(T) == 2, uint16_t,
+                    std::conditional_t<sizeof(T) == 4, uint32_t,
+                                       uint64_t>>>;
+    using lds_int_as3 = lds_int __attribute__((address_space(3)));
+    auto* lds_dst = (lds_int_as3*)(reinterpret_cast<uintptr_t>(lds_dst_raw));
+
     #pragma unroll
     for (int i = tid; i < total_elems; i += N_THREADS) {
         const int row = i / COLS;
         const int col = i % COLS;
         // Subtile-major LDS layout (rows of 16 x 32 subtiles).
         const int lds_flat = detail::subtile_flat<ROWS, COLS, 16, 32>(i);
-        lds_dst[Pad::padded(lds_flat)] = base[row * row_stride + col];
+        const T v = base[row * row_stride + col];
+        lds_dst[Pad::padded(lds_flat)] = *reinterpret_cast<const lds_int*>(&v);
     }
 }
 

@@ -54,11 +54,19 @@ struct gemm_globals {
  *   - `data[k].y` -> row `2k + 1 + 8 * (L / 16)`
  */
 __device__ static inline void store_acc16(
-    kittens::bf16* __restrict__ c_global,
+    kittens::bf16* __restrict__ c_global_raw,
     int gr_base, int gc_base, int N,
     const kittens::rt_base<float, kittens::ducks::rt_layout::col,
                             kittens::ducks::rt_shape::rt_16x16>& tile)
 {
+    // Coerce to a uint16_t AS(1) pointer and store the bf16 bit-pattern,
+    // forcing the compiler to emit `global_store_b16` instead of a
+    // generic flat store. We route through uint16_t because
+    // `__hip_bfloat16::operator=` is not address-space-qualified, so
+    // direct assignment through an AS(1)-qualified bf16* fails to compile.
+    using c_global_t = uint16_t __attribute__((address_space(1)));
+    auto* c_global = (c_global_t*)(reinterpret_cast<uintptr_t>(c_global_raw));
+
     const int L    = kittens::laneid();
     const int half = L / 16;
     const int col  = L % 16;
@@ -67,10 +75,12 @@ __device__ static inline void store_acc16(
     for (int k = 0; k < 4; ++k) {
         const int gr0 = gr_base + 2 * k     + 8 * half;
         const int gr1 = gr_base + 2 * k + 1 + 8 * half;
-        c_global[gr0 * N + gc] =
+        kittens::bf16 v0 =
             kittens::base_types::convertor<kittens::bf16, float>::convert(tile.data[k].x);
-        c_global[gr1 * N + gc] =
+        kittens::bf16 v1 =
             kittens::base_types::convertor<kittens::bf16, float>::convert(tile.data[k].y);
+        c_global[gr0 * N + gc] = *reinterpret_cast<const uint16_t*>(&v0);
+        c_global[gr1 * N + gc] = *reinterpret_cast<const uint16_t*>(&v1);
     }
 }
 
