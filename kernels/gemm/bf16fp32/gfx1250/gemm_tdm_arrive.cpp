@@ -103,15 +103,20 @@ void gemm_tdm_arrive_kernel(const gemm_globals g, int M, int N, int K)
     // atomic and fires per active lane: guard with `laneid() == 0` so each
     // producer wave arrives exactly once per phase (matching the
     // `init_semaphore(.., 1)` priming above).
+    using A_tile = tdm::tile<BLOCK_M, K_STEP>;
+    using B_tile = tdm::tile<BLOCK_N, K_STEP>;
+
     if (wid == 0) {
-        tdm::load_async<Pad, BLOCK_M, K_STEP>(
-            A_lds[0], g.a, {0, 0, tile_m, 0}, M, K, K);
+        tdm::load_async<A_tile, Pad>(
+            A_lds[0], g.a, {0, 0, tile_m, 0},
+            A_tile::extents{M, K}, A_tile::strides{K});
         tdm::load_async_wait();
         if (laneid() == 0) arrive(A_bar[0]);
     }
     if (wid == 1) {
-        tdm::load_async<Pad, BLOCK_N, K_STEP>(
-            B_lds[0], g.b, {0, 0, tile_n, 0}, N, K, K);
+        tdm::load_async<B_tile, Pad>(
+            B_lds[0], g.b, {0, 0, tile_n, 0},
+            B_tile::extents{N, K}, B_tile::strides{K});
         tdm::load_async_wait();
         if (laneid() == 0) arrive(B_bar[0]);
     }
@@ -121,14 +126,16 @@ void gemm_tdm_arrive_kernel(const gemm_globals g, int M, int N, int K)
 
         if (k + 1 < k_iters) {
             if (wid == 0) {
-                tdm::load_async<Pad, BLOCK_M, K_STEP>(
-                    A_lds[nxt], g.a, {0, 0, tile_m, k + 1}, M, K, K);
+                tdm::load_async<A_tile, Pad>(
+                    A_lds[nxt], g.a, {0, 0, tile_m, k + 1},
+                    A_tile::extents{M, K}, A_tile::strides{K});
                 tdm::load_async_wait();
                 if (laneid() == 0) arrive(A_bar[nxt]);
             }
             if (wid == 1) {
-                tdm::load_async<Pad, BLOCK_N, K_STEP>(
-                    B_lds[nxt], g.b, {0, 0, tile_n, k + 1}, N, K, K);
+                tdm::load_async<B_tile, Pad>(
+                    B_lds[nxt], g.b, {0, 0, tile_n, k + 1},
+                    B_tile::extents{N, K}, B_tile::strides{K});
                 tdm::load_async_wait();
                 if (laneid() == 0) arrive(B_bar[nxt]);
             }
