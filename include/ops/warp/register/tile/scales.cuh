@@ -9,6 +9,7 @@
 #pragma once
 
 #include "../../../../common/common.cuh"
+#include "../../memory/util/util.cuh"
 
 namespace kittens {
 
@@ -70,5 +71,29 @@ __device__ __forceinline__ fp8e8m0_4 pack_scales(
     uint32_t hi  = __builtin_amdgcn_perm(w2, w3, sel);
 
     return (fp8e8m0_4)(lo | (hi << 16));
+}
+
+__device__ __forceinline__ void prefetch_scales_to_lds_dma(
+    uint8_t *smem_scales,
+    const uint32_t *__restrict__ scale_A_iter,
+    const uint32_t *__restrict__ scale_B_iter,
+    int block_m, int block_n, int k_iter, int M_dim, int N_dim) {
+
+    int warp_id = threadIdx.x / WARP_THREADS;
+    int lane_id = threadIdx.x % WARP_THREADS;
+
+    if (warp_id == 0) {
+        const uint32_t *src = scale_A_iter + (size_t)k_iter * M_dim + block_m;
+        i32x4 srd = make_srsrc((const void *)src, 1024);
+        uintptr_t lds_addr = reinterpret_cast<uintptr_t>(smem_scales);
+        as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
+        llvm_amdgcn_raw_buffer_load_lds(srd, lds_ptr, 16, lane_id * 16, 0, 0, 0);
+    } else if (warp_id == 4) {
+        const uint32_t *src = scale_B_iter + (size_t)k_iter * N_dim + block_n;
+        i32x4 srd = make_srsrc((const void *)src, 1024);
+        uintptr_t lds_addr = reinterpret_cast<uintptr_t>(smem_scales + 1024);
+        as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
+        llvm_amdgcn_raw_buffer_load_lds(srd, lds_ptr, 16, lane_id * 16, 0, 0, 0);
+    }
 }
 } // namespace kittens

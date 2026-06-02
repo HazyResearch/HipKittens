@@ -20,14 +20,24 @@ endif
 
 CXXFLAGS := -w
 
-TARGET=tk_kernel
-SRC=8_wave.cu
-BUILD_DIR=build
+BUILD_DIR=build2
 
-$(TARGET): $(SRC)
+all: 8_wave_TN 8_wave_NN 8_wave_NT
+
+8_wave_TN: 8_wave_TN.cu
 	mkdir -p $(BUILD_DIR)
-	$(HIPCXX) $(HIPFLAGS) $(CXXFLAGS) -c $(SRC) -o $(BUILD_DIR)/8_wave.o
-	$(HIPCXX) $(HIPFLAGS) $(BUILD_DIR)/8_wave.o -o $(TARGET)
+	$(HIPCXX) $(HIPFLAGS) $(CXXFLAGS) -c $< -o $(BUILD_DIR)/$@.o
+	$(HIPCXX) $(HIPFLAGS) $(BUILD_DIR)/$@.o -o $@
+
+8_wave_NN: 8_wave_NN.cu
+	mkdir -p $(BUILD_DIR)
+	$(HIPCXX) $(HIPFLAGS) $(CXXFLAGS) -c $< -o $(BUILD_DIR)/$@.o
+	$(HIPCXX) $(HIPFLAGS) $(BUILD_DIR)/$@.o -o $@
+
+8_wave_NT: 8_wave_NT.cu
+	mkdir -p $(BUILD_DIR)
+	$(HIPCXX) $(HIPFLAGS) $(CXXFLAGS) -c $< -o $(BUILD_DIR)/$@.o
+	$(HIPCXX) $(HIPFLAGS) $(BUILD_DIR)/$@.o -o $@
 
 clean:
-	rm -rf $(BUILD_DIR) $(TARGET)
+	rm -rf $(BUILD_DIR) 8_wave_TN 8_wave_NN 8_wave_NT

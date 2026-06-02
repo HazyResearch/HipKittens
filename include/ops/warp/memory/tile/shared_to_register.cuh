@@ -688,4 +688,52 @@ __device__ inline static void store(ST &dst, const RT &src) {
     }
 }
 
+template<ducks::rt::row_layout RT, ducks::st::all ST>
+__device__ inline static void load_col(RT &dst, const ST &src, int col_offset = 0) {
+    static_assert(std::is_same_v<typename RT::dtype, fp8e4m3_4>,
+                  "load_col only supports fp8e4m3 (used for both e4m3 and e5m2 storage)");
+    static_assert(RT::cols == ST::rows,
+                  "load_col: ST.rows must equal RT::cols (K dimension)");
+    static_assert(RT::width == 1, "load_col: only width==1 supported");
+
+    const int laneid   = kittens::laneid();
+    const int block_id = laneid / 16;
+    const int l_within = laneid % 16;
+    const int tr_k_grp = l_within / 2;
+    const int m_half   = l_within & 1;
+
+    const uint32_t src_ptr      = (uint32_t)(uintptr_t)(&src.data[0]);
+    constexpr int subtile_bytes = ST::underlying_subtile_bytes;
+
+    #pragma unroll
+    for (int N = 0; N < RT::height; N++) {
+        const int m_col = col_offset + N * RT::base_tile_rows + m_half * 8;
+
+        const int subtile_base = block_id;
+        uint32_t addr = src_ptr
+                      + (uint32_t)(subtile_base * subtile_bytes)
+                      + src.swizzle({tr_k_grp, m_col});
+
+        asm volatile(
+            "ds_read_b64_tr_b8 %0, %2 offset:0\n"
+            "ds_read_b64_tr_b8 %1, %2 offset:%3\n"
+            : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[N][0].data[0])),
+              "=&v"(*reinterpret_cast<float2*>(&dst.tiles[N][0].data[4]))
+            : "v"(addr), "i"(4 * subtile_bytes)
+            : "memory"
+        );
+
+        addr ^= 1088u;
+
+        asm volatile(
+            "ds_read_b64_tr_b8 %0, %2 offset:0\n"
+            "ds_read_b64_tr_b8 %1, %2 offset:%3\n"
+            : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[N][0].data[2])),
+              "=&v"(*reinterpret_cast<float2*>(&dst.tiles[N][0].data[6]))
+            : "v"(addr), "i"(4 * subtile_bytes)
+            : "memory"
+        );
+    }
+}
+
 } // namespace kittens
