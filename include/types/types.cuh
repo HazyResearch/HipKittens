@@ -75,6 +75,7 @@ using st_32x32_s = ducks::st_shape::st_32x32;
 using st_16x32_s = ducks::st_shape::st_16x32;
 using st_32x16_s = ducks::st_shape::st_32x16;
 using st_8x32_s = ducks::st_shape::st_8x32;
+using st_16x64_s = ducks::st_shape::st_16x64;
 using st_16x128_s = ducks::st_shape::st_16x128;
 
 }

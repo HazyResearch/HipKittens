@@ -201,10 +201,10 @@ __device__ static inline void mma_AB_base(rt_base<float, ducks::rt_layout::col, 
  * @param[in] b The second input rt_base<bf16_2, row_layout> matrix in row-major mode.
  * @param[in] c The input rt_base<float2, row_layout> accumulator matrix.
  */
-template<ducks::rt_shape::all D_shape, ducks::rt_shape::all A_shape, ducks::rt_shape::all B_shape, ducks::rt_shape::all C_shape, typename MM_Operand_T=bf16>
+template<ducks::rt_shape::all D_shape, ducks::rt_layout::all A_layout, ducks::rt_shape::all A_shape, ducks::rt_layout::all B_layout, ducks::rt_shape::all B_shape, ducks::rt_shape::all C_shape, typename MM_Operand_T=bf16>
 __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col, D_shape> &d,
-    const rt_base<MM_Operand_T, ducks::rt_layout::row, A_shape> &a,
-    const rt_base<MM_Operand_T, ducks::rt_layout::row, B_shape> &b, // in row-major mode
+    const rt_base<MM_Operand_T, A_layout, A_shape> &a,
+    const rt_base<MM_Operand_T, B_layout, B_shape> &b,
     const rt_base<float, ducks::rt_layout::col, C_shape> &c) {
 
     static_assert(std::is_same_v<D_shape, C_shape>, "D and C must have the same shape");
@@ -244,6 +244,32 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col,
 }
 
 /**
+ * @brief Pack 4 E8M0 scale bytes from LDS into one fp8e8m0_4 register.
+ *
+ * @param smem_scales LDS pointer to scale tile data.
+ * @param row_offset Starting row within the scale region (warp's tile offset).
+ * @return fp8e8m0_4 with 4 scale bytes packed for MFMA opsel.
+ */
+__device__ __forceinline__ fp8e8m0_4 pack_scales(
+    const fp8e8m0 *smem_scales, int row_offset) {
+    int lid   = laneid();
+    int r16   = lid % 16;
+    int k_sub = lid / 16;
+
+    const fp8e8m0_4 *s4 = (const fp8e8m0_4 *)smem_scales;
+    fp8e8m0_4 w0 = s4[row_offset + 0 * 16 + r16];
+    fp8e8m0_4 w1 = s4[row_offset + 1 * 16 + r16];
+    fp8e8m0_4 w2 = s4[row_offset + 2 * 16 + r16];
+    fp8e8m0_4 w3 = s4[row_offset + 3 * 16 + r16];
+
+    fp8e8m0_4 sel = 0x0C0C0000u | (k_sub << 8) | (4u + k_sub);
+    fp8e8m0_4 lo  = __builtin_amdgcn_perm(w0, w1, sel);
+    fp8e8m0_4 hi  = __builtin_amdgcn_perm(w2, w3, sel);
+
+    return lo | (hi << 16);
+}
+
+/**
  * @brief Base dot product operation for row layout.
  *
  * This function performs the base dot product operation
@@ -254,10 +280,10 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col,
  * @param[in] b The second input rt_base<Operand_T, row_layout> matrix.
  * @param[in] c The input rt_base<float, col_layout> accumulator matrix.
  */
-template<int opsel_a, int opsel_b, int cbsz = 0, int blgp = 0, ducks::rt_shape::all D_shape, ducks::rt_shape::all A_shape, ducks::rt_shape::all B_shape, ducks::rt_shape::all C_shape, typename MM_Operand_T>
+template<int opsel_a, int opsel_b, int cbsz = 0, int blgp = 0, ducks::rt_shape::all D_shape, ducks::rt_layout::all A_layout, ducks::rt_shape::all A_shape, ducks::rt_layout::all B_layout, ducks::rt_shape::all B_shape, ducks::rt_shape::all C_shape, typename MM_Operand_T>
 __device__ static inline void mma_ABt_base_scaled(rt_base<float, ducks::rt_layout::col, D_shape> &d,
-    const rt_base<MM_Operand_T, ducks::rt_layout::row, A_shape> &a,
-    const rt_base<MM_Operand_T, ducks::rt_layout::row, B_shape> &b,
+    const rt_base<MM_Operand_T, A_layout, A_shape> &a,
+    const rt_base<MM_Operand_T, B_layout, B_shape> &b,
     const rt_base<float, ducks::rt_layout::col, C_shape> &c,
     const fp8e8m0_4 *scale_a,
     const fp8e8m0_4 *scale_b) {
@@ -441,7 +467,7 @@ __device__ static inline void mma_AB(D &d,
  * @param[in] b The second input rt_bf<M, K, row_layout> matrix in row-major mode.
  * @param[in] c The input rt_fl<N, M, row_layout> accumulator matrix.
  */
-template<ducks::rt::col_layout D, ducks::rt::row_layout A, ducks::rt::row_layout B, ducks::rt::col_layout C>
+template<ducks::rt::col_layout D, ducks::rt::all A, ducks::rt::all B, ducks::rt::col_layout C>
 __device__ static inline void mma_ABt(D &d,
                                 const A &a,
                                 const B &b, // notice row and (M, K) instead of col and (K, M)
@@ -499,7 +525,7 @@ __device__ static inline void mma_ABt(D &d,
  * @param[in] scale_a Pointer to the packed E8M0 scale for the A matrix.
  * @param[in] scale_b Pointer to the packed E8M0 scale for the B matrix.
  */
-template<int cbsz = 0, int blgp = 0, ducks::rt::col_layout D, ducks::rt::row_layout A, ducks::rt::row_layout B, ducks::rt::col_layout C>
+template<int cbsz = 0, int blgp = 0, ducks::rt::col_layout D, ducks::rt::all A, ducks::rt::all B, ducks::rt::col_layout C>
 __device__ static inline void mma_ABt_scaled(D &d,
                                 const A &a,
                                 const B &b,
