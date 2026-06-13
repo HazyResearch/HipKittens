@@ -1,7 +1,6 @@
 import torch
 import tk_kernel
 import random
-import time
 
 profiling = True
 
@@ -15,49 +14,11 @@ B = torch.randn(N, N, dtype=torch.bfloat16, device='cuda') / 10.0
 Bt = B.t().contiguous()  # Transpose B for the kernel
 
 
-if profiling:
-    ############### LOGGING STUFF ###############
+def efficiency(flop_count, time_ms):
+    flop_t = flop_count / 1e12
+    time_s = time_ms / 1e3
+    return flop_t / time_s
 
-    import os
-    import time
-    import shutil
-    import re
-
-    def parse_makefile_targets(makefile_path):
-        src = None
-        with open(makefile_path, "r") as f:
-            for line in f:
-                if match := re.match(r"^SRC\s*=\s*(\S+)", line):
-                    src = match.group(1)
-        return src
-
-    base_dir = os.path.dirname(os.path.realpath(__file__))
-
-    # Set destination directory
-    dirpath = "/workdir/data_logs/"
-    timestamp = time.strftime("%m%d_%H%M%S")
-    new_dir = os.path.join(dirpath, f"{timestamp}_outputs")
-    os.makedirs(new_dir, exist_ok=True)
-
-    # Files to copy (relative to base_dir)
-    src_name = parse_makefile_targets(os.path.join(base_dir, "Makefile"))
-    print(f"src: {src_name}")
-    files_to_copy = [
-        "Makefile",
-        src_name, 
-        "tk_kernel.cpython-313-x86_64-linux-gnu.so",
-        "tk_kernel.cpython-312-x86_64-linux-gnu.so"
-    ]
-
-    for filename in files_to_copy:
-        src = os.path.join(base_dir, filename)
-        dst = os.path.join(new_dir, filename)
-        if os.path.exists(src):
-            shutil.copy2(src, dst)
-        else:
-            print(f"Warning: {filename} not found at {src}, skipping.")
-
-    ################ END LOGGING STUFF ###############
 
 if profiling:
     num_warmup = 20
@@ -83,12 +44,11 @@ if profiling:
         torch.cuda.synchronize()
         elapsed_time = start_event.elapsed_time(end_event)
         timings_ref.append(elapsed_time)
-    if profiling:
-        print(f"{C_ref.dtype=}")
-        avg_time_ref = sum(timings_ref) / len(timings_ref)
-        tflops_ref = flops_ref / (avg_time_ref * 1e9) 
-        print(f"PyTorch reference average execution time: {avg_time_ref:.4f} ms")
-        print(f"PyTorch reference performance: {tflops_ref:.2f} TFLOPS for {N}x{N} matrix multiplication.\n")
+    print(f"{C_ref.dtype=}")
+    avg_time_ref = sum(timings_ref) / len(timings_ref)
+    tflops_ref = efficiency(flops_ref, avg_time_ref)
+    print(f"PyTorch reference average execution time: {avg_time_ref:.4f} ms")
+    print(f"PyTorch reference performance: {tflops_ref:.2f} TFLOPS for {N}x{N} matrix multiplication.\n")
 
 
 # Kernel matmul
@@ -107,7 +67,7 @@ for _ in range(num_iters):
 if profiling:
     print(f"{C.dtype=}")
     avg_time = sum(timings) / len(timings)
-    tflops = flops_ref / (avg_time * 1e9) 
+    tflops = efficiency(flops_ref, avg_time)
     print(f"Average execution time: {avg_time:.4f} ms")
     print(f"Performance: {tflops:.2f} TFLOPS for {N}x{N} matrix multiplication.\n")
 
@@ -156,27 +116,5 @@ if profiling:
     print("diff[7232:7296, 7232:7296].max()", diff[7232:7296, 7232:7296].max())
     print("diff[7296:7360, 7296:7360].max()", diff[7296:7360, 7296:7360].max())
     print("diff[7360:7424, 7360:7424].max()", diff[7360:7424, 7360:7424].max())
-
-
-
-
-    ############### LOGGING OUTPUTS ####################
-
-    data_to_log = {
-        "N": N,
-        "avg_time_ref": avg_time_ref,
-        "tflops_ref": tflops_ref,
-        "avg_time": avg_time,
-        "tflops": tflops,
-        "max_error": max_error,
-        "mean_error": mean_error,
-        "error_count": error_count,
-    }
-
-    import json
-    with open(os.path.join(new_dir, "data_to_log.json"), "w") as f:
-        json.dump(data_to_log, f, indent=4)
-
-    ################ END LOGGING OUTPUTS ###############
 
     
