@@ -1,35 +1,10 @@
-GPU_TARGET=CDNA4
-COMP_LEVEL=profile
+GPU_TARGET ?= CDNA4
+COMP_LEVEL ?= profile
+BUILD_MODE := standalone
+TARGET ?= tk_kernel
+SRC ?= 4_wave.cu
 
-GPU_RUNTIME := HIP
+EXTRA_HIPFLAGS += -fopenmp -Wl,--allow-multiple-definition
+EXTRA_HIPFLAGS += -Rpass-analysis=kernel-resource-usage
 
-ROCM_INSTALL_DIR := $(ROCM_PATH)
-HIP_INCLUDE_DIR  := $(ROCM_INSTALL_DIR)/include/hip
-
-HIPCXX ?= $(ROCM_INSTALL_DIR)/bin/hipcc
-HIPFLAGS=-std=c++20 -I$(HIP_INCLUDE_DIR) -I../../../../include -Wall -Wextra -Wl,--allow-multiple-definition -DKITTENS_CDNA4 --offload-arch=gfx950 -fopenmp
-
-ifeq ($(COMP_LEVEL),safe)
-HIPFLAGS+= -O0
-else ifeq ($(COMP_LEVEL),debug)
-HIPFLAGS+= -g -O0
-else ifeq ($(COMP_LEVEL),profile)
-HIPFLAGS+= -O3 -Rpass-analysis=kernel-resource-usage # --save-temps
-endif
-
-CXXFLAGS ?= -Wall -Wextra
-CXXFLAGS := -w
-
-ICXXFLAGS += $(CXXFLAGS) 
-
-TARGET=tk_kernel
-SRC=4_wave.cu
-BUILD_DIR=build
-
-$(TARGET): $(SRC)
-	mkdir -p $(BUILD_DIR)
-	$(HIPCXX) $(HIPFLAGS) $(ICXXFLAGS) -c $(SRC) -o $(BUILD_DIR)/4_wave.o
-	$(HIPCXX) $(HIPFLAGS) $(BUILD_DIR)/4_wave.o -o $(TARGET)
-
-clean:
-	rm -rf $(BUILD_DIR) $(TARGET)
+include ../../../common.mk

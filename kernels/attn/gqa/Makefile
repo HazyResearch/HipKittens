@@ -1,73 +1,25 @@
-# Compiler
-GPU_TARGET=CDNA4
+GPU_TARGET ?= CDNA4
+TARGET ?= tk_kernel
+PYTHON ?= python3.12
 
-TARGET=tk_kernel
-
-# parameters
 ATTN_B ?= 16
 ATTN_H ?= 64
 ATTN_H_KV ?= 8
 ATTN_N ?= 2048
 ATTN_D ?= 128
 
-# if attention d is 64 use kernel.cpp else use kernel_64.cpp
-ifeq ($(ATTN_D),64)
-SRC=kernel_d64.cpp
-else
-SRC=kernel.cpp
-endif
-
 CPPFLAGS += -DATTN_B=$(ATTN_B)
 CPPFLAGS += -DATTN_H=$(ATTN_H)
 CPPFLAGS += -DATTN_H_KV=$(ATTN_H_KV)
 CPPFLAGS += -DATTN_N=$(ATTN_N)
 
-# HIP variables
-ROCM_INSTALL_DIR := $(ROCM_PATH)
-HIP_INCLUDE_DIR  := $(ROCM_INSTALL_DIR)/include/hip
-
-HIPCXX ?= $(ROCM_INSTALL_DIR)/bin/hipcc
-
-# Compiler flags based on GPU target
-ifeq ($(GPU_TARGET),CDNA2)
-HIPFLAGS+= -DKITTENS_CDNA2 --offload-arch=gfx90a
-else ifeq ($(GPU_TARGET),CDNA3)
-HIPFLAGS+= -DKITTENS_CDNA3 --offload-arch=gfx942
-else ifeq ($(GPU_TARGET),CDNA4)
-HIPFLAGS+= -DKITTENS_CDNA4 --offload-arch=gfx950 -DHIP_ENABLE_WARP_SYNC_BUILTINS -ffast-math
+ifeq ($(ATTN_D),64)
+SRC ?= kernel_d64.cpp
+else
+SRC ?= kernel.cpp
 endif
 
-# Common variables and flags
-CXX_STD   := c++20
-ICXXFLAGS := -std=$(CXX_STD)
-ICPPFLAGS := -I${THUNDERKITTENS_ROOT}/include -I$(HIP_INCLUDE_DIR)
-ILDFLAGS  :=
-ILDLIBS   :=
+EXTRA_HIPFLAGS += -DHIP_ENABLE_WARP_SYNC_BUILTINS -ffast-math
+EXTRA_ICXXFLAGS += --save-temps
 
-CXXFLAGS ?= -Wall -Wextra
-CXXFLAGS := -w
-
-ICXXFLAGS += $(CXXFLAGS)
-ICPPFLAGS += $(CPPFLAGS)
-ILDFLAGS  += $(LDFLAGS)
-ILDLIBS   += $(LDLIBS)
-
-PY_LDFLAGS := $(shell python3-config --ldflags | sed 's/-lcrypt//g')
-ICXXFLAGS += $(PY_LDFLAGS)
-ICXXFLAGS+= -I${THUNDERKITTENS_ROOT}/include -I${THUNDERKITTENS_ROOT}/prototype $(shell python3 -m pybind11 --includes) -shared -fPIC -Rpass-analysis=kernel-resource-usage --save-temps
-
-
-# Default target
-all: $(TARGET)
-
-LOGDIR := /workdir/data_logs/$(shell date +%m%d_%H%M%S)_outputs
-LOGFILE := $(LOGDIR)/make_build.log
-
-$(TARGET): $(SRC)
-	@mkdir -p $(LOGDIR)
-	$(HIPCXX) $(SRC) $(HIPFLAGS) $(ICXXFLAGS) $(ICPPFLAGS) $(ILDFLAGS) \
-	    -o $(TARGET)$(shell python3-config --extension-suffix) 2>&1 | tee $(LOGFILE)
-
-# Clean target
-clean:
-	rm -f $(TARGET)
+include ../../common.mk

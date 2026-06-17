@@ -8,7 +8,7 @@ import time
 import sys
 import os
 
-use_aiter = True
+use_aiter = False
 if use_aiter:
     import aiter
 
@@ -221,7 +221,8 @@ V_tk = V_bhnd.transpose(1, 2).bfloat16().clone().contiguous().detach().requires_
 dO_tk = dO_bhnd.transpose(1, 2).bfloat16().clone().contiguous()
 
 # Call TK forward to get O and L
-O_tk = torch.zeros_like(out_aiter_bnhd).bfloat16().clone().contiguous()
+# Use Q layout for output allocation so HK can run even if AITER is disabled.
+O_tk = torch.zeros_like(Q_tk).bfloat16().clone().contiguous()
 L_tk = torch.zeros((B, H, N, 1), device='cuda').float().transpose(-1, -2).contiguous()
 # print(Q_tk.shape, K_tk.shape, V_tk.shape, O_tk.shape, L_tk.shape)
 tk_kernel_fwd.dispatch_fwd(Q_tk, K_tk, V_tk, O_tk, L_tk)
@@ -233,10 +234,10 @@ tk_kernel_fwd.dispatch_fwd(Q_tk, K_tk, V_tk, O_tk, L_tk)
 print("Running HipKittens...")
 timings = []
 for _ in range(num_warmup):
-    dQ_tk_in = torch.zeros_like(q_grad_aiter_bnhd).bfloat16().transpose(1, 2).contiguous()
-    dQ_tk = torch.zeros_like(q_grad_aiter_bnhd).bfloat16().contiguous()
-    dK_tk = torch.zeros_like(k_grad_aiter_bnhd).bfloat16().contiguous()
-    dV_tk = torch.zeros_like(v_grad_aiter_bnhd).bfloat16().contiguous()
+    dQ_tk_in = torch.zeros_like(Q_tk).bfloat16().transpose(1, 2).contiguous()
+    dQ_tk = torch.zeros_like(Q_tk).bfloat16().contiguous()
+    dK_tk = torch.zeros_like(K_tk).bfloat16().contiguous()
+    dV_tk = torch.zeros_like(V_tk).bfloat16().contiguous()
     delta_tk = torch.zeros((B, H, N, 1), device='cuda').float().transpose(-1, -2).contiguous()
 
     tk_kernel_bkwd_prep.dispatch_prep(
@@ -263,10 +264,10 @@ for _ in range(num_warmup):
     )
 
 for _ in range(num_iters):
-    dQ_tk_in = torch.zeros_like(q_grad_aiter_bnhd).bfloat16().transpose(1, 2).contiguous()
-    dQ_tk = torch.zeros_like(q_grad_aiter_bnhd).bfloat16().contiguous()
-    dK_tk = torch.zeros_like(k_grad_aiter_bnhd).bfloat16().contiguous()
-    dV_tk = torch.zeros_like(v_grad_aiter_bnhd).bfloat16().contiguous()
+    dQ_tk_in = torch.zeros_like(Q_tk).bfloat16().transpose(1, 2).contiguous()
+    dQ_tk = torch.zeros_like(Q_tk).bfloat16().contiguous()
+    dK_tk = torch.zeros_like(K_tk).bfloat16().contiguous()
+    dV_tk = torch.zeros_like(V_tk).bfloat16().contiguous()
     # delta_tk = torch.zeros_like(delta_tiled).float()
     delta_tk = torch.zeros((B, H, N, 1), device='cuda').float().transpose(-1, -2).contiguous()
     torch.cuda.synchronize()
@@ -314,56 +315,54 @@ print(f"HipKittens performance: {eff_tk:.2f} TFLOPS for {B=} H={H} H_KV={H_KV} N
 
 num_print = 8
 
-# HK vs AITER
-print(f"\nHipKittens vs AITER comparison:")
-print("\nO outputs:")
-print("HK: ", O_tk[0, 0, :num_print, 0], "Max:", O_tk.max().item())
-print("AITER: ", out_aiter_bnhd[0, 0, :num_print, 0], "Max:", out_aiter_bnhd.max().item())
+if use_aiter:
+    # HK vs AITER
+    print(f"\nHipKittens vs AITER comparison:")
+    print("\nO outputs:")
+    print("HK: ", O_tk[0, 0, :num_print, 0], "Max:", O_tk.max().item())
+    print("AITER: ", out_aiter_bnhd[0, 0, :num_print, 0], "Max:", out_aiter_bnhd.max().item())
 
-print()
-print("\nGradient K outputs:")
-print("HK: ", dK_tk[0, 0, 0, :num_print], "Max:", dK_tk.max().item())
-print("AITER: ", k_grad_aiter_bnhd[0, 0, 0, :num_print], "Max:", k_grad_aiter_bnhd.max().item())
+    print()
+    print("\nGradient K outputs:")
+    print("HK: ", dK_tk[0, 0, 0, :num_print], "Max:", dK_tk.max().item())
+    print("AITER: ", k_grad_aiter_bnhd[0, 0, 0, :num_print], "Max:", k_grad_aiter_bnhd.max().item())
 
-print()
-print("Gradient V outputs:")
-print("HK: ", dV_tk[0, 0, 0, :num_print], "Max:", dV_tk.max().item())
-print("AITER: ", v_grad_aiter_bnhd[0, 0, 0, :num_print], "Max:", v_grad_aiter_bnhd.max().item())
+    print()
+    print("Gradient V outputs:")
+    print("HK: ", dV_tk[0, 0, 0, :num_print], "Max:", dV_tk.max().item())
+    print("AITER: ", v_grad_aiter_bnhd[0, 0, 0, :num_print], "Max:", v_grad_aiter_bnhd.max().item())
 
-print()
-print("Gradient Q outputs:")
-print("HK: ", dQ_tk[0, 0, 0, :num_print], "Max:", dQ_tk.max().item())
-print("AITER: ", q_grad_aiter_bnhd[0, 0, 0, :num_print], "Max:", q_grad_aiter_bnhd.max().item())
-# print("Diff: ", (dQ_tk - q_grad_aiter_bnhd)[0, :, 0, 32:48], "Max:", (dQ_tk - q_grad_aiter_bnhd).max().item())
+    print()
+    print("Gradient Q outputs:")
+    print("HK: ", dQ_tk[0, 0, 0, :num_print], "Max:", dQ_tk.max().item())
+    print("AITER: ", q_grad_aiter_bnhd[0, 0, 0, :num_print], "Max:", q_grad_aiter_bnhd.max().item())
 
+    # **************************************************
+    # HK vs AITER (robust tolerances & metrics)
+    # **************************************************
+    print(f"\nRobustness checks (HK vs AITER):")
+    o_diff, o_err_cnt, o_total, o_rel_error, o_l2_error, o_cos, o_mask = robustness_check(O_tk, out_aiter_bnhd)
+    print(f"O: max_abs={o_diff.max().item():.6f}, max_rel={o_rel_error:.4f}, "
+          f"rel_l2={o_l2_error:.4f}, cos={o_cos:.6f}, "
+          f"errors={o_err_cnt}/{o_total} ({100*o_err_cnt/o_total:.4f}%)")
 
-# **************************************************
-# HK vs AITER (robust tolerances & metrics)
-# **************************************************
-# Compare O and L with AITER
-print(f"\nRobustness checks (HK vs AITER):") 
-o_diff, o_err_cnt, o_total, o_rel_error, o_l2_error, o_cos, o_mask = robustness_check(O_tk, out_aiter_bnhd)
-print(f"O: max_abs={o_diff.max().item():.6f}, max_rel={o_rel_error:.4f}, "
-      f"rel_l2={o_l2_error:.4f}, cos={o_cos:.6f}, "
-      f"errors={o_err_cnt}/{o_total} ({100*o_err_cnt/o_total:.4f}%)")
+    # **************************************************
+    # HK vs AITER (gradient comparisons)
+    # **************************************************
+    print(f"\nGradient comparisons (HK vs AITER):")
+    q_diff, q_err_cnt, q_total, q_rel_error, q_l2_error, q_cos, q_mask = robustness_check(q_grad_aiter_bnhd, dQ_tk)
+    k_diff, k_err_cnt, k_total, k_rel_error, k_l2_error, k_cos, k_mask = robustness_check(k_grad_aiter_bnhd, dK_tk)
+    v_diff, v_err_cnt, v_total, v_rel_error, v_l2_error, v_cos, v_mask = robustness_check(v_grad_aiter_bnhd, dV_tk)
 
-# **************************************************
-# HK vs AITER (gradient comparisons)
-# **************************************************
-print(f"\nGradient comparisons (HK vs AITER):") 
-
-# Compute diffs in float32 to avoid bf16 quantization in the comparison itself
-q_diff, q_err_cnt, q_total, q_rel_error, q_l2_error, q_cos, q_mask = robustness_check(q_grad_aiter_bnhd, dQ_tk)
-k_diff, k_err_cnt, k_total, k_rel_error, k_l2_error, k_cos, k_mask = robustness_check(k_grad_aiter_bnhd, dK_tk)
-v_diff, v_err_cnt, v_total, v_rel_error, v_l2_error, v_cos, v_mask = robustness_check(v_grad_aiter_bnhd, dV_tk)
-
-print(f"Q grad: max_abs={q_diff.max().item():.6f}, max_rel={q_rel_error:.4f}, "
-        f"rel_l2={q_l2_error:.4f}, cos={q_cos:.6f}, "
-      f"errors={q_err_cnt}/{q_total} ({100*q_err_cnt/q_total:.4f}%)")
-print(f"K grad: max_abs={k_diff.max().item():.6f}, max_rel={k_rel_error:.4f}, "
-      f"rel_l2={k_l2_error:.4f}, cos={k_cos:.6f}, "
-      f"errors={k_err_cnt}/{k_total} ({100*k_err_cnt/k_total:.4f}%)")
-print(f"V grad: max_abs={v_diff.max().item():.6f}, max_rel={v_rel_error:.4f}, "
-      f"rel_l2={v_l2_error:.4f}, cos={v_cos:.6f}, "
-      f"errors={v_err_cnt}/{v_total} ({100*v_err_cnt/v_total:.4f}%)")
+    print(f"Q grad: max_abs={q_diff.max().item():.6f}, max_rel={q_rel_error:.4f}, "
+            f"rel_l2={q_l2_error:.4f}, cos={q_cos:.6f}, "
+          f"errors={q_err_cnt}/{q_total} ({100*q_err_cnt/q_total:.4f}%)")
+    print(f"K grad: max_abs={k_diff.max().item():.6f}, max_rel={k_rel_error:.4f}, "
+          f"rel_l2={k_l2_error:.4f}, cos={k_cos:.6f}, "
+          f"errors={k_err_cnt}/{k_total} ({100*k_err_cnt/k_total:.4f}%)")
+    print(f"V grad: max_abs={v_diff.max().item():.6f}, max_rel={v_rel_error:.4f}, "
+          f"rel_l2={v_l2_error:.4f}, cos={v_cos:.6f}, "
+          f"errors={v_err_cnt}/{v_total} ({100*v_err_cnt/v_total:.4f}%)")
+else:
+    print("\nAITER comparison skipped (use_aiter=False).")
 

@@ -10,6 +10,9 @@
 __pycache__/
 */printouts/*
 tests/unit/build/
+tests/unit/*/build/
+tests/unit/*/unit_tests
+hsakmt_counters.csv
 *.o
 build/
 *.egg-info/
@@ -28,5 +31,9 @@ utils/__pycache__/
 *amd-amdhsa-gfx950.hipi
 *amd-amdhsa-gfx950.bc
 
+# Host-specific build/test scripts.
+kernels/gemm/bf16fp32/gfx1250/*.sh
+kernels/gemm/bf16fp32/gfx1250/*.sbatch
+kernels/gemm/bf16fp32/gfx1250/*.out
 
 !CMakeLists.txt
