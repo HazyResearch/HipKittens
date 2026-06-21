@@ -41,10 +41,10 @@ __device__ inline static void load(RT &dst, const ST &src) {
     int row_offset, col_offset;
     if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {
         row_offset = laneid%16;
-        col_offset = 4*(laneid/16);
+        col_offset = std::is_same_v<T, fp8e4m3> ? 8*(laneid/16) : 4*(laneid/16);
     }
     else {
-        row_offset = 4*(laneid/16);
+        row_offset = std::is_same_v<T, fp8e4m3> ? 8*(laneid/16) : 4*(laneid/16);
         col_offset = laneid%16;
     }
 
@@ -77,7 +77,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                         asm volatile(
                             "ds_read_b64 %0, %1 offset:%2\n"
                             : "=v"(*reinterpret_cast<uint64_t*>(&dst.tiles[i][j].data[0]))
-                            : "v"(addr), "i"(i * ST::underlying_cols * kittens::TILE_ROW_DIM<U> * sizeof(U))
+                            : "v"(addr), "i"(i * ST::underlying_cols * kittens::TILE_ROW_DIM<U, typename ST::layout> * sizeof(U))
                             : "memory"
                         );
                     } else {
@@ -91,8 +91,22 @@ __device__ inline static void load(RT &dst, const ST &src) {
                 }
             }
             else { // handle the column-major layout
-                dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(U2{src[{row, col}], src[{row+1, col}]});
-                dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(U2{src[{row+2, col}], src[{row+3, col}]});
+                if constexpr (std::is_same_v<T, fp8e4m3>) {
+                    dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(
+                        base_types::make_fp8e4m3_4(
+                            src[{row, col}], src[{row+1, col}], src[{row+2, col}], src[{row+3, col}]
+                        )
+                    );
+                    dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(
+                        base_types::make_fp8e4m3_4(
+                            src[{row+4, col}], src[{row+5 , col}], src[{row+6, col}], src[{row+7, col}]
+                        )
+                    );
+                }
+                else {
+                    dst.tiles[i][j].data[0] = base_types::convertor<T2, U2>::convert(U2{src[{row, col}], src[{row+1, col}]});
+                    dst.tiles[i][j].data[1] = base_types::convertor<T2, U2>::convert(U2{src[{row+2, col}], src[{row+3, col}]});
+                }
             }
         }
     }
