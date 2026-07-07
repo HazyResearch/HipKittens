@@ -732,11 +732,10 @@ __device__ inline void load(
 
     constexpr int sub_rows     = Shape::rows;
     constexpr int sub_cols     = Shape::cols;
-    constexpr int sub_elems    = sub_rows * sub_cols;
     constexpr int height       = WARP_M / sub_rows;
     constexpr int width        = WARP_K / sub_cols;
-    constexpr int subs_per_row = WARP_K / sub_cols;
-    constexpr int half_cols    = sub_cols / 2;
+    // g2r uses col_offset = rt_16x32::stride * (lane / 16) == 8 * half, not half * 16.
+    constexpr int half_col_stride = sub_cols / 4;
 
     const int L    = kittens::laneid();
     const int row  = L % sub_rows;
@@ -746,23 +745,22 @@ __device__ inline void load(
     for (int ti = 0; ti < height; ti++) {
         #pragma unroll
         for (int tj = 0; tj < width; tj++) {
-            const int sub_id     = ti * subs_per_row + tj;
-            const int base_flat  = warp_origin_flat
-                                 + sub_id * sub_elems
-                                 + row * sub_cols
-                                 + half * half_cols;
-            const int padded_off = src.padded(base_flat);
+            const int origin_row = warp_origin_flat / C;
+            const int origin_col = warp_origin_flat % C;
+            const int gr         = origin_row + row + ti * sub_rows;
+            const int gc0        = origin_col + tj * sub_cols + half * half_col_stride;
+            const int gc1        = gc0 + sub_cols / 2;
 
-            // Two 16B ds_load_b128s fill the 16 bf16 per lane; bank-conflict-free
-            // thanks to the tile's padding.
-            const uint32_t addr = static_cast<uint32_t>(
-                reinterpret_cast<uintptr_t>(src.data + padded_off));
+            const uint32_t addr0 = static_cast<uint32_t>(
+                reinterpret_cast<uintptr_t>(src.data) + src.swizzle({gr, gc0}));
+            const uint32_t addr1 = static_cast<uint32_t>(
+                reinterpret_cast<uintptr_t>(src.data) + src.swizzle({gr, gc1}));
 
             float4 lo, hi;
             asm volatile("ds_load_b128 %0, %1 offset:0\n"
-                : "=v"(lo) : "v"(addr) : "memory");
-            asm volatile("ds_load_b128 %0, %1 offset:16\n"
-                : "=v"(hi) : "v"(addr) : "memory");
+                : "=v"(lo) : "v"(addr0) : "memory");
+            asm volatile("ds_load_b128 %0, %1 offset:0\n"
+                : "=v"(hi) : "v"(addr1) : "memory");
 
             bf16_2* lo_p = reinterpret_cast<bf16_2*>(&lo);
             bf16_2* hi_p = reinterpret_cast<bf16_2*>(&hi);

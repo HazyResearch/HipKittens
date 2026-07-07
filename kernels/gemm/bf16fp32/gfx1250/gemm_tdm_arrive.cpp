@@ -94,12 +94,12 @@ void gemm_tdm_arrive_kernel(const gemm_globals g, int M, int N, int K)
     // guard with `laneid() == 0` so each producer wave arrives exactly
     // once per phase (matching the `init_barrier(.., 1)` priming above).
     if (wid == 0) {
-        load_tdm(A_st[0], g.a, {0, 0, tile_m, 0}, M, K, K);
+        load_tdm(A_st[0], g.a, {0, 0, tile_m, 0}, M, K, K, 0, &__shm[0]);
         sync::wait_tdm();
         if (laneid() == 0) sync::async_barrier_arrive(&A_bar[0].state);
     }
     if (wid == 1) {
-        load_tdm(B_st[0], g.b, {0, 0, tile_n, 0}, N, K, K);
+        load_tdm(B_st[0], g.b, {0, 0, tile_n, 0}, N, K, K, 0, &__shm[0]);
         sync::wait_tdm();
         if (laneid() == 0) sync::async_barrier_arrive(&B_bar[0].state);
     }
@@ -114,12 +114,12 @@ void gemm_tdm_arrive_kernel(const gemm_globals g, int M, int N, int K)
 
             if (k + 1 < k_iters) {
                 if (wid == 0) {
-                    load_tdm(A_st[nxt], g.a, {0, 0, tile_m, k + 1}, M, K, K);
+                    load_tdm(A_st[nxt], g.a, {0, 0, tile_m, k + 1}, M, K, K, 0, &__shm[0]);
                     sync::wait_tdm();
                     if (laneid() == 0) sync::async_barrier_arrive(&A_bar[nxt].state);
                 }
                 if (wid == 1) {
-                    load_tdm(B_st[nxt], g.b, {0, 0, tile_n, k + 1}, N, K, K);
+                    load_tdm(B_st[nxt], g.b, {0, 0, tile_n, k + 1}, N, K, K, 0, &__shm[0]);
                     sync::wait_tdm();
                     if (laneid() == 0) sync::async_barrier_arrive(&B_bar[nxt].state);
                 }

@@ -173,8 +173,9 @@ __device__ inline void load(st<T, ROWS, COLS, Shape>& dst, const GL& src,
  *
  * Inverse of the register-mediated `load(st, gl, idx, row_stride)`: reads
  * each element from the tile's subtile-major/padded slot `lds_offset(flat)`
- * and scatters it back to global memory. Pairs with `load` / `load_async` /
- * `load_tdm`, which all land data in the same LDS address map.
+ * and scatters it back to global memory. Pairs with `load` / `load_async`.
+ * For TDM fills use `store_tdm`, which reads the row-major padded map the
+ * hardware lands via the D# padding fields.
  */
 template<int N_THREADS = WARP_THREADS, typename T, int ROWS, int COLS,
          ducks::st_shape::all Shape, ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
@@ -194,6 +195,34 @@ __device__ inline void store(const GL& dst, const st<T, ROWS, COLS, Shape>& src,
         const int row = i / COLS;
         const int col = i % COLS;
         base[row * row_stride + col] = src.data[src.lds_offset(i)];
+    }
+}
+
+/**
+ * @brief Cooperative LDS -> global tile copy for TDM-filled tiles (gfx1250).
+ *
+ * TDM lands a dense row-major tile in LDS and inserts bank-conflict padding
+ * via the D# descriptor. That layout is `shape::padded(row_major_flat)`, not
+ * the subtile-major `lds_offset()` map used by register-mediated/async loads.
+ */
+template<int N_THREADS = WARP_THREADS, typename T, int ROWS, int COLS,
+         ducks::st_shape::all Shape, ducks::gl::all GL, ducks::coord::tile COORD = coord<>>
+__device__ inline void store_tdm(const GL& dst, const st<T, ROWS, COLS, Shape>& src,
+                                 const COORD& idx, int row_stride)
+{
+    constexpr int total_elems = ROWS * COLS;
+    const int tid = threadIdx.x;
+    const int gr_base = idx.r * ROWS;
+    const int gc_base = idx.c * COLS;
+    T* base = dst.raw_ptr
+            + (((int64_t(idx.b) * dst.depth() + idx.d) * dst.rows() + gr_base)
+               * dst.cols() + gc_base);
+
+    #pragma unroll
+    for (int i = tid; i < total_elems; i += N_THREADS) {
+        const int row = i / COLS;
+        const int col = i % COLS;
+        base[row * row_stride + col] = src.data[src.padded(i)];
     }
 }
 
@@ -284,6 +313,12 @@ namespace detail {
 using v4u32 = unsigned int __attribute__((ext_vector_type(4)));
 using v8u32 = unsigned int __attribute__((ext_vector_type(8)));
 
+__device__ __forceinline__ uint32_t lds_byte_offset(const void* lds_ptr,
+                                                    const void* shared_base) {
+    return static_cast<uint32_t>(static_cast<const char*>(lds_ptr)
+                                 - static_cast<const char*>(shared_base));
+}
+
 /**
  * @brief Build the 12-DWord TDM D# (groups 0 + 1) for a 2D tile transfer.
  *
@@ -297,17 +332,15 @@ using v8u32 = unsigned int __attribute__((ext_vector_type(8)));
 template<typename Shape, int ROWS, int COLS, typename T>
 __device__ __forceinline__ void build_tdm_descriptor_2d(
     v4u32& g0, v8u32& g1,
-    const T* base, T* lds_dst,
+    const T* base, uint32_t lds_byte_addr,
     int tensor_rows, int tensor_cols, int row_stride,
     uint32_t cluster_mask, uint32_t bar_lds_addr)
 {
     // ---- Group 0: count, lds_addr, global_addr, type ----
-    const uint32_t lds_addr = static_cast<uint32_t>(
-        reinterpret_cast<uintptr_t>(lds_dst));
     const uint64_t gaddr    = reinterpret_cast<uint64_t>(base);
 
     g0[0] = 1u;                                                  // count
-    g0[1] = lds_addr;
+    g0[1] = lds_byte_addr;
     g0[2] = static_cast<uint32_t>(gaddr);
     g0[3] = (static_cast<uint32_t>(gaddr >> 32) & 0x01FFFFFFu) | (2u << 30);
 
@@ -318,10 +351,13 @@ __device__ __forceinline__ void build_tdm_descriptor_2d(
                                      : (sizeof(T) == 4) ? 2
                                      : 3;
     constexpr uint32_t pad_enable   = (Shape::pad_interval > 0) ? 1u : 0u;
+    // D# fields count DWORD (4B) chunks: interval = 2^(enc+1) DW, amount = enc+1 DW.
+    constexpr uint32_t pad_int_dw   = (Shape::pad_interval * static_cast<int>(sizeof(T))) / 4;
+    constexpr uint32_t pad_amt_dw   = (Shape::pad_amount * static_cast<int>(sizeof(T))) / 4;
     constexpr uint32_t pad_int_enc  = (Shape::pad_interval > 0)
-        ? ( __builtin_ctz(Shape::pad_interval * sizeof(T) / 4) ) : 0;
+        ? (__builtin_ctz(pad_int_dw) - 1u) : 0u;
     constexpr uint32_t pad_amt_enc  = (Shape::pad_amount > 0)
-        ? ( (Shape::pad_amount * sizeof(T) / 4) - 1 ) : 0;
+        ? (pad_amt_dw - 1u) : 0u;
 
     // atomic_barrier_enable lives at bit 18 of group 1 word 0
     // (per the MI400 TDM D# layout: w0 = multicast_mask[15:0],
@@ -347,8 +383,7 @@ __device__ __forceinline__ void build_tdm_descriptor_2d(
     uint32_t w3 = (tdim1 >> 16) | (tiledim0 << 16);
     uint32_t w4 = tiledim1;
 
-    const uint64_t stride0 = static_cast<uint64_t>(
-        static_cast<uint32_t>(row_stride * sizeof(T)));
+    const uint64_t stride0 = static_cast<uint64_t>(static_cast<uint32_t>(row_stride));
     uint32_t w5 = static_cast<uint32_t>(stride0);
     uint32_t w6 = static_cast<uint32_t>(stride0 >> 32);
     uint32_t w7 = 0;
@@ -364,7 +399,8 @@ template<typename T, int ROWS, int COLS, ducks::st_shape::all Shape,
 __device__ inline void load_tdm(st<T, ROWS, COLS, Shape>& dst, const GL& src,
                                 const COORD& idx,
                                 int tensor_rows, int tensor_cols, int row_stride,
-                                uint32_t cluster_mask = 0)
+                                uint32_t cluster_mask = 0,
+                                const void* shared_base = nullptr)
 {
     const int gr_base = idx.r * ROWS;
     const int gc_base = idx.c * COLS;
@@ -372,10 +408,14 @@ __device__ inline void load_tdm(st<T, ROWS, COLS, Shape>& dst, const GL& src,
                   + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
                      * src.cols() + gc_base);
 
+    const uint32_t lds_byte_addr = shared_base
+        ? detail::lds_byte_offset(dst.data, shared_base)
+        : static_cast<uint32_t>(reinterpret_cast<uintptr_t>(dst.data));
+
     detail::v4u32 g0;
     detail::v8u32 g1;
     detail::build_tdm_descriptor_2d<Shape, ROWS, COLS, T>(
-        g0, g1, base, dst.data, tensor_rows, tensor_cols, row_stride,
+        g0, g1, base, lds_byte_addr, tensor_rows, tensor_cols, row_stride,
         cluster_mask, /*bar_lds_addr=*/ 0);
 
     detail::v4u32 g2 = {0, 0, 0, 0};
@@ -415,7 +455,8 @@ template<typename T, int ROWS, int COLS, ducks::st_shape::all Shape,
 __device__ inline void load_tdm_arrive(
     st<T, ROWS, COLS, Shape>& dst, const GL& src, const COORD& idx,
     int tensor_rows, int tensor_cols, int row_stride,
-    uint64_t* bar, uint32_t cluster_mask = 0)
+    uint64_t* bar, uint32_t cluster_mask = 0,
+    const void* shared_base = nullptr)
 {
     const int gr_base = idx.r * ROWS;
     const int gc_base = idx.c * COLS;
@@ -423,13 +464,17 @@ __device__ inline void load_tdm_arrive(
                   + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
                      * src.cols() + gc_base);
 
-    const uint32_t bar_lds_addr = static_cast<uint32_t>(
-        reinterpret_cast<uintptr_t>(bar));
+    const uint32_t lds_byte_addr = shared_base
+        ? detail::lds_byte_offset(dst.data, shared_base)
+        : static_cast<uint32_t>(reinterpret_cast<uintptr_t>(dst.data));
+    const uint32_t bar_lds_addr = shared_base
+        ? detail::lds_byte_offset(bar, shared_base)
+        : static_cast<uint32_t>(reinterpret_cast<uintptr_t>(bar));
 
     detail::v4u32 g0;
     detail::v8u32 g1;
     detail::build_tdm_descriptor_2d<Shape, ROWS, COLS, T>(
-        g0, g1, base, dst.data, tensor_rows, tensor_cols, row_stride,
+        g0, g1, base, lds_byte_addr, tensor_rows, tensor_cols, row_stride,
         cluster_mask, bar_lds_addr);
 
     detail::v4u32 g2 = {0, 0, 0, 0};
