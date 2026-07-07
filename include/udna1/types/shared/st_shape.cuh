@@ -205,6 +205,23 @@ struct st_8x32 {
     }
 };
 
+struct st_16x64 {
+    static constexpr int rows = 16;
+    static constexpr int cols = 64;
+
+    template<typename _T>
+    static constexpr int bytes_per_thread() {
+        static_assert(sizeof(_T) == 1 || sizeof(_T) == 2 || sizeof(_T) == 4, "Unsupported type");
+        return 16;
+    }
+
+    template<typename _T>
+    __device__ __forceinline__ static const uint32_t swizzle (int2 coord) {
+        static_assert(sizeof(_T) == 1 || sizeof(_T) == 2 || sizeof(_T) == 4, "Unsupported type");
+        return sizeof(_T) * (coord.x * cols + coord.y);
+    }
+};
+
 struct st_16x128 {
     static constexpr int rows = 16;
     static constexpr int cols = 128;
@@ -296,6 +313,7 @@ concept all = std::is_same_v<T, st_16x16> ||
               std::is_same_v<T, st_16x32> || 
               std::is_same_v<T, st_32x16> || 
               std::is_same_v<T, st_8x32>  ||
+              std::is_same_v<T, st_16x64> ||
               std::is_same_v<T, st_16x128> ||
               std::is_same_v<T, st_16x32_padded<>> ||
               std::is_same_v<T, st_16x32_padded<128, 8>> ||
