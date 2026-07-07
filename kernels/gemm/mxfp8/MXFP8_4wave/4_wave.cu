@@ -181,6 +181,7 @@ void mxfp8_gemm_4wave_kernel(
         auto a_subtile_1 = kittens::subtile_inplace<REG_M, BLOCK_K>(As[curr][1], {warp_m, 0});
         load(a[1], a_subtile_1);
         G::load(Bs[curr][1], B, {0, 0, block_col * 2 + 1, k + 2});
+        asm volatile("s_waitcnt lgkmcnt(0)");
         G::load(As[curr][1], A, {0, 0, block_row * 2 + 1, k + 2});
 
         mma_ABt_scaled_16(cB, a[0], b[1], &sa_h0, &sb_h1);
