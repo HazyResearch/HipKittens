@@ -1,5 +1,6 @@
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
+#include <stdexcept>
 using namespace kittens;
 
 constexpr int BLOCK_SIZE       = 256;  
@@ -327,6 +328,10 @@ void micro_tk(const micro_globals g, int M, int N, int K) {
 }
 
 void dispatch_micro(micro_globals g) {
+    if (g.M % BLOCK_SIZE || g.N % BLOCK_SIZE)
+        throw std::runtime_error("GEMM: M and N must be multiples of BLOCK_SIZE (256)");
+    if (g.K % (2 * K_STEP))
+        throw std::runtime_error("GEMM: K must be a multiple of 128 (mainloop consumes K-slices in pairs of K_STEP=64; K%64 is not sufficient)");
     unsigned long mem_size = g.dynamic_shared_memory();
     hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
     micro_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M, g.N, g.K);
