@@ -9,6 +9,9 @@ void warp::tests(test_data &results) {
 #ifdef TEST_WARP_MEMORY
     memory::tests(results);
 #endif
+#ifdef TEST_WARP_REGISTER
+    reg::tests(results);
+#endif
 }
 
 #endif

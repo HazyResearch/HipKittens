@@ -1,16 +1,19 @@
 #include "testing_flags.cuh"
 
-#ifdef TEST_WARP
+#ifdef TEST_WARP_REGISTER_TILE_MMA
 
 #include "testing_commons.cuh"
 
-#include "memory/memory.cuh"
-#include "register/register.cuh"
-
 namespace warp {
+namespace reg {
+namespace tile {
+namespace mma {
 
 void tests(test_data &results);
 
+}
+}
+}
 }
 
 #endif
