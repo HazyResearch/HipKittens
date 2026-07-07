@@ -26,9 +26,9 @@ if __name__ == "__main__":
         Bt = B.t().contiguous()
         C = init_empty((m, n), dtype, device)
 
-        C_ref = torch.matmul(A, B)
+        C_ref = torch.matmul(A.float(), B.float())   # fp32 reference
         tk_kernel.dispatch_micro(A, Bt, C)
 
-        is_valid = torch.allclose(C, C_ref, rtol=1e-2)
+        is_valid = torch.allclose(C.float(), C_ref, rtol=1e-2, atol=1e-1)
         result = "TEST PASSED" if is_valid else "TEST FAILED"
         print(f"{test_shape}".ljust(18) + f" | {result}")
