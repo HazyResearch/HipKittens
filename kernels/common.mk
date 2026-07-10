@@ -16,11 +16,14 @@ GPU_TARGET ?= CDNA4
 ifeq ($(GPU_TARGET),CDNA4)
   KITTENS_ARCH_DEFINE := -DKITTENS_CDNA4
   KITTENS_OFFLOAD_ARCH := gfx950
+else ifeq ($(GPU_TARGET),CDNA3)
+  KITTENS_ARCH_DEFINE := -DKITTENS_CDNA3
+  KITTENS_OFFLOAD_ARCH := gfx942
 else ifeq ($(GPU_TARGET),UDNA1)
   KITTENS_ARCH_DEFINE := -DKITTENS_UDNA1
   KITTENS_OFFLOAD_ARCH := gfx1250
 else
-  $(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA4, UDNA1)
+  $(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA3, CDNA4, UDNA1)
 endif
 
 PYTHON ?= python3
@@ -44,7 +47,7 @@ else
   OPT_HIPFLAGS := -O3
 endif
 
-HIPFLAGS += $(BASE_HIPFLAGS) $(OPT_HIPFLAGS)
+HIPFLAGS += $(BASE_HIPFLAGS) $(OPT_HIPFLAGS) $(EXTRA_HIPFLAGS)
 
 ICPPFLAGS += -I$(THUNDERKITTENS_ROOT)/include -I$(HIP_INCLUDE_DIR)
 ICPPFLAGS += $(CPPFLAGS) $(EXTRA_CPPFLAGS)
@@ -53,8 +56,8 @@ ICXXFLAGS += $(EXTRA_ICXXFLAGS)
 ILDFLAGS += $(LDFLAGS) $(EXTRA_LDFLAGS)
 ILDLIBS += $(LDLIBS) $(EXTRA_LDLIBS)
 
-PY_LDFLAGS := $(shell $(PYTHON)-config --ldflags | sed 's/-lcrypt//g')
-PY_EXT_SUFFIX := $(shell $(PYTHON)-config --extension-suffix)
+PY_LDFLAGS := $(shell $(PYTHON)-config --ldflags 2>/dev/null | sed 's/-lcrypt//g')
+PY_EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '')" 2>/dev/null)
 PY_INCLUDES := $(shell $(PYTHON) -m pybind11 --includes)
 
 ifeq ($(BUILD_MODE),pyext)

@@ -32,8 +32,8 @@ utils/__pycache__/
 *amd-amdhsa-gfx950.bc
 
 # Host-specific build/test scripts.
-kernels/gemm/bf16fp32/gfx1250/*.sh
-kernels/gemm/bf16fp32/gfx1250/*.sbatch
-kernels/gemm/bf16fp32/gfx1250/*.out
+kernels/udna1/gemm/bf16fp32/gfx1250/*.sh
+kernels/udna1/gemm/bf16fp32/gfx1250/*.sbatch
+kernels/udna1/gemm/bf16fp32/gfx1250/*.out
 
 !CMakeLists.txt

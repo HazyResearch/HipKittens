@@ -57,7 +57,7 @@ bash mi355x_benchmark.sh
 FP8 GEMM:
 ```bash
 # First switch ThunderKittens branches
-cd cd https://github.com/HazyResearch/HipKittens/tree/main/kernels/gemm/fp8fp32/FP8_4wave
+cd https://github.com/HazyResearch/HipKittens/tree/main/kernels/cdna4/gemm/fp8fp32/FP8_4wave
 # Set the M, N, K in the matmul.cu file
 make clean && make
 ./tk_kernel
