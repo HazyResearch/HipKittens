@@ -1,0 +1,14 @@
+/bin/sh: 1: /opt/venv/bin/python-config: not found
+make: /opt/venv/bin/python-config: No such file or directory
+kernel.cpp:31:1: remark: Function Name: _Z10softmax_tkILi128EEv15softmax_globalsIXT_EE [-Rpass-analysis=kernel-resource-usage]
+   31 | __global__ void softmax_tk(const softmax_globals<_D> g) {
+      | ^
+kernel.cpp:31:1: remark:     TotalSGPRs: 30 [-Rpass-analysis=kernel-resource-usage]
+kernel.cpp:31:1: remark:     VGPRs: 94 [-Rpass-analysis=kernel-resource-usage]
+kernel.cpp:31:1: remark:     AGPRs: 0 [-Rpass-analysis=kernel-resource-usage]
+kernel.cpp:31:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+kernel.cpp:31:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+kernel.cpp:31:1: remark:     Occupancy [waves/SIMD]: 5 [-Rpass-analysis=kernel-resource-usage]
+kernel.cpp:31:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernel.cpp:31:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+kernel.cpp:31:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
