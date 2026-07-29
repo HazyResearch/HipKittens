@@ -1,8 +1,3 @@
-/*************************************************************************
- * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
- * License for AMD contributions = MIT. See LICENSE for more information
-*************************************************************************/
-
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
 
