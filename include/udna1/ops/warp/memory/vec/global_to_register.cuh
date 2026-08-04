@@ -18,7 +18,26 @@ namespace kittens {
  * @param[out] dst The destination register vector to load data into.
  * @param[in] src The source array in global memory to load data from.
  */
-template<ducks::rv::all RV, ducks::gl::all GL, ducks::coord::vec COORD=coord<RV>>
+/**
+* @brief Refused: this load walks the vector linearly, which assumes a unit-stride column axis.
+*
+* `coord<RV>::unit_coord<-1,3>()` places the vector at `(b, d, r, c*RV::length)`, i.e. it runs
+* along the column axis. The base address that produces is layout-correct, because `gl::idx()` is.
+* But every access after it is `src_ptr[offset]` -- or a buffer load at a byte displacement from
+* that base -- which walks memory contiguously. Contiguous is the column axis only under
+* `row_major`; under `col_major` the row axis is unit-stride, so the same walk reads a column of
+* `rows()` elements instead of the intended run along `c`, from the correct starting element. It
+* returns plausible values from the wrong places, with no diagnostic.
+*/
+template<ducks::rv::all RV, ducks::gl::col_layout GL, ducks::coord::vec COORD=coord<RV>>
+__device__ inline static void load(RV &dst, const GL &src, const COORD &idx) {
+    static_assert(ducks::gl_layout::unhandled<typename GL::layout>,
+        "load() of a register vector from global is implemented for ducks::gl_layout::row_major "
+        "only: the vector lies along the column axis and is walked with an implicit unit stride, "
+        "which holds only when columns are unit-stride. Implement the strided walk (stride "
+        "rows(), from stride<3>()) rather than passing this descriptor.");
+}
+template<ducks::rv::all RV, ducks::gl::row_layout GL, ducks::coord::vec COORD=coord<RV>>
 __device__ inline static void load(RV &dst, const GL &src, const COORD &idx) {
     using T2 = RV::dtype;
     using U = typename GL::dtype;
@@ -134,7 +153,25 @@ __device__ inline static void load(RV &dst, const GL &src, const COORD &idx) {
  * @param[out] dst The destination array in global memory to store data into.
  * @param[in] src The source register vector to store data from.
  */
-template<ducks::rv::all RV, ducks::gl::all GL, ducks::coord::vec COORD=coord<RV>>
+/**
+* @brief Refused: this store walks the vector linearly, which assumes a unit-stride column axis.
+*
+* The mirror of `load` above and refused for the same reason: the vector runs along the column
+* axis, and every write is `dst_ptr[offset]` or a buffer store at a byte displacement, i.e. a
+* contiguous walk. Under `col_major` contiguous is the row axis, so the run would land down a
+* column instead of along one. Keeping the pair symmetric matters independently of either
+* function: a type where `store` honoured the layout and `load` did not would round-trip a
+* `col_major` vector through two different address maps.
+*/
+template<ducks::rv::all RV, ducks::gl::col_layout GL, ducks::coord::vec COORD=coord<RV>>
+__device__ inline static void store(const GL &dst, const RV &src, const COORD &idx) {
+    static_assert(ducks::gl_layout::unhandled<typename GL::layout>,
+        "store() of a register vector to global is implemented for ducks::gl_layout::row_major "
+        "only: the vector lies along the column axis and is walked with an implicit unit stride, "
+        "which holds only when columns are unit-stride. Implement the strided walk (stride "
+        "rows(), from stride<3>()) rather than passing this descriptor.");
+}
+template<ducks::rv::all RV, ducks::gl::row_layout GL, ducks::coord::vec COORD=coord<RV>>
 __device__ inline static void store(const GL &dst, const RV &src, const COORD &idx) {
     using T2 = RV::dtype;
     using U = typename GL::dtype;
