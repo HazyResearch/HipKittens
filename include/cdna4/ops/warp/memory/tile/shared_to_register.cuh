@@ -248,7 +248,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                         "ds_read_b64_tr_b16 %0, %2 offset:%3\n"
                                         "ds_read_b64_tr_b16 %1, %2 offset:%4\n"
                                         // "s_waitcnt lgkmcnt(0)\n"
-                                        : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])), 
+                                        : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])),
                                         "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx + 2]))
                                         : "v"(addr), "i"(offset), "i"(offset + 4 * ST::underlying_subtile_row_bytes)
                                         : "memory"
@@ -259,7 +259,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                         "ds_read_b64_tr_b16 %0, %2 offset:%4\n"
                                         "ds_read_b64_tr_b16 %1, %3 offset:%4\n"
                                         // "s_waitcnt lgkmcnt(0)\n"
-                                        : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])), 
+                                        : "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx])),
                                         "=v"(*reinterpret_cast<float2*>(&dst.tiles[register_row][register_col].data[idx + 2]))
                                         : "v"(addr), "v"(next_addr), "i"(offset)
                                         : "memory"
@@ -685,6 +685,90 @@ __device__ inline static void store(ST &dst, const RT &src) {
         }
     } else {
         static_assert(false, "Unsupported subtile sizes");
+    }
+}
+
+template<ducks::rt::col_layout RT, ducks::st::all ST>
+__device__ inline static void load(RT &dst, const ST &src, int col_offset) {
+    static_assert(RT::cols == ST::rows,
+                  "col_layout load with col_offset: ST.rows must equal RT::cols");
+    static_assert(RT::width == 1, "col_layout load with col_offset: only width==1 supported");
+
+    using T2 = RT::dtype;
+    using U  = ST::dtype;
+    using U2 = base_types::packing<U>::packed_type;
+
+    const int laneid = kittens::laneid();
+    const uint32_t src_ptr = (uint32_t)(uintptr_t)(&src.data[0]);
+    constexpr int subtile_bytes = ST::underlying_subtile_bytes;
+
+    if constexpr (std::is_same_v<T2, fp8e4m3_4>) {
+        const int block_id = laneid / 16;
+        const int l_within = laneid % 16;
+        const int tr_k_grp = l_within / 2;
+        const int m_half   = l_within & 1;
+
+        #pragma unroll
+        for (int i = 0; i < RT::height; i++) {
+            const int m_col = col_offset + i * RT::base_tile_rows + m_half * 8;
+
+            const int subtile_base = block_id;
+            uint32_t addr = src_ptr
+                          + (uint32_t)(subtile_base * subtile_bytes)
+                          + src.swizzle({tr_k_grp, m_col});
+
+            asm volatile(
+                "ds_read_b64_tr_b8 %0, %2 offset:0\n"
+                "ds_read_b64_tr_b8 %1, %2 offset:%3\n"
+                : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][0].data[0])),
+                  "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][0].data[4]))
+                : "v"(addr), "i"(4 * subtile_bytes)
+                : "memory"
+            );
+
+            addr ^= 1088u;
+
+            asm volatile(
+                "ds_read_b64_tr_b8 %0, %2 offset:0\n"
+                "ds_read_b64_tr_b8 %1, %2 offset:%3\n"
+                : "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][0].data[2])),
+                  "=&v"(*reinterpret_cast<float2*>(&dst.tiles[i][0].data[6]))
+                : "v"(addr), "i"(4 * subtile_bytes)
+                : "memory"
+            );
+        }
+    } else if constexpr (std::is_same_v<U2, bf16_2> || std::is_same_v<U2, half_2>) {
+        const int row_offset = ((laneid % 16) / 4) + ((laneid / 16) * 4);
+        const int col_offset_lane = (laneid % 4) * 4;
+
+        #pragma unroll
+        for (int i = 0; i < RT::height; i++) {
+            const int m_col = col_offset + i * RT::base_tile_rows + col_offset_lane;
+            const uint32_t addr = src_ptr + src.swizzle({row_offset, m_col});
+            const uint32_t next_addr = src_ptr + src.swizzle({row_offset + 4, m_col});
+
+            if constexpr (RT::base_tile_stride == 8) {
+                asm volatile(
+                    "ds_read_b64_tr_b16 %0, %2 offset:0\n"
+                    "ds_read_b64_tr_b16 %1, %3 offset:0\n"
+                    : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][0].data[0])),
+                      "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][0].data[2]))
+                    : "v"(addr), "v"(next_addr)
+                    : "memory"
+                );
+            } else if constexpr (RT::base_tile_stride == 4) {
+                asm volatile(
+                    "ds_read_b64_tr_b16 %0, %1 offset:0\n"
+                    : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][0].data[0]))
+                    : "v"(addr)
+                    : "memory"
+                );
+            } else {
+                static_assert(false, "Unsupported stride for col_layout load with col_offset");
+            }
+        }
+    } else {
+        static_assert(false, "Unsupported type for col_layout load with col_offset");
     }
 }
 

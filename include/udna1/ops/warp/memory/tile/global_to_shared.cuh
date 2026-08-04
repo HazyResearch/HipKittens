@@ -709,8 +709,7 @@ __device__ inline void load_tdm(st<T, ROWS, COLS, Shape>& dst, const GL& src,
  * in the Triton AMD backend (third_party/amd/lib/TritonAMDGPUToLLVM/
  * TDMUtility.cpp lines 224-264). The Triton lowering itself does not use
  * the D# auto-arrive path -- it follows `load_tdm` with an explicit
- * `wait_tdm()` + `async_barrier_arrive()` sequence (see
- * `gemm_tdm_arrive.cpp` for that pattern). This overload is provided for
+ * `wait_tdm()` + `async_barrier_arrive()` sequence. This overload is provided for
  * runtimes that model TDM auto-arrive natively; on simulators that don't,
  * use the explicit-arrive pattern instead.
  *

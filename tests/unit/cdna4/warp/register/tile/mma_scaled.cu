@@ -4,17 +4,19 @@
 
 using namespace kittens;
 
+using GG_test = group<8>;
 
-// Test 1: Scale pipeline (load_scales_to_lds + pack_scales)
+// Test 1: Scale pipeline (G::load into st<fp8e8m0> + pack_scales)
 __global__ __launch_bounds__(512, 1)
 void scale_pipeline_kernel(
-    const uint32_t *__restrict__ scale_A,
-    const uint32_t *__restrict__ scale_B,
-    uint32_t *__restrict__ out,
-    int M, int N, int k_iter, int block_m, int block_n) {
-    __shared__ uint8_t smem_scales[2048];
+    const gl<fp8e8m0, -1, 1, 16, 64> scale_A_gl,
+    uint32_t *__restrict__ out) {
+    using ST_Scale = st<fp8e8m0, 16, 64, st_16x64_s>;
+    __shared__ ST_Scale scale_smem;
 
-    load_scales_to_lds(smem_scales, scale_A, scale_B, block_m, block_n, k_iter, M, N);
+    GG_test::load(scale_smem, scale_A_gl, {0, 0, 0, 0});
+    asm volatile("s_waitcnt vmcnt(0)");
+    asm volatile("s_waitcnt lgkmcnt(0)");
     __builtin_amdgcn_s_barrier();
 
     int lid  = laneid();
@@ -22,7 +24,7 @@ void scale_pipeline_kernel(
     if (wid >= 2) return;
 
     int row_offset = wid * 64;
-    fp8e8m0_4 packed = pack_scales(smem_scales, 0, row_offset);
+    fp8e8m0_4 packed = pack_scales(scale_smem.data, row_offset);
 
     out[wid * 64 + lid] = (uint32_t)packed;
 }
@@ -51,15 +53,14 @@ void run_scale_pipeline_test(test_data &results) {
         }
     }
 
-    uint32_t *d_sa, *d_sb, *d_out;
+    uint32_t *d_sa, *d_out;
     hipMalloc(&d_sa, k_iters * M * sizeof(uint32_t));
-    hipMalloc(&d_sb, k_iters * M * sizeof(uint32_t));
     hipMalloc(&d_out, 2 * 64 * sizeof(uint32_t));
     hipMemcpy(d_sa, iter_scales.data(), k_iters * M * sizeof(uint32_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_sb, iter_scales.data(), k_iters * M * sizeof(uint32_t), hipMemcpyHostToDevice);
     hipMemset(d_out, 0, 2 * 64 * sizeof(uint32_t));
 
-    scale_pipeline_kernel<<<1, 512>>>(d_sa, d_sb, d_out, M, M, 0, 0, 0);
+    gl<fp8e8m0, -1, 1, 16, 64> SA_gl(reinterpret_cast<fp8e8m0 *>(d_sa), 1, nullptr, nullptr, nullptr);
+    scale_pipeline_kernel<<<1, 512>>>(SA_gl, d_out);
     hipDeviceSynchronize();
 
     std::vector<uint32_t> gpu_out(2 * 64);
@@ -98,7 +99,7 @@ void run_scale_pipeline_test(test_data &results) {
     if (fail_count > 0)
         printf("  scale_pipeline: %d/128 failures\n", fail_count);
 
-    hipFree(d_sa); hipFree(d_sb); hipFree(d_out);
+    hipFree(d_sa); hipFree(d_out);
     results.push_back(info);
 }
 
@@ -119,14 +120,15 @@ void mini_gemm_kernel(
     const gl<fp8e4m3, 1, 1, GEMM_M, GEMM_K> A,
     const gl<fp8e4m3, 1, 1, GEMM_N, GEMM_K> B,
     const gl<float,   1, 1, GEMM_M, GEMM_N> C,
-    const uint32_t *__restrict__ scale_A,
-    const uint32_t *__restrict__ scale_B) {
+    const gl<fp8e8m0, -1, 1, 16, 64> scale_A_gl,
+    const gl<fp8e8m0, -1, 1, 16, 64> scale_B_gl) {
     using ST_A = st_fp8e4m3<GEMM_HALF, GEMM_BLOCK_K, st_16x128_s>;
     using ST_B = st_fp8e4m3<GEMM_HALF, GEMM_BLOCK_K, st_16x128_s>;
+    using ST_Scale = st<fp8e8m0, 16, 64, st_16x64_s>;
 
     __shared__ ST_A As[2];
     __shared__ ST_B Bs[2];
-    __shared__ uint8_t smem_scales[2048];
+    __shared__ ST_Scale scale_A_smem, scale_B_smem;
 
     rt_fp8e4m3<GEMM_REG_M, GEMM_BLOCK_K> a;
     rt_fp8e4m3<GEMM_REG_N, GEMM_BLOCK_K> b0, b1;
@@ -158,13 +160,16 @@ void mini_gemm_kernel(
         asm volatile("s_waitcnt vmcnt(0)");
         __builtin_amdgcn_s_barrier();
 
-        load_scales_to_lds(smem_scales, scale_A, scale_B, 0, 0, k, GEMM_M, GEMM_N);
+        GG::load(scale_A_smem, scale_A_gl, {k, 0, 0, 0});
+        GG::load(scale_B_smem, scale_B_gl, {k, 0, 0, 0});
+        asm volatile("s_waitcnt vmcnt(0)");
+        asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
 
-        fp8e8m0_4 sa_h0 = pack_scales(smem_scales, 0, a_row_h0);
-        fp8e8m0_4 sa_h1 = pack_scales(smem_scales, 0, a_row_h1);
-        fp8e8m0_4 sb_h0 = pack_scales(smem_scales, 1024, b_row_h0);
-        fp8e8m0_4 sb_h1 = pack_scales(smem_scales, 1024, b_row_h1);
+        fp8e8m0_4 sa_h0 = pack_scales(scale_A_smem.data, a_row_h0);
+        fp8e8m0_4 sa_h1 = pack_scales(scale_A_smem.data, a_row_h1);
+        fp8e8m0_4 sb_h0 = pack_scales(scale_B_smem.data, b_row_h0);
+        fp8e8m0_4 sb_h1 = pack_scales(scale_B_smem.data, b_row_h1);
 
         auto as0 = subtile_inplace<GEMM_REG_M, GEMM_BLOCK_K>(As[0], {warp_m, 0});
         auto as1 = subtile_inplace<GEMM_REG_M, GEMM_BLOCK_K>(As[1], {warp_m, 0});
@@ -284,8 +289,10 @@ void run_mini_gemm_test(test_data &results) {
     gl<fp8e4m3, 1, 1, M, K> A_gl(d_a, nullptr, nullptr, nullptr, nullptr);
     gl<fp8e4m3, 1, 1, N, K> B_gl(d_b, nullptr, nullptr, nullptr, nullptr);
     gl<float,   1, 1, M, N> C_gl(d_c, nullptr, nullptr, nullptr, nullptr);
+    gl<fp8e8m0, -1, 1, 16, 64> SA_gl(reinterpret_cast<fp8e8m0 *>(d_sa), k_iters, nullptr, nullptr, nullptr);
+    gl<fp8e8m0, -1, 1, 16, 64> SB_gl(reinterpret_cast<fp8e8m0 *>(d_sb), k_iters, nullptr, nullptr, nullptr);
 
-    mini_gemm_kernel<<<1, 512>>>(A_gl, B_gl, C_gl, d_sa, d_sb);
+    mini_gemm_kernel<<<1, 512>>>(A_gl, B_gl, C_gl, SA_gl, SB_gl);
     hipDeviceSynchronize();
 
     std::vector<float> c_gpu(M * N);

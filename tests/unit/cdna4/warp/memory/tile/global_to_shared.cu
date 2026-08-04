@@ -74,5 +74,6 @@ void warp::memory::tile::global_to_shared::tests(test_data &results) {
     test_generator<kittens::ducks::st_shape::st_16x32>(results);
     test_generator<kittens::ducks::st_shape::st_32x16>(results);
     test_generator<kittens::ducks::st_shape::st_8x32>(results);
+    test_generator<kittens::ducks::st_shape::st_16x64>(results);
 }
 #endif
