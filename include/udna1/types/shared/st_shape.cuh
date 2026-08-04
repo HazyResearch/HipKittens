@@ -299,6 +299,7 @@ concept all = std::is_same_v<T, st_16x16> ||
               std::is_same_v<T, st_16x128> ||
               std::is_same_v<T, st_16x32_padded<>> ||
               std::is_same_v<T, st_16x32_padded<128, 8>> ||
+              std::is_same_v<T, st_16x32_padded<256, 8>> ||
               std::is_same_v<T, st_16x32_padded<64, 4>>;
 
 
