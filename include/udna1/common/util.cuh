@@ -76,36 +76,39 @@ __host__ __device__ inline int ceil_div(int a, int b) {
   }
 
 /**
-   * @brief Transform a workgroup ID to a new workgroup ID based on the chunk size and number of XCDs.
+   * @brief Regroup workgroup IDs so that each NUMA domain receives a contiguous run of them.
+   *
+   * The dispatcher assigns consecutive workgroup IDs round-robin across NUMA domains, so
+   * domain `d` natively owns IDs `d, d+num_numa, d+2*num_numa, ...`. This maps that stride
+   * back to a contiguous chunk, giving domain `d` the IDs it would have owned had the
+   * dispatcher blocked instead of interleaved. Workgroups past the last whole
+   * `num_numa * chunk_size` block are left alone, since a partial block has no domain to
+   * balance against.
+   *
    * @param workgroup_id The original workgroup ID.
    * @param num_workgroups The total number of workgroups.
-   * @param num_xcds The number of XCDs.
-   * @param chunk_size The chunk size.
+   * @param num_numa The number of NUMA domains to spread across.
+   * @param chunk_size How many consecutive IDs each domain receives per block.
    * @return The new workgroup ID.
    */
-   __host__ __device__ inline int chiplet_transform_chunked(
+   __host__ __device__ inline int numa_transform_chunked(
     int workgroup_id, 
     int num_workgroups,
-    int num_xcds,
+    int num_numa,
     int chunk_size 
 ) {
-    // Current XCD
-    int xcd = workgroup_id % num_xcds;
+    int numa = workgroup_id % num_numa;
 
-    // Largest full (NUM_XCDS*CHUNK_SIZE)-aligned block
-    int block = num_xcds * chunk_size;
+    int block = num_numa * chunk_size;
     int limit = (num_workgroups / block) * block;
 
-    // If pid beyond the last full block, leave unchanged
-    if (workgroup_id > limit) return workgroup_id;
+    if (workgroup_id >= limit) return workgroup_id;
 
-    // Local PID (within round-robin assignment)
-    int local_pid    = workgroup_id / num_xcds;
+    int local_pid    = workgroup_id / num_numa;
     int chunk_idx    = local_pid / chunk_size;
     int pos_in_chunk = local_pid % chunk_size;
 
-    // New PID
-    return chunk_idx * block + xcd * chunk_size + pos_in_chunk;
+    return chunk_idx * block + numa * chunk_size + pos_in_chunk;
 }
 
 
@@ -128,6 +131,15 @@ constexpr int MAX_SHARED_MEMORY             = MAX_SHARED_MEMORY_PER_SEGMENT * SH
 constexpr int NUM_XCDS = 1;
 constexpr int CUS_PER_XCD = 64;
 constexpr int NUM_CUS = CUS_PER_XCD * NUM_XCDS;
+
+/**
+ * @brief Number of NUMA domains, meaning independent L2 slices, to spread workgroups over.
+ *
+ */
+#ifndef KITTENS_NUM_NUMA
+#define KITTENS_NUM_NUMA 2
+#endif
+constexpr int NUM_NUMA = KITTENS_NUM_NUMA;
 
 /* ----------  CUSTOM TYPES  ---------- */
 typedef uint32_t      uint2_t __attribute__((ext_vector_type(2)));
@@ -315,6 +327,40 @@ struct segment {
     static constexpr int index       = IDX;
     static constexpr int byte_offset = IDX * MAX_SHARED_MEMORY_PER_SEGMENT;
 };
+
+/**
+ * @brief Checks whether two multi-buffered operand rings land in different 64 KB LDS segments
+ *        at every ring slot. Compile-time, and independent of where the allocation starts.
+ *
+ * Whether two tiles occupy different segments depends on the LDS base, which is not a property
+ * of the rings. Requiring separation for every possible base reduces to a base-free condition:
+ * corresponding slots must be at least one full segment apart, `|b_i - a_i| >= 64 KB`.
+ *
+ * @param a_base,a_stride  first ring's byte offset and per-slot stride
+ * @param b_base,b_stride  second ring's byte offset and per-slot stride
+ * @param stages           number of ring slots
+ */
+__device__ __host__ constexpr bool operand_rings_segment_separated(
+    int a_base, int a_stride, int b_base, int b_stride, int stages)
+{
+    for (int i = 0; i < stages; ++i) {
+        const int d = (b_base + i * b_stride) - (a_base + i * a_stride);
+        if ((d < 0 ? -d : d) < MAX_SHARED_MEMORY_PER_SEGMENT) return false;
+    }
+    return true;
+}
+
+/**
+ * @brief The same test for one bump allocation of `A[stages]` immediately followed by
+ *        `B[stages]`, with equal tile sizes.
+ *
+ * Corresponding slots are then a fixed `stages * tile_bytes` apart, so the condition reduces to
+ * `stages * tile_bytes >= 64 KB`.
+ */
+__device__ __host__ constexpr bool blocked_rings_segment_separated(int tile_bytes, int stages)
+{
+    return operand_rings_segment_separated(0, tile_bytes, stages * tile_bytes, tile_bytes, stages);
+}
 
 namespace ducks {
 namespace segment_tag {

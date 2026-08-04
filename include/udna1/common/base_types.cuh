@@ -326,21 +326,21 @@ template<> struct convertor<float, bf16> {
         return 	__bfloat162float(u);
     }
 };
-// template<> struct convertor<bf16, float> {
-//     static __host__ __device__ inline bf16 convert(const float & u) {
-//         return 	__float2bfloat16(u);
-//     }
-// };
 template<> struct convertor<bf16, float> {
-    static __host__ __device__ inline bf16 convert(const float &u) {
-        // Fast unsafe conversion (truncation only)
-        return std::bit_cast<bf16>(
-            static_cast<uint16_t>(
-                std::bit_cast<uint32_t>(u) >> 16
-            )
-        );
+    static __host__ __device__ inline bf16 convert(const float & u) {
+        return 	__float2bfloat16(u);
     }
 };
+// template<> struct convertor<bf16, float> {
+//     static __host__ __device__ inline bf16 convert(const float &u) {
+//         // Fast unsafe conversion (truncation only)
+//         return std::bit_cast<bf16>(
+//             static_cast<uint16_t>(
+//                 std::bit_cast<uint32_t>(u) >> 16
+//             )
+//         );
+//     }
+// };
 template<> struct convertor<float2, bf16_2> {
     static __host__ __device__ inline float2 convert(const bf16_2 & u) {
         return 	__bfloat1622float2(u);
