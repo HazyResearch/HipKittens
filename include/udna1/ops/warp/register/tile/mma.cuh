@@ -515,6 +515,11 @@ __device__ static inline void mma_ABt(D &d,
     static_assert(
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, bf16> &&
             std::is_same_v<typename B::T, bf16> && std::is_same_v<typename C::T, float>) ||
+        // fp16 operands with an fp32 accumulator: the gfx1250 WMMA
+        // `v_wmma_f32_16x16x32_f16` has the same shape and fp32 D/C as the bf16
+        // form, so `wmma161632`'s half_2 overload handles it unchanged.
+        (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, half> &&
+            std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, float>) ||
         (std::is_same_v<typename D::T, half> && std::is_same_v<typename A::T, half> &&
             std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, half>) ||
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, fp8e4m3> &&
