@@ -1,15 +1,51 @@
 /**
  * @file gemm_double_buf.cpp
- * @brief Rung 2 -- double-buffered bf16 -> fp32 GEMM for gfx1250.
+ * @brief Rung 2 -- gemm_naive plus a second LDS stage.
  *
- * Diff vs `gemm_naive`: allocate two LDS slabs and overlap the next tile's
- * load with the current tile's compute. Still uses register-mediated copy.
+ * Two interleaved stages in one segment rather than a single slab, so a K-block's fill runs
+ * under the previous block's compute and the publish-then-drain barrier pair collapses to one
+ * rendezvous. Same 64x64 tile and the same register-mediated `global_load` -> VGPR -> `ds_store`
+ * fill, which needs no counter drained by hand because the barrier's own release fence already
+ * covers a `ds_store`.
+ *
+ * The fill has to lead the operand reads here. Nothing else covers its global latency, so it
+ * must be in flight across the reads and the matrix op below. Uses only:
+ *   - `kittens::load(st,gl,idx)`  : register-mediated global -> LDS copy.
+ *   - `kittens::sync::fence`      : drain LDS traffic before the barrier.
+ *   - `kittens::sync::sync`       : block-wide barrier (-1).
+ *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
+ *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
+ *   - `kittens::store(gl,rt,st,...)`   : staged column-major epilogue.
  */
+
+#ifndef GFX1250_BLOCK_M
+#define GFX1250_BLOCK_M 64
+#endif
+#ifndef GFX1250_BLOCK_N
+#define GFX1250_BLOCK_N 64
+#endif
+#ifndef GFX1250_BLOCK_K
+#define GFX1250_BLOCK_K 32
+#endif
+#define GFX1250_K_STEP  32
+#ifndef GFX1250_WARPS_M
+#define GFX1250_WARPS_M 2
+#endif
+#ifndef GFX1250_WARPS_N
+#define GFX1250_WARPS_N 2
+#endif
 
 #include "common.h"
 
 using namespace kittens;
 using namespace gfx1250_gemm;
+
+static constexpr int S = 2;                    // stages in the LDS ring
+
+// One ring slot, with A and B adjacent.
+struct KITTENS_DEFAULT_ALIGN ab_pair { A_tile a; B_tile b; };
+static_assert(sizeof(ab_pair) == sizeof(A_tile) + sizeof(B_tile),
+              "an interleaved pair must not introduce padding");
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
 void gemm_double_buf_kernel(const gemm_globals g, int M, int N, int K)
@@ -17,53 +53,80 @@ void gemm_double_buf_kernel(const gemm_globals g, int M, int N, int K)
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
 
-    A_tile(&A_st)[2] = al.allocate<A_tile, 2>();
-    B_tile(&B_st)[2] = al.allocate<B_tile, 2>();
+    ab_pair(&ring)[S] = al.allocate_in<segment<0>, ab_pair, S>();
 
     rt_fl<WARP_M, WARP_N, col_l, rt_16x16_s> C_acc;
     zero(C_acc);
 
-    const int tile_m  = blockIdx.x;
-    const int tile_n  = blockIdx.y;
-    const int wid     = warpid();
-    const int warp_r  = wid / WARPS_N;
-    const int warp_c  = wid % WARPS_N;
-    const int k_iters = K / K_STEP;
+    const int tile_m   = blockIdx.x;
+    const int tile_n   = blockIdx.y;
+    const int wid      = warpid();
+    const int warp_r   = wid / WARPS_N;
+    const int warp_c   = wid % WARPS_N;
+    const int k_blocks = K / BLOCK_K;
+    if (k_blocks <= 0) return;                    // K shorter than one block: nothing to compute
 
-    kittens::load<NUM_THREADS>(A_st[0], g.a, {0, 0, tile_m, 0}, K);
-    kittens::load<NUM_THREADS>(B_st[0], g.b, {0, 0, tile_n, 0}, K);
+    const int warp_off_a = warp_r * WARP_M * K_STEP;
+    const int warp_off_b = warp_c * WARP_N * K_STEP;
+
+    // Every thread participates: `load` spreads the tile across all NUM_THREADS lanes.
+    auto issue_fill = [&](int slot, int kblock) {
+        kittens::load<NUM_THREADS>(ring[slot].a, g.a, {0, 0, tile_m, kblock}, K);
+        kittens::load<NUM_THREADS>(ring[slot].b, g.b, {0, 0, tile_n, kblock}, K);
+    };
+
+    // Prologue: fill the ring ahead of the loop.
+    #pragma unroll
+    for (int s = 0; s < S - 1; ++s)
+        if (s < k_blocks) issue_fill(s, s);
+
+    kittens::sync::fence();                           // publish stage 0
     kittens::sync::sync();
 
-    for (int k = 0; k < k_iters; ++k) {
-        const int cur = k & 1, nxt = 1 - cur;
+    rt_e<WARP_M, K_STEP> A_reg;
+    rt_e<WARP_N, K_STEP> B_reg;
 
-        if (k + 1 < k_iters) {
-            kittens::load<NUM_THREADS>(A_st[nxt], g.a, {0, 0, tile_m, k + 1}, K);
-            kittens::load<NUM_THREADS>(B_st[nxt], g.b, {0, 0, tile_n, k + 1}, K);
-        }
+    // Main loop: one K-block per iteration.
+    for (int kb = 0; kb < k_blocks; ++kb) {
+        const int cur = kb % S, nxt = (kb + 1) % S;
 
-        rt_bf<WARP_M, K_STEP, row_l, rt_16x32_s> A_reg;
-        rt_bf<WARP_N, K_STEP, row_l, rt_16x32_s> B_reg;
-        kittens::load(A_reg, A_st[cur], warp_r * WARP_M * K_STEP);
-        kittens::load(B_reg, B_st[cur], warp_c * WARP_N * K_STEP);
+        /* The fill leads the reads so its global latency is covered. The clamped index is a
+         * branch-free tail: the last iteration refills a stage nothing reads again. */
+        const int fk = (kb + 1 < k_blocks) ? (kb + 1) : (k_blocks - 1);
+        issue_fill(nxt, fk);
 
-        kittens::sync::wait_ds();
+        kittens::load(A_reg, ring[cur].a, warp_off_a);
+        kittens::load(B_reg, ring[cur].b, warp_off_b);
         mma_ABt(C_acc, A_reg, B_reg, C_acc);
 
+        // One rendezvous per K-block: publishes the fill just issued, frees the stage just read.
+        kittens::sync::fence();
         kittens::sync::sync();
     }
 
-    bf16* c_base = reinterpret_cast<bf16*>(&g.c[{0, 0, 0, 0}]);
-    store_acc<WARP_M / 16, WARP_N / 16>(
-        c_base,
-        tile_m * BLOCK_M + warp_r * WARP_M,
-        tile_n * BLOCK_N + warp_c * WARP_N,
-        N, C_acc);
+    // The epilogue reuses the ring, so drain this wave's LDS traffic first.
+    kittens::sync::wait_ds<0>();
+
+    // Epilogue: stage C through LDS so the global store coalesces.
+    kittens::store<NUM_THREADS>(
+        g.c, C_acc, *reinterpret_cast<C_tile*>(&__shm[0]),
+        tile_m * BLOCK_M, tile_n * BLOCK_N, warp_r * WARP_M, warp_c * WARP_N);
 }
 
 void dispatch(gemm_globals g)
 {
-    const size_t mem_size = g.dynamic_shared_memory();
+    const size_t mem_size = g.dynamic_shared_memory<S>();
+
+    /* The column-major stream writes 8-element chunks down a column, so it is aligned only if
+     * the leading dimension is a multiple of 8. */
+    if (g.c.rows() % 8 != 0) {
+        std::fprintf(stderr,
+            "gemm_double_buf: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+        std::abort();
+    }
+
+    gfx1250_gemm::require_k_blocks(g.K(), "gemm_double_buf");
+
     hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_double_buf_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
     gemm_double_buf_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());

@@ -1,14 +1,13 @@
 /**
- * @file gemm_async.cpp
- * @brief Rung 3 -- gemm_double_buf plus the cooperative async fill.
+ * @file gemm_128x128.cpp
+ * @brief Rung 4 -- gemm_async with the macro tile doubled to 128x128.
  *
- * `global_load_async_to_lds_b128` lands operands in LDS without staging them through VGPRs, so
- * the registers and issue slots the register-mediated copy spent go back to the K-loop and the
- * fill no longer has to lead the operand reads. It is worth about 1.6x, one of the two largest
- * steps on the ladder. What it costs is a second counter to reason about: the fill retires on the
- * async counter, the operand reads on the LDS counter, and the stage handoff has to drain both.
- * Same 64x64 tile, two interleaved stages of a padded 64x32 LDS tile in one segment, plain split
- * barrier, staged column-major epilogue. Uses only:
+ * Arithmetic intensity for a square bf16 tile is M*N/(M+N) FLOP per byte, so it rises from 32 to
+ * 64 across this step and the operand traffic per output element halves. That is worth about
+ * 1.8x, the largest step on the ladder. The warp grid has to double with the tile, 2x2 -> 4x4, to
+ * hold the warp tile at 32x32: a 2x2 grid on a 128x128 tile gives each warp four times the
+ * accumulator and spills. Same BLOCK_K=32, two async-filled stages interleaved in one LDS
+ * segment, plain split barrier, staged column-major epilogue. Uses only:
  *   - `kittens::load_async`       : cooperative `global_load_async_to_lds_b128` fill.
  *   - `kittens::sync::wait_async` : drain the async fill.
  *   - `kittens::sync::arrive/wait`: split workgroup barrier (-1).
@@ -20,20 +19,20 @@
  */
 
 #ifndef GFX1250_BLOCK_M
-#define GFX1250_BLOCK_M 64
+#define GFX1250_BLOCK_M 128
 #endif
 #ifndef GFX1250_BLOCK_N
-#define GFX1250_BLOCK_N 64
+#define GFX1250_BLOCK_N 128
 #endif
 #ifndef GFX1250_BLOCK_K
 #define GFX1250_BLOCK_K 32
 #endif
 #define GFX1250_K_STEP  32
 #ifndef GFX1250_WARPS_M
-#define GFX1250_WARPS_M 2
+#define GFX1250_WARPS_M 4
 #endif
 #ifndef GFX1250_WARPS_N
-#define GFX1250_WARPS_N 2
+#define GFX1250_WARPS_N 4
 #endif
 
 #include "common.h"
@@ -49,7 +48,7 @@ static_assert(sizeof(ab_pair) == sizeof(A_tile) + sizeof(B_tile),
               "an interleaved pair must not introduce padding");
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
-void gemm_async_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_128x128_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -94,8 +93,6 @@ void gemm_async_kernel(const gemm_globals g, int M, int N, int K)
         const int cur = kb % S, nxt = (kb + 1) % S;
 
         kittens::sched::compiler_fence();
-        // The operand reads lead the fill: an async fill carries its own latency, so
-        // reading first gets the matrix op started sooner.
         kittens::load(A_reg, ring[cur].a, warp_off_a);
         kittens::load(B_reg, ring[cur].b, warp_off_b);
 
@@ -137,15 +134,15 @@ void dispatch(gemm_globals g)
      * the leading dimension is a multiple of 8. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_async: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "gemm_128x128: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_async");
+    gfx1250_gemm::require_k_blocks(g.K(), "gemm_128x128");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_async_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_128x128_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
-    gemm_async_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
+    gemm_128x128_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
 }
 
 #include "harness.h"

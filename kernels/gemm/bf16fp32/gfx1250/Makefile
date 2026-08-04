@@ -18,7 +18,10 @@ GPU_TARGET ?= UDNA1
 BUILD_MODE ?= standalone
 CUSTOM_RULES := 1
 
-LADDER := gemm_naive gemm_double_buf gemm_async gemm_split_bar gemm_segment gemm_expert gemm_tdm_arrive
+# The ten rungs, listed top down. Each is named for the one hardware or algorithmic feature it
+# adds to the rung below it. Anything else that used to be listed here now lives in archive/.
+LADDER := gemm_wgc_multicast gemm_split_bar gemm_tdm gemm_segment gemm_deepk \
+          gemm_256x256 gemm_128x128 gemm_async gemm_double_buf gemm_naive
 
 KERNEL ?= gemm_naive
 SRC    := $(KERNEL).cpp
@@ -32,13 +35,21 @@ VERIFY ?= 1
 
 include ../../../common.mk
 
+# Rebuild a rung whenever ANY ThunderKittens header changes -- otherwise an edit
+# to include/**/*.cuh silently leaves a stale .out (a correctness-of-testing
+# hazard we actually hit). Enumerated once at parse time.
+TK_HEADERS := $(shell find $(THUNDERKITTENS_ROOT)/include -name '*.cuh' 2>/dev/null)
+
 .PHONY: ladder run clean all
 
 # Default target: build the currently selected KERNEL as a standalone exe.
 all: $(BIN)
 
-$(BIN): $(SRC) harness.h common.h
-	$(HIPCXX) $(HIPFLAGS) $(ICPPFLAGS) -DHARNESS_MAIN $(SRC) -o $(BIN)
+# `-fopenmp` is not optional: without it the reference pragma is ignored, the CPU check runs on
+# one core, and an 8192^3 verify goes from ~4 s to over 4 minutes. That reads as a hung GPU when
+# the GPU finished in milliseconds. Device code is unaffected.
+$(BIN): $(SRC) harness.h common.h $(TK_HEADERS)
+	$(HIPCXX) $(HIPFLAGS) $(ICPPFLAGS) -fopenmp -DHARNESS_MAIN $(SRC) -o $(BIN)
 
 # Loop variant -- `make ladder` rebuilds every rung.
 ladder:

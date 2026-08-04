@@ -1,25 +1,18 @@
 /**
- * @file gemm_split_bar.cpp
- * @brief Rung 9 -- gemm_tdm with the workgroup barrier actually split.
+ * @file gemm_wgc_multicast.cpp
+ * @brief Rung 10 -- gemm_split_bar plus a workgroup cluster multicasting both operands.
  *
- * Every rung below closes the barrier the instant it opens it -- rungs 1 and 2 through the fused
- * `sync()`, rungs 3 to 8 by issuing `arrive()` and `wait()` back to back, which is the split API
- * spent as a fused barrier. Here the two halves are finally pulled apart and the K-block's last
- * matrix op is issued between them. What makes that legal is that the op reads registers only: a
- * wave is done with the LDS stage the moment its `ds_load`s drain, which is strictly before it is
- * done computing, so it can declare itself finished and keep working. A barrier costs skew rather
- * than instructions -- every wave that arrives early idles until the slowest one shows up -- and
- * this spends that idle time rather than shortening it. Sixteen `v_wmma` sit in the window, worth
- * about 5%.
- *
- * It fails silently. Nothing in the language holds the op inside the window: the compiler will
- * hoist it above the signal or sink it below the wait, and when it does the answers stay correct,
- * verification still passes, and the 5% is simply gone. The fences around the matrix op are what
- * pin it. Same 256x256 tile, BLOCK_K=128, 4x4 warps, two-stage TDM ring, segment-separated LDS,
+ * Sixteen workgroups form a 4x4 cluster and share each fetched panel four ways, which removes
+ * 75% of the fill transactions and is worth about 5%. What it costs is a second rendezvous: the
+ * barrier grows a cluster half alongside the workgroup one, and the launch now has a shape
+ * requirement, since a cluster only forms if the grid divides by the cluster dimension.
+ * Everything else is `gemm_split_bar`: 256x256 macro tile, BLOCK_K=128 walked in four K_STEP=32
+ * sub-steps, 4x4 warps, a two-stage TDM-filled LDS ring, the barrier in its split form, and a
  * staged column-major epilogue. Uses only:
- *   - `kittens::load_tdm`         : descriptor-driven global -> LDS tile DMA.
+ *   - `kittens::load_tdm`         : descriptor-driven global -> LDS tile DMA, with multicast.
  *   - `kittens::sync::wait_tdm`   : drain the tile DMA.
  *   - `kittens::sync::arrive/wait`: workgroup barrier (-1), in the split form.
+ *   - `kittens::cluster::arrive/wait` : cluster barrier (-3), likewise split.
  *   - `kittens::sync::wait_ds`    : partial and full LDS-read drains.
  *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
  *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
@@ -27,6 +20,12 @@
  *   - `kittens::store(gl,rt,st,...)`   : staged column-major epilogue.
  */
 
+/* Geometry, overridable from the command line. Three constraints bind it:
+ *   - VGPRs: a warp tile of WARP_M*WARP_N floats over 32 lanes must leave room for operands.
+ *     The 64x64 warp tile here sits at 244 of 256.
+ *   - LDS: S*(A_tile + B_tile) must fit in 327,680 B.
+ *   - Tiling: BLOCK_M and BLOCK_N must divide the problem, so on power-of-two shapes they must
+ *     be powers of two too, which rules out 320 and 384 whatever the registers allow. */
 #ifndef GFX1250_BLOCK_M
 #define GFX1250_BLOCK_M 256
 #endif
@@ -37,9 +36,9 @@
 #define GFX1250_BLOCK_K 128
 #endif
 #define GFX1250_K_STEP  32
-/* Four waves per SIMD is what the register file allows: at eight it cannot hold the
- * double-buffered operands plus the matrix op held in the window, and the kernel spills. Wave
- * count is co-designed with the split form rather than free to set on its own. */
+/* 4x4 warps is four waves per SIMD, which is what the register file allows: at eight it cannot
+ * hold the double-buffered operands plus the matrix op held in the window, and the kernel spills.
+ * Wave count is co-designed with the split form rather than free to set on its own. */
 #ifndef GFX1250_WARPS_M
 #define GFX1250_WARPS_M 4
 #endif
@@ -55,11 +54,19 @@ using namespace gfx1250_gemm;
 /* LDS holds two stages at this tile size, not three -- see `kittens::MAX_SHARED_MEMORY`. */
 static constexpr int S = 2;                    // stages in the LDS ring
 
+/* A cluster holds at most 16 workgroups (WG_in_Cluster is 4 bits) and a multicast mask may name
+ * at most 5 destinations before the hardware demotes it to an ordinary load, so 4x4 is the
+ * largest legal shape whose masks stay inside the demotion limit. It also shares both operands
+ * four ways, removing 75% of fill transactions against 50% for 2x2 and 37.5% for 1x4. */
+static constexpr int CLUSTER_DIM = 4;
+
 using A_deep = st_e<BLOCK_M, BLOCK_K>;
 using B_deep = st_e<BLOCK_N, BLOCK_K>;
 
-__global__ __launch_bounds__(NUM_THREADS, 1)
-void gemm_split_bar_kernel(const gemm_globals g, int M, int N, int K)
+__global__
+__cluster_dims__(CLUSTER_DIM, CLUSTER_DIM, 1)
+__launch_bounds__(NUM_THREADS, 1)
+void gemm_wgc_multicast_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -88,15 +95,22 @@ void gemm_split_bar_kernel(const gemm_globals g, int M, int N, int K)
     constexpr int DS_SUB = ds_loads_per_subblock<WARP_M>()
                          + ds_loads_per_subblock<WARP_N>();
 
+    /* Multicast delivery masks. A workgroup's id within the cluster is cx + 4*cy, so the four
+     * sharing its A panel have the same cx and the four sharing its B panel the same cy. Bit i
+     * of the mask means "deliver to workgroup i"; a wrong ordering is a wrong answer. */
+    const uint32_t cx = blockIdx.x & 3u;
+    const uint32_t cy = blockIdx.y & 3u;
+    const uint32_t a_mask = 0x1111u << cx;
+    const uint32_t b_mask = 0xFu << (4u * cy);
+
     /* The two issuers must differ in SIMD parity so both tile-DMA engines are used: the four
      * SIMDs pair as {0,2} and {1,3}, each pair served by one engine. Warps 0 and 1 are on
      * different pairs; warps 0 and 2 would share one and serialize the two fills. */
     auto issue_fill = [&](int slot, int kblock, uint32_t count = 1) {
-        if (wid == 0) kittens::load_tdm(A_st[slot], g.a, {0, 0, tile_m, kblock}, M, K, K, 0, count);
-        if (wid == 1) kittens::load_tdm(B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, 0, count);
+        if (wid == 0) kittens::load_tdm(A_st[slot], g.a, {0, 0, tile_m, kblock}, M, K, K, a_mask, count);
+        if (wid == 1) kittens::load_tdm(B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, b_mask, count);
     };
 
-    // Split into a signal half and a wait half so real work can be placed between them.
     // Prologue: fill the ring ahead of the loop.
     #pragma unroll
     for (int s = 0; s < S - 1; ++s)
@@ -104,7 +118,7 @@ void gemm_split_bar_kernel(const gemm_globals g, int M, int N, int K)
 
     kittens::sync::wait_tdm<0>();
     kittens::sched::compiler_fence();
-    kittens::sync::arrive(); kittens::sync::wait();   // publish stage 0; no work to fill a window
+    kittens::cluster::sync();                 // publish stage 0; no work to fill a window yet
     kittens::sched::compiler_fence();
 
     // Operands are double-buffered in registers: the matrix unit reads one buffer while the
@@ -120,9 +134,8 @@ void gemm_split_bar_kernel(const gemm_globals g, int M, int N, int K)
         kittens::load(A_reg[0], A_st[cur], warp_off_a);
         kittens::load(B_reg[0], B_st[cur], warp_off_b);
 
-        /* Branch-free tail. On the last K-block there is nothing left to fetch, but
-         * branching here would diverge the wave. A TDM also cannot be EXEC-masked, so the
-         * skip is a count=0 NULL descriptor, which moves no memory. */
+        /* Branch-free tail: a count=0 descriptor rather than an `if`. Branching would let
+         * some cluster members skip a rendezvous their peers are still waiting on. */
         const int      fk  = (kb + 1 < k_blocks) ? (kb + 1) : (k_blocks - 1);
         const uint32_t cnt = (kb + 1 < k_blocks) ? 1u : 0u;
         issue_fill(nxt, fk, cnt);
@@ -139,20 +152,19 @@ void gemm_split_bar_kernel(const gemm_globals g, int M, int N, int K)
             mma_ABt(C_acc, A_reg[c], B_reg[c], C_acc);
         }
 
-        /* The stage handoff, in the split form. Both counters drain first: LDS says this wave
-         * is done with the current stage, TDM says the next has landed. The final matrix op is
-         * then the independent work between signalling and waiting -- independent because it
-         * reads registers only. The fences hold it inside the window; without them it is
-         * hoisted above the signal or sunk below the wait. */
+        /* Stage handoff, in order: drain LDS, drain TDM, signal both barriers, the last matrix
+         * op, then wait on both. */
         constexpr int c_last = (KS - 1) & 1;
         kittens::sync::wait_ds<0>();
         kittens::sync::wait_tdm<S - 2>();
         kittens::sched::compiler_fence();
         kittens::sync::arrive();                               // --- signal (-1) ---
+        if (wid == 0) kittens::cluster::arrive();              // --- signal (-3) ---
         kittens::sched::compiler_fence();
         mma_ABt(C_acc, A_reg[c_last], B_reg[c_last], C_acc);   // 16 v_wmma in window
         kittens::sched::compiler_fence();
         kittens::sync::wait();                                 // --- wait (-1) ---
+        kittens::cluster::wait();                              // --- wait (-3) ---
         kittens::sched::compiler_fence();
     }
 
@@ -178,15 +190,42 @@ void dispatch(gemm_globals g)
      * the leading dimension is a multiple of 8. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_split_bar: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "gemm_wgc_multicast: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_split_bar");
+    gfx1250_gemm::require_k_blocks(g.K(), "gemm_wgc_multicast");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_split_bar_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_wgc_multicast_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
-    gemm_split_bar_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
+
+    const dim3 grid = g.grid();
+
+    /* Refuse rather than launch without a cluster. The multicast masks name peers by cluster
+     * position, so without the cluster they name workgroups that are not co-scheduled. */
+    if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
+        printf("!! gemm_wgc_multicast: a %dx%d cluster needs grid.x and grid.y both divisible "
+               "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
+        return;
+    }
+
+    hipLaunchConfig_t cfg = {};
+    cfg.gridDim          = grid;
+    cfg.blockDim         = g.block();
+    cfg.dynamicSmemBytes = mem_size;
+    cfg.stream           = g.stream;
+
+    hipLaunchAttribute attrs[1];
+    attrs[0].id               = hipLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = CLUSTER_DIM;
+    attrs[0].val.clusterDim.y = CLUSTER_DIM;
+    attrs[0].val.clusterDim.z = 1;
+    cfg.attrs    = attrs;
+    cfg.numAttrs = 1;
+
+    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_wgc_multicast_kernel, g, g.M(), g.N(), g.K());
+    if (e != hipSuccess)
+        printf("!! gemm_wgc_multicast: cluster launch REJECTED: %s\n", hipGetErrorString(e));
 }
 
 #include "harness.h"
