@@ -36,7 +36,7 @@ namespace cluster {
  * @brief Build the `M0` mask for a cluster multicast load.
  *
  * @param wg_bits        16-bit mask, bit `i` set ⇒ deliver result to WG `i` of the cluster.
- * @param early_timeout  If true, set bit 16 -- the load returns to whichever waves
+ * @param early_timeout  If true, set bit 21 -- the load returns to whichever requesters
  *                       have already joined as soon as the L2 returns; late joiners
  *                       issue a follow-up transaction. Useful when a few stragglers
  *                       would otherwise stall fast workgroups.
@@ -44,22 +44,40 @@ namespace cluster {
  * @return The `M0` value to pass as the `cluster_mask` argument of
  *         `kittens::load_async`/`kittens::load_tdm`.
  */
+static constexpr uint32_t EARLY_TIMEOUT_BIT = 1u << 21;
 __device__ __host__ __forceinline__ constexpr uint32_t mask(
     uint16_t wg_bits,
     bool early_timeout = false)
 {
-    return static_cast<uint32_t>(wg_bits) | (static_cast<uint32_t>(early_timeout) << 16);
+    return static_cast<uint32_t>(wg_bits)
+         | (early_timeout ? EARLY_TIMEOUT_BIT : 0u);
 }
 
 /**
- * @brief Cluster-wide split barrier.
+ * @brief Signal the cluster-wide split barrier.
  *
- * Outside a cluster this lowers to a workgroup-wide `sync::sync()`. Inside
- * a cluster the same `s_barrier_signal -1 / s_barrier_wait -1` pair extends to
- * every workgroup in the cluster by hardware-managed forwarding.
+ */
+__device__ __forceinline__ void arrive() {
+    __builtin_amdgcn_s_barrier_signal(-3);
+}
+
+/**
+ * @brief Wait on the cluster-wide split barrier.
+ *
+ */
+__device__ __forceinline__ void wait() {
+    __builtin_amdgcn_s_barrier_wait(-3);
+}
+
+/**
+ * @brief Cluster-wide barrier (signal + wait).
+ *
  */
 __device__ __forceinline__ void sync() {
-    ::kittens::sync::sync();
+    ::kittens::sync::arrive();
+    if (::kittens::warpid() == 0) arrive();
+    ::kittens::sync::wait();
+    wait();
 }
 
 } // namespace cluster

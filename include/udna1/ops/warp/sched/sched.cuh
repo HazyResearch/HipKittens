@@ -37,7 +37,10 @@ namespace detail {
 // Opaque, gfx1250-specific operands for the s_setreg instructions that
 // toggle this wave's expert-scheduling controls.
 constexpr int SCHED_MODE_EXPERT_SIMM16    = 26 | (0 << 6) | (1 << 11);  // expert mode on/off
-constexpr int SCHED_MODE_CLAIM_SIMD_SIMM16 = 26 | (4 << 6) | (0 << 11);  // back-to-back WMMAs
+// Bit 2, per ISA sect.5.7.2.1: DISABLE_XDL_ARB_STALL, "allows a wave to declare that it wants
+// to be able to issue multiple WMMA ops back to back". Pointing this at bit 4 writes a bit that
+// is not the documented control, which is why `lock_simd` was once recorded as doing nothing.
+constexpr int SCHED_MODE_CLAIM_SIMD_SIMM16 = 26 | (2 << 6) | (0 << 11);  // back-to-back WMMAs
 } // namespace detail
 
 /**
@@ -61,6 +64,7 @@ constexpr int SCHED_MODE_CLAIM_SIMD_SIMM16 = 26 | (4 << 6) | (0 << 11);  // back
  * does both at the start and end of a scope.
  */
 __device__ __forceinline__ void set_expert(bool on) {
+#if defined(KITTENS_UDNA1_ENABLE_EXPERT_MODE)
     // Value 2 selects the scheduling mode that lifts *only* the memory<->math
     // overlap interlock these loops rely on, so a single `wait_alu()` at each
     // genuine dependency is the complete fix. (The more aggressive value 1
@@ -68,6 +72,9 @@ __device__ __forceinline__ void set_expert(bool on) {
     // in these kernels cannot safely take responsibility for.)
     __builtin_amdgcn_s_setreg(detail::SCHED_MODE_EXPERT_SIMM16,
                               on ? 2u : 0u);
+#else
+    (void)on;
+#endif
 }
 
 /**
@@ -90,7 +97,15 @@ __device__ __forceinline__ void set_expert(bool on) {
  */
 struct expert_scope {
     __device__ __forceinline__ expert_scope()  { set_expert(true);  }
-    __device__ __forceinline__ ~expert_scope() { set_expert(false); }
+    __device__ __forceinline__ ~expert_scope() {
+#if defined(KITTENS_UDNA1_ENABLE_EXPERT_MODE)
+        // Drain outstanding results and load/store source reads before leaving, so the following
+        // non-expert code does not race work that is still in flight.
+        asm volatile("s_wait_alu depctr_va_vdst(0)" ::: "memory");
+        asm volatile("s_wait_alu depctr_vm_vsrc(0)" ::: "memory");
+#endif
+        set_expert(false);
+    }
 
     expert_scope(const expert_scope&)            = delete;
     expert_scope& operator=(const expert_scope&) = delete;
@@ -135,17 +150,19 @@ __device__ __forceinline__ void lock_simd() {
  * next K-tile into the same registers the previous multiply consumed.
  *
  * With expert scheduling off the hardware inserts these waits for you, so this
- * is never needed. Note it does *not* wait for loaded data to *arrive* -- that
- * is a memory-count wait (`sync::wait_load`, `wait_ds`, `wait_async`, ...),
- * which expert mode does not affect.
+ * is never needed and compiles to nothing. Note it does *not* wait for loaded
+ * data to *arrive* -- that is a memory-count wait (`sync::wait_load`,
+ * `wait_ds`, `wait_async`, ...), which expert mode does not affect.
  *
  * @note Clang 23 does not expose `__builtin_amdgcn_s_wait_alu`; we emit the
  *       instructions directly. Lowers to `s_wait_alu depctr_va_vdst(0)` then
  *       `s_wait_alu depctr_vm_vsrc(0)`.
  */
 __device__ __forceinline__ void wait_alu() {
+#if defined(KITTENS_UDNA1_ENABLE_EXPERT_MODE)
     asm volatile("s_wait_alu depctr_va_vdst(0)" ::: "memory");
     asm volatile("s_wait_alu depctr_vm_vsrc(0)" ::: "memory");
+#endif
 }
 
 /**
@@ -210,4 +227,3 @@ __device__ __forceinline__ void compiler_fence() {
 
 } // namespace sched
 } // namespace kittens
-
