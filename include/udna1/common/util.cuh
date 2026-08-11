@@ -401,13 +401,19 @@ struct shared_allocator {
         template<typename A, size_t... dims> 
         using variadic_array_t = typename variadic_array<A, dims...>::type;
 
+        /**
+         * @brief Advance the cursor to an `alignment` boundary by POINTER arithmetic.
+         * @tparam alignment The alignment to enforce.
+         */
         template<int alignment>
         __device__ inline void align_ptr() {
             if constexpr (alignment > 0) {
-                uint64_t p = reinterpret_cast<uint64_t>(ptr);
-                if(p % alignment != 0) {
-                    ptr = (int*)(p + (alignment-(p%alignment)));
-                }
+                static_assert(alignment % sizeof(int) == 0,
+                    "shared_allocator alignment must be a multiple of sizeof(int): the cursor is an "
+                    "int* and advances in whole ints, so a finer alignment is unreachable by pointer "
+                    "arithmetic and would need the provenance-destroying integer round trip back.");
+                const uint64_t misalign = reinterpret_cast<uint64_t>(ptr) % alignment;
+                if (misalign != 0) ptr += (alignment - misalign) / sizeof(int);
             }
         }
 
