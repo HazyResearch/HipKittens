@@ -117,6 +117,22 @@ struct gl {
         else if constexpr (axis==2) { return 1; }
         else                        { return rows(); }
     }
+
+    /* Element offset of (row, col) from a tile base, in the units `raw_ptr` is indexed in. The one
+     * place a layout becomes an address: the contiguous axis contributes its coordinate unscaled and
+     * the other is scaled by its stride. `axis` names the tile's row axis, as it does for `stride`.
+     *
+     * The multiply stays 32-bit on purpose. Both coordinates are bounded by the tile and the stride by
+     * the tensor, so the product cannot overflow, while widening it makes the backend give up on
+     * proving the base wave-uniform and materialise it into a VGPR pair. */
+    template<int axis> __device__ inline int64_t offset(int row, int col) const
+        requires std::is_same_v<layout, ducks::gl_layout::row_major> {
+        return (int64_t)row * (int)stride<axis>() + col;
+    }
+    template<int axis> __device__ inline int64_t offset(int row, int col) const
+        requires std::is_same_v<layout, ducks::gl_layout::col_major> {
+        return (int64_t)col * (int)stride<3>() + row;
+    }
 };
 
 namespace ducks {

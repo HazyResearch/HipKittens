@@ -242,15 +242,15 @@ __device__ __forceinline__ void wait_async() {
  * `__builtin_amdgcn_tensor_load_to_lds` or `tensor_store_from_lds`.
  *
  * @code
- *   load_tdm(buf[0], ...);
- *   load_tdm(buf[1], ...);
- *   load_tdm(buf[2], ...);
+ *   tdm::load_async(buf[0], ...);
+ *   tdm::load_async(buf[1], ...);
+ *   tdm::load_async(buf[2], ...);
  *   for (int k = 0; k + 3 < K; ++k) {
- *       sync::wait_tdm<2>();              // drain one slot, two stay in flight
+ *       tdm::wait<2>();              // drain one slot, two stay in flight
  *       consume(buf[k % 3]);
- *       load_tdm(buf[k % 3], ...);
+ *       tdm::load_async(buf[k % 3], ...);
  *   }
- *   sync::wait_tdm<0>();                  // drain the tail
+ *   tdm::wait<0>();                  // drain the tail
  * @endcode
  */
 template<int N = 0>
@@ -338,7 +338,7 @@ __device__ __forceinline__ void wait_barrier(uint64_t* bar, int expected_phase) 
  *
  * Lowers to `DS_ATOMIC_ASYNC_BARRIER_ARRIVE_B64`. Use this to manually
  * arrive at a cell (the auto-arrive form is encoded in the TDM descriptor
- * via `load_tdm_arrive`).
+ * via `tdm::arrive`).
  */
 __device__ __forceinline__ void async_barrier_arrive(uint64_t* lds_counter) {
     uintptr_t lds_uint = reinterpret_cast<uintptr_t>(lds_counter);

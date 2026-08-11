@@ -42,7 +42,7 @@ namespace cluster {
  *                       would otherwise stall fast workgroups.
  *
  * @return The `M0` value to pass as the `cluster_mask` argument of
- *         `kittens::load_async`/`kittens::load_tdm`.
+ *         `kittens::load_async`/`kittens::tdm::load_async`.
  */
 static constexpr uint32_t EARLY_TIMEOUT_BIT = 1u << 21;
 __device__ __host__ __forceinline__ constexpr uint32_t mask(
