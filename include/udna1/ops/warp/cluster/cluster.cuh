@@ -70,8 +70,14 @@ __device__ __forceinline__ void wait() {
 }
 
 /**
- * @brief Cluster-wide barrier (signal + wait).
+ * @brief Cluster-wide barrier: workgroup rendezvous, one signal per workgroup, then both waits.
  *
+ * The cluster barrier's member count is the number of workgroups in the cluster, and completion
+ * compares it against a signal count that records how many signals arrived rather than which waves
+ * sent them. Exactly one warp per workgroup may therefore signal it. If every warp
+ * signalled, a single workgroup would satisfy the count on its own and release the cluster before
+ * its peers arrived, and would do so without raising a fault. The wait is unconditional, since
+ * completion is reported to every wave in the cluster.
  */
 __device__ __forceinline__ void sync() {
     ::kittens::sync::arrive();
