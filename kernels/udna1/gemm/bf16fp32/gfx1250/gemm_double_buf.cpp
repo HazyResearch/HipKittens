@@ -87,8 +87,8 @@ void gemm_double_buf_kernel(const gemm_globals g, int M, int N, int K)
     for (int s = 0; s < S - 1; ++s)
         if (s < k_blocks) issue_fill(s, s);
 
-    kittens::sync::fence();                           // publish stage 0
-    kittens::sync::sync();
+    kittens::sync::fence();                           // wait for data (global + LDS): stage 0 landed
+    kittens::sync::sync();                            // wait for everyone (workgroup): stage 0 readable
 
     rt_e<WARP_M, K_STEP> A_reg;
     rt_e<WARP_N, K_STEP> B_reg;
@@ -106,13 +106,12 @@ void gemm_double_buf_kernel(const gemm_globals g, int M, int N, int K)
         kittens::load(B_reg, ring[cur].b, warp_off_b);
         mma_ABt(C_acc, A_reg, B_reg, C_acc);
 
-        // One rendezvous per K-block: publishes the fill just issued, frees the stage just read.
-        kittens::sync::fence();
-        kittens::sync::sync();
+        kittens::sync::fence();      // wait for data (global + LDS): the fill landed, our reads are done
+        kittens::sync::sync();       // wait for everyone (workgroup): publish the fill, free the stage
     }
 
     // Nothing reuses the ring now; this drains the wave's outstanding LDS traffic before exit.
-    kittens::sync::wait_ds<0>();
+    kittens::sync::wait_ds<0>();     // wait for data (LDS): no read may outlive the workgroup
 
     // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});

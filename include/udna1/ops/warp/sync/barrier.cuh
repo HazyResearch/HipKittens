@@ -156,10 +156,13 @@ __device__ __forceinline__ void wait() {
 /**
  * @brief Block-wide barrier (signal + wait).
  *
- * Semantically equivalent to `__syncthreads()`. Prefer the split form
- * (`arrive()` followed by independent work followed by `wait()`) when the
- * window between signalling and waiting can be filled with non-dependent
- * instructions.
+ * Not equivalent to `__syncthreads()`, which also drains LDS before signalling.
+ * This is the rendezvous alone, pair it with the `wait_*` for whatever the other 
+ * warps are about to read.
+ *
+ * Prefer the split form (`arrive()`, then independent work, then `wait()`) when
+ * the window between signalling and waiting can be filled with instructions
+ * that do not depend on the barrier.
  */
 __device__ __forceinline__ void sync() {
     arrive();

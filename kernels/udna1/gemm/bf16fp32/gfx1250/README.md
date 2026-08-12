@@ -29,6 +29,22 @@ holds, so `BLOCK_K / K_STEP` sub-steps run per fill. Deepening it amortises the 
 over more math and puts the LDS row at 256 B, which is eight lanes per cache line and half the fill
 requests.
 
+## Synchronization
+
+The rungs collectively use ten sync calls, which is a lot to meet at once -- but no rung meets more
+than one new one. Reading upward, `gemm_naive` and `gemm_double_buf` use only the full barrier
+`sync::sync`. `gemm_async` splits it into `arrive`/`wait` and adds `wait_async`, because the fill is
+now a copy engine that has to be waited on separately. `gemm_tdm` swaps that engine, and with it
+`wait_async` for `wait_tdm`. `gemm_wgc_multicast` adds the cluster barrier. `gemm_one_wave` adds no
+new primitive at all -- it only wraps the ones already there in `sched::compiler_fence`.
+
+Each call in a kernel is labelled with the job it does and the resource it does it on: `wait for
+data (LDS)`, `wait for data (TDM)`, `wait for everyone (workgroup)`, and so on. The two jobs are
+independent -- a barrier orders warps and says nothing about memory, a counter wait orders one
+warp's own transfers and says nothing about other warps -- and the four rules that follow from that,
+including which drains may be partial and why, are in the header of
+`include/udna1/ops/warp/sync/barrier.cuh`.
+
 Every kernel file opens with a `Kernel Specification` block -- tile geometry, occupancy in waves per
 SIMD, register and spill counts, LDS footprint, the per-K-block sync inventory and arithmetic
 intensity -- so the per-kernel facts sit next to the code rather than here.

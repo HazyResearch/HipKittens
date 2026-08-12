@@ -144,9 +144,9 @@ void gemm_one_wave_kernel(const gemm_globals g, int M, int N, int K)
     for (int s = 0; s < S - 1; ++s)
         if (s < k_blocks) issue_fill(s, s);
 
-    kittens::sync::wait_tdm<0>();
+    kittens::sync::wait_tdm<0>();               // wait for data (TDM): stage 0 landed
     kittens::sched::compiler_fence();
-    kittens::cluster::sync();                   // publish stage 0; no work to fill a window yet
+    kittens::cluster::sync();                   // wait for everyone (cluster): no work to fill a window
     kittens::sched::compiler_fence();
 
     rt_e<WARP_M, K_STEP> A_reg[R];
@@ -183,6 +183,7 @@ void gemm_one_wave_kernel(const gemm_globals g, int M, int N, int K)
                 kittens::load(B_reg[fs % R], *B_st[cur], warp_off_b + fs * K_STEP);
             }
             kittens::sched::compiler_fence();
+            // wait for data (LDS): partial -- LDS reads finish in order, so some stay in flight.
             kittens::sync::wait_ds<DS_SUB>();
             mma_ABt(C_acc, A_reg[si % R], B_reg[si % R], C_acc);
             kittens::sched::compiler_fence();
@@ -191,35 +192,36 @@ void gemm_one_wave_kernel(const gemm_globals g, int M, int N, int K)
         /* Stage handoff, in order: drain LDS, drain TDM, signal both barriers, the last matrix op,
          * then wait on both. This is rung 9's split form. */
         constexpr int c_last = (KS - 1) % R;
-        kittens::sync::wait_ds<0>();
-        kittens::sync::wait_tdm<S - 2>();
+        kittens::sync::wait_ds<0>();               // wait for data (LDS): done reading this stage
+        kittens::sync::wait_tdm<S - 2>();          // wait for data (TDM): the next stage has landed
         kittens::sched::compiler_fence();
-        kittens::sync::arrive();                               // --- signal (-1) ---
-        if (wid == 0) kittens::cluster::arrive();              // --- signal (-3) ---
+        kittens::sync::arrive();                   // wait for everyone (workgroup): the 4 warps here
+        // wait for everyone (cluster): one signal each -- it counts workgroups, not warps.
+        if (wid == 0) kittens::cluster::arrive();
         kittens::sched::compiler_fence();
-        mma_ABt(C_acc, A_reg[c_last], B_reg[c_last], C_acc);   // 64 v_wmma in window
+        mma_ABt(C_acc, A_reg[c_last], B_reg[c_last], C_acc);   // 64 v_wmma inside the barrier window
         kittens::sched::compiler_fence();
-        kittens::sync::wait();                                 // --- wait (-1) ---
-        kittens::cluster::wait();                              // --- wait (-3) ---
+        kittens::sync::wait();
+        kittens::cluster::wait();
         kittens::sched::compiler_fence();
     }
 
     // The epilogue reuses the ring, so drain both counters first.
-    kittens::sync::wait_tdm<0>();
-    kittens::sync::wait_ds<0>();
+    kittens::sync::wait_tdm<0>();                  // wait for data (TDM): no fill outlives the group
+    kittens::sync::wait_ds<0>();                   // wait for data (LDS): nor any read of the ring
 
     /* Epilogue, written out. Each barrier below needs its own LDS drain: a barrier orders execution
      * and not LDS traffic, and because the staging tile aliases the operand ring, omitting either
      * drain produces silently wrong output rather than a hang. */
     C_col& c_st = *reinterpret_cast<C_col*>(&__shm[0]);
 
-    kittens::sync::wait_ds<0>();          // WAR: every warp's operand ds_reads have landed
-    kittens::sync::sync();
+    kittens::sync::wait_ds<0>();   // wait for data (LDS): reads done, so the LDS can be reused
+    kittens::sync::sync();         // wait for everyone (workgroup): the ring is free to become C
 
     kittens::store(c_st, C_acc, warp_r * WARP_M, warp_c * WARP_N);
 
-    kittens::sync::wait_ds<0>();          // RAW: the staged tile is visible to every warp
-    kittens::sync::sync();
+    kittens::sync::wait_ds<0>();   // wait for data (LDS): our staged writes are visible to others
+    kittens::sync::sync();         // wait for everyone (workgroup): the whole C tile is staged
 
     kittens::store<NUM_THREADS>(g.c, c_st, {0, 0, tile_m, tile_n});
 }

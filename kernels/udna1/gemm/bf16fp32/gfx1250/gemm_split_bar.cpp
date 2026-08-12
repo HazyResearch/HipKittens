@@ -110,9 +110,9 @@ void gemm_split_bar_kernel(const gemm_globals g, int M, int N, int K)
     for (int s = 0; s < S - 1; ++s)
         if (s < k_blocks) issue_fill(s, s);
 
-    kittens::sync::wait_tdm<0>();
+    kittens::sync::wait_tdm<0>();                     // wait for data (TDM): stage 0 landed
     kittens::sched::compiler_fence();
-    kittens::sync::arrive(); kittens::sync::wait();   // publish stage 0; no work to fill a window
+    kittens::sync::arrive(); kittens::sync::wait();   // wait for everyone (workgroup): no work to fill
     kittens::sched::compiler_fence();
 
     // Operands are double-buffered in registers: the matrix unit reads one buffer while the
@@ -143,6 +143,7 @@ void gemm_split_bar_kernel(const gemm_globals g, int M, int N, int K)
             const int c = si & 1, n = 1 - c;
             kittens::load(A_reg[n], A_st[cur], warp_off_a + (si + 1) * K_STEP);
             kittens::load(B_reg[n], B_st[cur], warp_off_b + (si + 1) * K_STEP);
+            // wait for data (LDS): partial -- LDS reads finish in order, so some stay in flight.
             kittens::sync::wait_ds<DS_SUB>();
             mma_ABt(C_acc, A_reg[c], B_reg[c], C_acc);
         }
@@ -153,20 +154,20 @@ void gemm_split_bar_kernel(const gemm_globals g, int M, int N, int K)
          * reads registers only. The fences hold it inside the window; without them it is
          * hoisted above the signal or sunk below the wait. */
         constexpr int c_last = (KS - 1) & 1;
-        kittens::sync::wait_ds<0>();
-        kittens::sync::wait_tdm<S - 2>();
+        kittens::sync::wait_ds<0>();       // wait for data (LDS): done reading the current stage
+        kittens::sync::wait_tdm<S - 2>();  // wait for data (TDM): the next stage's fill has landed
         kittens::sched::compiler_fence();
-        kittens::sync::arrive();                               // --- signal (-1) ---
+        kittens::sync::arrive();           // wait for everyone (workgroup): publish next, protect this
         kittens::sched::compiler_fence();
-        mma_ABt(C_acc, A_reg[c_last], B_reg[c_last], C_acc);   // 16 v_wmma in window
+        mma_ABt(C_acc, A_reg[c_last], B_reg[c_last], C_acc);   // 16 v_wmma inside the barrier window
         kittens::sched::compiler_fence();
-        kittens::sync::wait();                                 // --- wait (-1) ---
+        kittens::sync::wait();
         kittens::sched::compiler_fence();
     }
 
     // Nothing reuses the ring now, but a workgroup must not exit with a fill still writing its LDS.
-    kittens::sync::wait_tdm<0>();
-    kittens::sync::wait_ds<0>();
+    kittens::sync::wait_tdm<0>();          // wait for data (TDM): no fill outlives the workgroup
+    kittens::sync::wait_ds<0>();           // wait for data (LDS): nor any read of the ring
 
     // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});

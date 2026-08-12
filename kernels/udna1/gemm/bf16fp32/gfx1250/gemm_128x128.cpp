@@ -86,9 +86,9 @@ void gemm_128x128_kernel(const gemm_globals g, int M, int N, int K)
     for (int s = 0; s < S - 1; ++s)
         if (s < k_blocks) issue_fill(s, s);
 
-    kittens::sync::wait_async<0>();
+    kittens::sync::wait_async<0>();                   // wait for data (async copy): stage 0 landed
     kittens::sched::compiler_fence();
-    kittens::sync::arrive(); kittens::sync::wait();   // publish stage 0
+    kittens::sync::arrive(); kittens::sync::wait();   // wait for everyone (workgroup): stage 0 ready
     kittens::sched::compiler_fence();
 
     rt_e<WARP_M, K_STEP> A_reg;
@@ -112,16 +112,17 @@ void gemm_128x128_kernel(const gemm_globals g, int M, int N, int K)
          * order, so a partial `wait_async<N>` establishes nothing. */
         kittens::sync::wait_ds<0>();
         mma_ABt(C_acc, A_reg, B_reg, C_acc);
+        // wait for data (async copy): all of it -- the engine says "done" before visible.
         kittens::sync::wait_async<0>();
         kittens::sched::compiler_fence();
-        kittens::sync::arrive();                               // --- signal (-1) ---
-        kittens::sync::wait();                                 // --- wait (-1) ---
+        kittens::sync::arrive();         // wait for everyone (workgroup): publish new, protect old
+        kittens::sync::wait();
         kittens::sched::compiler_fence();
     }
 
     // Nothing reuses the ring now, but a workgroup must not exit with a fill still writing its LDS.
-    kittens::sync::wait_async<0>();
-    kittens::sync::wait_ds<0>();
+    kittens::sync::wait_async<0>();      // wait for data (async copy): no fill outlives the workgroup
+    kittens::sync::wait_ds<0>();         // wait for data (LDS): nor any read of the ring
 
     // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});

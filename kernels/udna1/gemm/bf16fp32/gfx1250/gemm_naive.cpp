@@ -74,15 +74,15 @@ void gemm_naive_kernel(const gemm_globals g, int M, int N, int K)
         kittens::load<NUM_THREADS>(A_st, g.a, {0, 0, tile_m, kb}, K);
         kittens::load<NUM_THREADS>(B_st, g.b, {0, 0, tile_n, kb}, K);
 
-        kittens::sync::fence();                   // RAW: publish the slab
-        kittens::sync::sync();
+        kittens::sync::fence();                   // wait for data (global + LDS): the slab has landed
+        kittens::sync::sync();                    // wait for everyone (workgroup): the slab is readable
 
         kittens::load(A_reg, A_st, warp_off_a);
         kittens::load(B_reg, B_st, warp_off_b);
         mma_ABt(C_acc, A_reg, B_reg, C_acc);
 
-        kittens::sync::fence();                   // WAR: nobody is still reading the slab
-        kittens::sync::sync();
+        kittens::sync::fence();                   // wait for data (LDS): our reads of the slab are done
+        kittens::sync::sync();                    // wait for everyone (workgroup): safe to refill it
     }
 
     /* Epilogue: each warp converts its accumulator to bf16 straight into global C. Column-major C
