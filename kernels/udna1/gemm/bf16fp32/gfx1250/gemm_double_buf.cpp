@@ -28,22 +28,19 @@
  *   - `kittens::store(gl,rt,idx)` : direct column-major epilogue.
  */
 
-#ifndef GFX1250_BLOCK_M
-#define GFX1250_BLOCK_M 64
-#endif
-#ifndef GFX1250_BLOCK_N
-#define GFX1250_BLOCK_N 64
-#endif
-#ifndef GFX1250_BLOCK_K
-#define GFX1250_BLOCK_K 32
-#endif
-#define GFX1250_K_STEP  32
-#ifndef GFX1250_WARPS_M
-#define GFX1250_WARPS_M 2
-#endif
-#ifndef GFX1250_WARPS_N
-#define GFX1250_WARPS_N 2
-#endif
+#include "kittens.cuh"
+
+constexpr int BLOCK_M     = 64;
+constexpr int BLOCK_N     = 64;
+constexpr int BLOCK_K     = 32;
+constexpr int K_STEP      = 32;
+constexpr int WARPS_M     = 2;
+constexpr int WARPS_N     = 2;
+constexpr int WARP_M      = BLOCK_M / WARPS_M;
+constexpr int WARP_N      = BLOCK_N / WARPS_N;
+constexpr int NUM_WARPS   = WARPS_M * WARPS_N;
+constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
+constexpr int K_SUBBLOCKS = BLOCK_K / K_STEP;
 
 #include "common.h"
 

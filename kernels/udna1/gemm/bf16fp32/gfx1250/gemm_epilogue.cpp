@@ -73,22 +73,19 @@
  *   - LDS: S*(A_tile + B_tile) must fit in 327,680 B.
  *   - Tiling: BLOCK_M and BLOCK_N must divide the problem, so on power-of-two shapes they must
  *     be powers of two too, which rules out 320 and 384 whatever the registers allow. */
-#ifndef GFX1250_BLOCK_M
-#define GFX1250_BLOCK_M 256
-#endif
-#ifndef GFX1250_BLOCK_N
-#define GFX1250_BLOCK_N 256
-#endif
-#ifndef GFX1250_BLOCK_K
-#define GFX1250_BLOCK_K 128
-#endif
-#define GFX1250_K_STEP  32
-#ifndef GFX1250_WARPS_M
-#define GFX1250_WARPS_M 4
-#endif
-#ifndef GFX1250_WARPS_N
-#define GFX1250_WARPS_N 4
-#endif
+#include "kittens.cuh"
+
+constexpr int BLOCK_M     = 256;
+constexpr int BLOCK_N     = 256;
+constexpr int BLOCK_K     = 128;
+constexpr int K_STEP      = 32;
+constexpr int WARPS_M     = 4;
+constexpr int WARPS_N     = 4;
+constexpr int WARP_M      = BLOCK_M / WARPS_M;
+constexpr int WARP_N      = BLOCK_N / WARPS_N;
+constexpr int NUM_WARPS   = WARPS_M * WARPS_N;
+constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
+constexpr int K_SUBBLOCKS = BLOCK_K / K_STEP;
 
 #include "common.h"
 
@@ -115,7 +112,7 @@ using B_deep = st_e<BLOCK_N, BLOCK_K>;
 #define E_PAD 128
 #endif
 #if E_TDM
-static_assert(E_PAD == GFX1250_BLOCK_M,
+static_assert(E_PAD == BLOCK_M,
     "the TDM arm needs the pad interval to equal the col-layout tile's innermost dimension (BLOCK_M)");
 #endif
 

@@ -2,10 +2,10 @@
  * @file pyext.h
  * @brief pybind11 module for one rung of the gfx1250 GEMM ladder.
  *
- * Included by `harness.h` under `-DHARNESS_PYEXT`, once per rung: each rung sets its own
- * `GFX1250_BLOCK_*` macros before including `common.h` and each names its entry point `dispatch`,
- * so one module cannot serve all thirteen. The module's name must match the .so basename, so both
- * come from `-DHK_PYEXT_NAME` and `make KERNEL=gemm_naive` gives Python `import gemm_naive`.
+ * Included by `harness.h` under `-DHARNESS_PYEXT`, once per rung: each rung declares its own tile
+ * geometry before including `common.h` and each names its entry point `dispatch`, so one module
+ * cannot serve all thirteen. The module's name must match the .so basename, so both come from
+ * `-DHK_PYEXT_NAME` and `make KERNEL=gemm_naive` gives Python `import gemm_naive`.
  *
  * The tensor contract, which is the whole of what is easy to get wrong here because getting it
  * wrong produces a wrong answer rather than an error:
@@ -207,11 +207,11 @@ HK_PYBIND_MODULE {
 
     m.attr("rung")        = HK_STRINGIFY(HK_PYEXT_NAME);
     m.attr("dtype")       = torch_dtype_name<dev_elem>::value;
-    m.attr("BLOCK_M")     = gfx1250_gemm::BLOCK_M;
-    m.attr("BLOCK_N")     = gfx1250_gemm::BLOCK_N;
-    m.attr("BLOCK_K")     = gfx1250_gemm::BLOCK_K;
-    m.attr("WARPS_M")     = gfx1250_gemm::WARPS_M;
-    m.attr("WARPS_N")     = gfx1250_gemm::WARPS_N;
+    m.attr("BLOCK_M")     = BLOCK_M;
+    m.attr("BLOCK_N")     = BLOCK_N;
+    m.attr("BLOCK_K")     = BLOCK_K;
+    m.attr("WARPS_M")     = WARPS_M;
+    m.attr("WARPS_N")     = WARPS_N;
     m.attr("warmup_iters") = HK_WARMUP_ITERS;
     m.attr("c_layout")    = "column-major";
 }

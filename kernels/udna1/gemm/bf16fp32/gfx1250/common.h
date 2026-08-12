@@ -1,11 +1,11 @@
 /**
  * @file common.h
- * @brief Shared types and tile geometry for the gfx1250 GEMM ladder.
+ * @brief Shared types for the gfx1250 GEMM ladder.
  *
  * Every rung includes this, so the rungs differ only in their compute body. It fixes the
- * operand and output types, derives the tile shape from five macros a rung may override
- * before including it, and carries the two contracts a rung cannot check for itself: the
- * LDS segment placement and the minimum K.
+ * operand and output types, builds the tile types from the geometry the rung declares, and
+ * carries the two contracts a rung cannot check for itself: the LDS segment placement and
+ * the minimum K.
  */
 
 #pragma once
@@ -16,52 +16,8 @@
 
 namespace gfx1250_gemm {
 
-/* ----------  TILE GEOMETRY  ----------
- *
- * The macro tile is BLOCK_M x BLOCK_N of output, split across a WARPS_M x WARPS_N grid of
- * warps. Bigger tiles do more math per byte of operand fetched -- arithmetic intensity for a
- * square tile is M*N/(M+N) FLOP per byte -- which is why the ladder climbs through 64x64,
- * 128x128 and 256x256. 256x256 is the largest the register file allows: at four waves per
- * SIMD a warp's 64x64 accumulator takes 128 VGPRs of the 256 a lane gets, and doubling the
- * tile again would need 512.
- *
- * K_STEP is the matrix instruction's K depth, fixed at 32. BLOCK_K is how much K one LDS
- * stage holds, so BLOCK_K / K_STEP sub-steps run per fill. Deepening it amortises the
- * per-block rendezvous over more math and puts the LDS row at 256 B, which is eight lanes
- * per cache line and half the fill requests.
- *
- * Defaults are the smallest rung's shape; the rungs above set what they need.
- */
-#ifndef GFX1250_BLOCK_M
-#define GFX1250_BLOCK_M 64
-#endif
-#ifndef GFX1250_BLOCK_N
-#define GFX1250_BLOCK_N 64
-#endif
-#ifndef GFX1250_K_STEP
-#define GFX1250_K_STEP 32
-#endif
-#ifndef GFX1250_BLOCK_K
-#define GFX1250_BLOCK_K GFX1250_K_STEP
-#endif
-#ifndef GFX1250_WARPS_M
-#define GFX1250_WARPS_M 2
-#endif
-#ifndef GFX1250_WARPS_N
-#define GFX1250_WARPS_N 2
-#endif
-
-constexpr int BLOCK_M     = GFX1250_BLOCK_M;
-constexpr int BLOCK_N     = GFX1250_BLOCK_N;
-constexpr int K_STEP      = GFX1250_K_STEP;
-constexpr int BLOCK_K     = GFX1250_BLOCK_K;
-constexpr int WARPS_M     = GFX1250_WARPS_M;
-constexpr int WARPS_N     = GFX1250_WARPS_N;
-constexpr int WARP_M      = BLOCK_M / WARPS_M;
-constexpr int WARP_N      = BLOCK_N / WARPS_N;
-constexpr int NUM_WARPS   = WARPS_M * WARPS_N;
-constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
-constexpr int K_SUBBLOCKS = BLOCK_K / K_STEP;
+/* Each rung declares its own tile geometry before including this. What follows uses
+ * BLOCK_M, BLOCK_N, BLOCK_K, K_STEP and NUM_THREADS from it. See README.md. */
 
 /* ----------  TYPES  ----------
  *

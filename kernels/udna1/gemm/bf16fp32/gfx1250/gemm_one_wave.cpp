@@ -47,15 +47,21 @@
  * matrix op.
  */
 
-/* Geometry is not overridable here, unlike the rungs below. One wave per SIMD is the whole point:
- * at 128 threads the four warps land one per SIMD, and a lone wave may take the full 1024-VGPR
- * budget, which is what pays for the pinned schedule. */
-#define GFX1250_BLOCK_M 256
-#define GFX1250_BLOCK_N 256
-#define GFX1250_BLOCK_K 128
-#define GFX1250_K_STEP  32
-#define GFX1250_WARPS_M 2
-#define GFX1250_WARPS_N 2
+#include "kittens.cuh"
+
+/* One wave per SIMD is the whole point: at 128 threads the four warps land one per SIMD, and a
+ * lone wave may take the full 1024-VGPR budget, which is what pays for the pinned schedule. */
+constexpr int BLOCK_M     = 256;
+constexpr int BLOCK_N     = 256;
+constexpr int BLOCK_K     = 128;
+constexpr int K_STEP      = 32;
+constexpr int WARPS_M     = 2;
+constexpr int WARPS_N     = 2;
+constexpr int WARP_M      = BLOCK_M / WARPS_M;
+constexpr int WARP_N      = BLOCK_N / WARPS_N;
+constexpr int NUM_WARPS   = WARPS_M * WARPS_N;
+constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
+constexpr int K_SUBBLOCKS = BLOCK_K / K_STEP;
 
 #include "common.h"
 

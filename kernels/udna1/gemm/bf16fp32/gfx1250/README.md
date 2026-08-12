@@ -12,6 +12,23 @@ rather than silently transposed. They are written against
 `include/udna1/ops/warp/{sync,sched,cluster}/` and the gfx1250-only extensions to
 `memory/tile/global_to_shared.cuh`, `memory/tile/shared_to_register.cuh` and `register/tile/mma.cuh`.
 
+## Tile geometry
+
+Each rung declares its own `BLOCK_M`, `BLOCK_N`, `BLOCK_K`, `K_STEP`, `WARPS_M` and `WARPS_N` at the
+top of its file, with the values derived from them, so a rung's shape is visible without opening
+`common.h`.
+
+The macro tile is `BLOCK_M` x `BLOCK_N` of output, split across a `WARPS_M` x `WARPS_N` grid of
+warps. Bigger tiles do more math per byte of operand fetched -- arithmetic intensity for a square
+tile is `M*N/(M+N)` FLOP per byte -- which is why the ladder climbs through 64x64, 128x128 and
+256x256. 256x256 is the largest the register file allows: at four waves per SIMD a warp's 64x64
+accumulator takes 128 VGPRs of the 256 a lane gets, and doubling the tile again would need 512.
+
+`K_STEP` is the matrix instruction's K depth, fixed at 32. `BLOCK_K` is how much K one LDS stage
+holds, so `BLOCK_K / K_STEP` sub-steps run per fill. Deepening it amortises the per-block rendezvous
+over more math and puts the LDS row at 256 B, which is eight lanes per cache line and half the fill
+requests.
+
 Every kernel file opens with a `Kernel Specification` block -- tile geometry, occupancy in waves per
 SIMD, register and spill counts, LDS footprint, the per-K-block sync inventory and arithmetic
 intensity -- so the per-kernel facts sit next to the code rather than here.

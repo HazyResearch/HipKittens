@@ -39,25 +39,22 @@
  *   - LDS: S*(A_tile + B_tile) must fit in 327,680 B.
  *   - Tiling: BLOCK_M and BLOCK_N must divide the problem, so on power-of-two shapes they must
  *     be powers of two too, which rules out 320 and 384 whatever the registers allow. */
-#ifndef GFX1250_BLOCK_M
-#define GFX1250_BLOCK_M 256
-#endif
-#ifndef GFX1250_BLOCK_N
-#define GFX1250_BLOCK_N 256
-#endif
-#ifndef GFX1250_BLOCK_K
-#define GFX1250_BLOCK_K 128
-#endif
-#define GFX1250_K_STEP  32
+#include "kittens.cuh"
+
+constexpr int BLOCK_M     = 256;
+constexpr int BLOCK_N     = 256;
+constexpr int BLOCK_K     = 128;
+constexpr int K_STEP      = 32;
 /* 4x4 warps is four waves per SIMD, which is what the register file allows: at eight it cannot
  * hold the double-buffered operands plus the matrix op held in the window, and the kernel spills.
  * Wave count is co-designed with the split form rather than free to set on its own. */
-#ifndef GFX1250_WARPS_M
-#define GFX1250_WARPS_M 4
-#endif
-#ifndef GFX1250_WARPS_N
-#define GFX1250_WARPS_N 4
-#endif
+constexpr int WARPS_M     = 4;
+constexpr int WARPS_N     = 4;
+constexpr int WARP_M      = BLOCK_M / WARPS_M;
+constexpr int WARP_N      = BLOCK_N / WARPS_N;
+constexpr int NUM_WARPS   = WARPS_M * WARPS_N;
+constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
+constexpr int K_SUBBLOCKS = BLOCK_K / K_STEP;
 
 #include "common.h"
 
