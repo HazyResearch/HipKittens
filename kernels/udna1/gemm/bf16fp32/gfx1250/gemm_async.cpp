@@ -2,13 +2,22 @@
  * @file gemm_async.cpp
  * @brief Rung 3 -- gemm_double_buf plus the cooperative async fill.
  *
+ * Kernel Specification
+ *   tile        64x64 macro, 32x32 per warp, 2x2 warps; BLOCK_K 32 = 1 x K_STEP 32
+ *   occupancy   4 warps / 128 threads / 1 wave per SIMD; 10 workgroups per CU, register-bound
+ *   registers   83 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 30 SGPR
+ *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
+ *   LDS         2 stages x 8.5 KB = 17 KB of 320 KB (5.3%)
+ *   sync        per K-block: 1 barrier (split), 1 LDS drain, 1 async drain
+ *   intensity   32 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
+ *
  * `global_load_async_to_lds_b128` lands operands in LDS without staging them through VGPRs, so
  * the registers and issue slots the register-mediated copy spent go back to the K-loop and the
  * fill no longer has to lead the operand reads. It is worth about 1.6x, one of the two largest
  * steps on the ladder. What it costs is a second counter to reason about: the fill retires on the
  * async counter, the operand reads on the LDS counter, and the stage handoff has to drain both.
  * Same 64x64 tile, two interleaved stages of a padded 64x32 LDS tile in one segment, plain split
- * barrier, staged column-major epilogue. Uses only:
+ * barrier, direct column-major epilogue. Uses only:
  *   - `kittens::load_async`       : cooperative `global_load_async_to_lds_b128` fill.
  *   - `kittens::sync::wait_async` : drain the async fill.
  *   - `kittens::sync::arrive/wait`: split workgroup barrier (-1).
@@ -16,7 +25,7 @@
  *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
  *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
  *   - `kittens::sched::compiler_fence` : keep the post-wait loads below the barrier.
- *   - `kittens::store(gl,rt,st,...)`   : staged column-major epilogue.
+ *   - `kittens::store(gl,rt,idx)` : direct column-major epilogue.
  */
 
 #ifndef GFX1250_BLOCK_M
@@ -116,25 +125,24 @@ void gemm_async_kernel(const gemm_globals g, int M, int N, int K)
         kittens::sched::compiler_fence();
     }
 
-    // The epilogue reuses the ring, so drain both counters first.
+    // Nothing reuses the ring now, but a workgroup must not exit with a fill still writing its LDS.
     kittens::sync::wait_async<0>();
     kittens::sync::wait_ds<0>();
 
-    // Epilogue: stage C through LDS so the global store coalesces.
-    kittens::store<NUM_THREADS>(
-        g.c, C_acc, *reinterpret_cast<C_tile*>(&__shm[0]),
-        tile_m * BLOCK_M, tile_n * BLOCK_N, warp_r * WARP_M, warp_c * WARP_N);
+    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
 void dispatch(gemm_globals g)
 {
     // The C staging tile reuses the ring, so the request is the larger of the two, not the sum.
     const size_t load_lds  = S * sizeof(ab_pair);
-    const size_t store_lds = sizeof(C_tile);
-    const size_t mem_size  = (load_lds > store_lds ? load_lds : store_lds);
+    const size_t mem_size  = load_lds;   // no C staging tile to make room for
 
-    /* The column-major stream writes 8-element chunks down a column, so it is aligned only if
-     * the leading dimension is a multiple of 8. */
+    /* The direct store writes a lane's run of consecutive rows as one sized buffer store, so the
+     * run has to be aligned, which needs the leading dimension to divide it. Kept at 8 rather than
+     * loosened to the run length: every tested shape satisfies it and it stays sufficient if a
+     * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
             "gemm_async: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());

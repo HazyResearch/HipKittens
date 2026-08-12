@@ -2,6 +2,15 @@
  * @file gemm_double_buf.cpp
  * @brief Rung 2 -- gemm_naive plus a second LDS stage.
  *
+ * Kernel Specification
+ *   tile        64x64 macro, 32x32 per warp, 2x2 warps; BLOCK_K 32 = 1 x K_STEP 32
+ *   occupancy   4 warps / 128 threads / 1 wave per SIMD; 12 workgroups per CU, register-bound
+ *   registers   67 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 29 SGPR
+ *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
+ *   LDS         2 stages x 8.5 KB = 17 KB of 320 KB (5.3%)
+ *   sync        per K-block: 1 barrier (full), 1 LDS drain, 1 global-load drain
+ *   intensity   32 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
+ *
  * Two interleaved stages in one segment rather than a single slab, so a K-block's fill runs
  * under the previous block's compute and the publish-then-drain barrier pair collapses to one
  * rendezvous. Same 64x64 tile and the same register-mediated `global_load` -> VGPR -> `ds_store`
@@ -11,11 +20,12 @@
  * The fill has to lead the operand reads here. Nothing else covers its global latency, so it
  * must be in flight across the reads and the matrix op below. Uses only:
  *   - `kittens::load(st,gl,idx)`  : register-mediated global -> LDS copy.
- *   - `kittens::sync::fence`      : drain LDS traffic before the barrier.
+ *   - `kittens::sync::fence`      : drain global-load and LDS traffic before the barrier.
  *   - `kittens::sync::sync`       : block-wide barrier (-1).
+ *   - `kittens::sync::wait_ds`    : drain the wave's LDS reads before exit.
  *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
  *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
- *   - `kittens::store(gl,rt,st,...)`   : staged column-major epilogue.
+ *   - `kittens::store(gl,rt,idx)` : direct column-major epilogue.
  */
 
 #ifndef GFX1250_BLOCK_M
@@ -104,21 +114,21 @@ void gemm_double_buf_kernel(const gemm_globals g, int M, int N, int K)
         kittens::sync::sync();
     }
 
-    // The epilogue reuses the ring, so drain this wave's LDS traffic first.
+    // Nothing reuses the ring now; this drains the wave's outstanding LDS traffic before exit.
     kittens::sync::wait_ds<0>();
 
-    // Epilogue: stage C through LDS so the global store coalesces.
-    kittens::store<NUM_THREADS>(
-        g.c, C_acc, *reinterpret_cast<C_tile*>(&__shm[0]),
-        tile_m * BLOCK_M, tile_n * BLOCK_N, warp_r * WARP_M, warp_c * WARP_N);
+    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
 void dispatch(gemm_globals g)
 {
     const size_t mem_size = g.dynamic_shared_memory<S>();
 
-    /* The column-major stream writes 8-element chunks down a column, so it is aligned only if
-     * the leading dimension is a multiple of 8. */
+    /* The direct store writes a lane's run of consecutive rows as one sized buffer store, so the
+     * run has to be aligned, which needs the leading dimension to divide it. Kept at 8 rather than
+     * loosened to the run length: every tested shape satisfies it and it stays sufficient if a
+     * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
             "gemm_double_buf: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());

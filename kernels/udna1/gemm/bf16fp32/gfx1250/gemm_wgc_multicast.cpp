@@ -2,27 +2,40 @@
  * @file gemm_wgc_multicast.cpp
  * @brief Rung 10 -- gemm_split_bar plus a workgroup cluster multicasting both operands.
  *
+ * Kernel Specification
+ *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
+ *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
+ *   cluster     4x4 workgroup cluster (CLUSTER_DIM 4); grid.x and grid.y must both be divisible by 4
+ *   registers   220 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator
+ *               (WARP_M*WARP_N/32), 50 SGPR
+ *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
+ *   LDS         2 stages x 136 KB = 272 KB of 320 KB (85%)
+ *   sync        per K-block: 2 barriers (workgroup + cluster, split), 4 LDS waits
+ *               (3 partial, 1 full), 1 TDM drain
+ *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
+ *
  * Sixteen workgroups form a 4x4 cluster and share each fetched panel four ways, which removes
  * 75% of the fill transactions and is worth about 5%. What it costs is a second rendezvous: the
  * barrier grows a cluster half alongside the workgroup one, and the launch now has a shape
  * requirement, since a cluster only forms if the grid divides by the cluster dimension.
  * Everything else is `gemm_split_bar`: 256x256 macro tile, BLOCK_K=128 walked in four K_STEP=32
  * sub-steps, 4x4 warps, a two-stage TDM-filled LDS ring, the barrier in its split form, and a
- * staged column-major epilogue. Uses only:
- *   - `kittens::load_tdm`         : descriptor-driven global -> LDS tile DMA, with multicast.
+ * direct column-major epilogue. Uses only:
+ *   - `kittens::tdm::load_async`         : descriptor-driven global -> LDS tile DMA, with multicast.
  *   - `kittens::sync::wait_tdm`   : drain the tile DMA.
  *   - `kittens::sync::arrive/wait`: workgroup barrier (-1), in the split form.
  *   - `kittens::cluster::arrive/wait` : cluster barrier (-3), likewise split.
+ *   - `kittens::cluster::sync`    : fused cluster barrier (-3) in the prologue.
  *   - `kittens::sync::wait_ds`    : partial and full LDS-read drains.
  *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
  *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
  *   - `kittens::sched::compiler_fence` : hold the matrix op inside the signal-to-wait window.
- *   - `kittens::store(gl,rt,st,...)`   : staged column-major epilogue.
+ *   - `kittens::store(gl,rt,idx)` : direct column-major epilogue.
  */
 
 /* Geometry, overridable from the command line. Three constraints bind it:
  *   - VGPRs: a warp tile of WARP_M*WARP_N floats over 32 lanes must leave room for operands.
- *     The 64x64 warp tile here sits at 244 of 256.
+ *     The 64x64 warp tile puts 128 floats per lane in the accumulator; the kernel totals 220 of 256.
  *   - LDS: S*(A_tile + B_tile) must fit in 327,680 B.
  *   - Tiling: BLOCK_M and BLOCK_N must divide the problem, so on power-of-two shapes they must
  *     be powers of two too, which rules out 320 and 384 whatever the registers allow. */
@@ -107,8 +120,8 @@ void gemm_wgc_multicast_kernel(const gemm_globals g, int M, int N, int K)
      * SIMDs pair as {0,2} and {1,3}, each pair served by one engine. Warps 0 and 1 are on
      * different pairs; warps 0 and 2 would share one and serialize the two fills. */
     auto issue_fill = [&](int slot, int kblock, uint32_t count = 1) {
-        if (wid == 0) kittens::load_tdm(A_st[slot], g.a, {0, 0, tile_m, kblock}, M, K, K, a_mask, count);
-        if (wid == 1) kittens::load_tdm(B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, b_mask, count);
+        if (wid == 0) kittens::tdm::load_async(A_st[slot], g.a, {0, 0, tile_m, kblock}, M, K, K, a_mask, count);
+        if (wid == 1) kittens::tdm::load_async(B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, b_mask, count);
     };
 
     // Prologue: fill the ring ahead of the loop.
@@ -168,26 +181,25 @@ void gemm_wgc_multicast_kernel(const gemm_globals g, int M, int N, int K)
         kittens::sched::compiler_fence();
     }
 
-    // The epilogue reuses the ring, so drain both counters first.
+    // Nothing reuses the ring, but a workgroup must not exit with a fill still writing its LDS.
     kittens::sync::wait_tdm<0>();
     kittens::sync::wait_ds<0>();
 
-    // Epilogue: stage C through LDS so the global store coalesces.
-    kittens::store<NUM_THREADS>(
-        g.c, C_acc, *reinterpret_cast<C_tile*>(&__shm[0]),
-        tile_m * BLOCK_M, tile_n * BLOCK_N, warp_r * WARP_M, warp_c * WARP_N);
+    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
 void dispatch(gemm_globals g)
 {
-    /* The C staging tile reuses the operand rings, so the request is the larger of the two, not
-     * the sum. At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
+    /* C is stored straight out of registers, so the LDS request is the operand ring alone.
+     * At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
     const size_t load_lds  = S * (sizeof(A_deep) + sizeof(B_deep));
-    const size_t store_lds = sizeof(C_tile);
-    const size_t mem_size  = (load_lds > store_lds ? load_lds : store_lds);
+    const size_t mem_size  = load_lds;   // no C staging tile to make room for
 
-    /* The column-major stream writes 8-element chunks down a column, so it is aligned only if
-     * the leading dimension is a multiple of 8. */
+    /* The direct store writes a lane's run of consecutive rows as one sized buffer store, so the
+     * run has to be aligned, which needs the leading dimension to divide it. Kept at 8 rather than
+     * loosened to the run length: every tested shape satisfies it and it stays sufficient if a
+     * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
             "gemm_wgc_multicast: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());

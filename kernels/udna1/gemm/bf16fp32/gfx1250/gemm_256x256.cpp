@@ -2,11 +2,23 @@
  * @file gemm_256x256.cpp
  * @brief Rung 5 -- gemm_128x128 with the macro tile doubled again, to 256x256.
  *
+ * Kernel Specification
+ *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 32 = 1 x K_STEP 32
+ *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
+ *   registers   220 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator
+ *               (WARP_M*WARP_N/32), 26 SGPR
+ *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
+ *   LDS         2 stages x 34 KB = 68 KB of 320 KB (21.3%)
+ *   sync        per K-block: 1 barrier (split), 1 LDS drain, 1 async drain
+ *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
+ *
  * Arithmetic intensity rises from 64 to 128 FLOP per byte, and each warp's output tile goes from
- * 32x32 to 64x64, worth about 1.25x. This is the largest tile the register file allows: the
- * accumulator alone sits at 244 VGPRs of 256 at four waves per SIMD, so the ladder stops growing
- * the tile here and starts deepening it instead. Same BLOCK_K=32, 4x4 warps, two async-filled
- * stages in one LDS segment, plain split barrier, staged column-major epilogue. A stage still
+ * 32x32 to 64x64, worth about 1.25x. This is the largest tile the register file allows at four
+ * waves per SIMD: the accumulator alone is 128 VGPRs of the 256 a lane gets there, and the kernel
+ * totals 220. Doubling the warp tile again needs 512 accumulator VGPRs, which fits only by dropping
+ * to one wave per SIMD for a 1024-VGPR budget. So the ladder stops growing the tile here and starts
+ * deepening it instead. Same BLOCK_K=32, 4x4 warps, two async-filled
+ * stages in one LDS segment, plain split barrier, direct column-major epilogue. A stage still
  * covers exactly one matrix sub-step, so what overlaps here is the cross-K-block prefetch, one
  * stage ahead. Uses only:
  *   - `kittens::load_async`       : cooperative `global_load_async_to_lds_b128` fill.
@@ -16,7 +28,7 @@
  *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
  *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
  *   - `kittens::sched::compiler_fence` : keep the post-wait loads below the barrier.
- *   - `kittens::store(gl,rt,st,...)`   : staged column-major epilogue.
+ *   - `kittens::store(gl,rt,idx)` : direct column-major epilogue.
  */
 
 #ifndef GFX1250_BLOCK_M
@@ -114,25 +126,24 @@ void gemm_256x256_kernel(const gemm_globals g, int M, int N, int K)
         kittens::sched::compiler_fence();
     }
 
-    // The epilogue reuses the ring, so drain both counters first.
+    // Nothing reuses the ring now, but a workgroup must not exit with a fill still writing its LDS.
     kittens::sync::wait_async<0>();
     kittens::sync::wait_ds<0>();
 
-    // Epilogue: stage C through LDS so the global store coalesces.
-    kittens::store<NUM_THREADS>(
-        g.c, C_acc, *reinterpret_cast<C_tile*>(&__shm[0]),
-        tile_m * BLOCK_M, tile_n * BLOCK_N, warp_r * WARP_M, warp_c * WARP_N);
+    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
 void dispatch(gemm_globals g)
 {
     // The C staging tile reuses the ring, so the request is the larger of the two, not the sum.
     const size_t load_lds  = S * sizeof(ab_pair);
-    const size_t store_lds = sizeof(C_tile);
-    const size_t mem_size  = (load_lds > store_lds ? load_lds : store_lds);
+    const size_t mem_size  = load_lds;   // no C staging tile to make room for
 
-    /* The column-major stream writes 8-element chunks down a column, so it is aligned only if
-     * the leading dimension is a multiple of 8. */
+    /* The direct store writes a lane's run of consecutive rows as one sized buffer store, so the
+     * run has to be aligned, which needs the leading dimension to divide it. Kept at 8 rather than
+     * loosened to the run length: every tested shape satisfies it and it stays sufficient if a
+     * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
             "gemm_256x256: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());

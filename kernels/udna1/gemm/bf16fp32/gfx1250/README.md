@@ -1,39 +1,46 @@
 # gfx1250 GEMM optimization ladder
 
-Ten bf16 -> fp32 GEMM rungs, ordered upward from a naive kernel to the fastest. Each rung adds one
+`bf16` -> `fp32` GEMM rungs, ordered upward from a naive kernel to the fastest. Each rung adds one
 hardware or algorithmic feature -- plus whatever that feature's API or latency structure forces
 along with it -- and changes nothing else. Accumulation is fp32 throughout, and each rung is named
 for the feature it adds.
 
 Every rung shares `common.h`, `harness.h`, the TN operand contract (`a` is `[M, K]`, `b` is
-`[N, K]`, both K-contiguous, so the kernel computes `C = A . B^T` via `mma_ABt`) and a column-major
-`c`. They are written against `include/udna1/ops/warp/{sync,sched,cluster}/` and the gfx1250-only
-extensions to `memory/tile/global_to_shared.cuh`, `memory/tile/shared_to_register.cuh` and
-`register/tile/mma.cuh`.
+`[N, K]`, both K-contiguous, so the kernel computes `C = A . B^T` via `mma_ABt`) and a **column-major
+`c`** -- allocate it as `torch.empty_strided((M, N), (1, M))`, since a row-major `c` is refused
+rather than silently transposed. They are written against
+`include/udna1/ops/warp/{sync,sched,cluster}/` and the gfx1250-only extensions to
+`memory/tile/global_to_shared.cuh`, `memory/tile/shared_to_register.cuh` and `register/tile/mma.cuh`.
+
+Every kernel file opens with a `Kernel Specification` block -- tile geometry, occupancy in waves per
+SIMD, register and spill counts, LDS footprint, the per-K-block sync inventory and arithmetic
+intensity -- so the per-kernel facts sit next to the code rather than here.
 
 ## Benchmark
 
-`gemm_ladder.py` syncs the tree, builds every rung on the box, runs the rotated paired campaign and
-prints the table. Rungs are positional and default to the ladder in order.
+`test.py` is the correctness gate and `gemm_ladder.py` is the measurement campaign; a rung number for publication comes from the latter.
 
 ```
-./gemm_ladder.py --host <hostname> -r 10 -i 10
-./gemm_ladder.py --host <hostname> -r 20 --no-null gemm_deepk gemm_segment
+make all-kernels                                    # 12 pybind11 modules, no executables
+python3 test.py                                     # every rung, four shapes, against torch.matmul
+./gemm_ladder.py -r 25 -i 100                       # the table above
+./gemm_ladder.py -r 25 -i 100 --torch gemm_tdm gemm_one_wave
 ```
 
-The second form is how a single close step gets extra rounds. `--no-null` skips the null control,
-so that run has no resolution of its own.
+Rungs are positional and default to the whole ladder. Each cell is 500 warmup iterations then 100
+measured, each measured iteration timed by its own event pair with a 512 MB cache flush enqueued
+before it, so no iteration reads what the one before it left resident. `--torch` adds `torch.matmul`
+as a baseline arm, rotated and timed like a rung but reported below the table since it is not on the
+ladder. Set `HIP_VISIBLE_DEVICES` to pick a card.
 
 ## Build
 
-The kernels target `gfx1250` and need clang 22+ (ROCm 7.2 hipcc). Without that toolchain, run make
-inside the `rocm/dev-ubuntu-24.04:7.2` image.
+The kernels target `gfx1250`. `gemm_wgc_multicast`, `gemm_epilogue` and `gemm_one_wave` use `__cluster_dims__` and the `hipLaunchAttributeClusterDimension` launch
+attribute; ROCm 7.2.4 and earlier have neither and fail those three with a cascade of errors that
+read as `shared_allocator` problems. Those three need **ROCm 7.15 (clang 23)**; the other nine build
+on ROCm 7.2+. Correctness needs PyTorch with gfx1250 support, which is **torch 2.11.0+rocm7.14.0**.
 
 ```
-make KERNEL=gemm_naive               # build one rung
-make ladder                          # build every rung
+pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ \
+    --extra-index-url https://pypi.org/simple "torch[device-gfx1250]==2.11.0+rocm7.14.0" pybind11
 ```
-
-Each rung is a standalone executable taking `M N K iters verify`. At `verify=1` the harness checks
-against an OpenMP CPU reference in the same invocation that timed it, which is why `make` always
-passes `-fopenmp`.

@@ -2,13 +2,24 @@
  * @file gemm_deepk.cpp
  * @brief Rung 6 -- gemm_256x256 with the LDS stage deepened, BLOCK_K 32 -> 128.
  *
+ * Kernel Specification
+ *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
+ *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
+ *   registers   226 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator
+ *               (WARP_M*WARP_N/32), 26 SGPR
+ *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
+ *   LDS         2 stages x 4 sub-blocks x 34 KB = 272 KB of 320 KB (85%); a third stage would
+ *               need 408 KB, which is what pins the ring at two from here up
+ *   sync        per K-block: 1 barrier (split), 4 LDS waits (3 partial, 1 full), 1 async drain
+ *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
+ *
  * A stage now holds four matrix sub-steps instead of one, so the per-K-block rendezvous count
  * drops four-fold and a register double-buffer inside the K-block has something to overlap.
  * Deepening the stage also puts the LDS row at 256 B for a 2-byte element, which is eight lanes
  * per cache line and half the fill requests. Together that is worth about 1.17x. What it costs
  * is LDS: a stage is four times the bytes, and that is what fixes the ring at two stages from
  * here up. Same 256x256 tile, 4x4 warps, two async-filled stages interleaved in one segment,
- * plain split barrier, staged column-major epilogue. Uses only:
+ * plain split barrier, direct column-major epilogue. Uses only:
  *   - `kittens::load_async`       : cooperative `global_load_async_to_lds_b128` fill.
  *   - `kittens::sync::wait_async` : drain the async fill.
  *   - `kittens::sync::arrive/wait`: split workgroup barrier (-1).
@@ -16,7 +27,7 @@
  *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
  *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
  *   - `kittens::sched::compiler_fence` : keep the post-wait loads below the barrier.
- *   - `kittens::store(gl,rt,st,...)`   : staged column-major epilogue.
+ *   - `kittens::store(gl,rt,idx)` : direct column-major epilogue.
  */
 
 #ifndef GFX1250_BLOCK_M
@@ -139,14 +150,12 @@ void gemm_deepk_kernel(const gemm_globals g, int M, int N, int K)
         kittens::sched::compiler_fence();
     }
 
-    // The epilogue reuses the ring, so drain both counters first.
+    // Nothing reuses the ring now, but a workgroup must not exit with a fill still writing its LDS.
     kittens::sync::wait_async<0>();
     kittens::sync::wait_ds<0>();
 
-    // Epilogue: stage C through LDS so the global store coalesces.
-    kittens::store<NUM_THREADS>(
-        g.c, C_acc, *reinterpret_cast<C_tile*>(&__shm[0]),
-        tile_m * BLOCK_M, tile_n * BLOCK_N, warp_r * WARP_M, warp_c * WARP_N);
+    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
 void dispatch(gemm_globals g)
@@ -154,11 +163,12 @@ void dispatch(gemm_globals g)
     /* The C staging tile reuses the ring, so the request is the larger of the two, not the sum.
      * At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
     const size_t load_lds  = S * K_SUBBLOCKS * sizeof(ab_pair);
-    const size_t store_lds = sizeof(C_tile);
-    const size_t mem_size  = (load_lds > store_lds ? load_lds : store_lds);
+    const size_t mem_size  = load_lds;   // no C staging tile to make room for
 
-    /* The column-major stream writes 8-element chunks down a column, so it is aligned only if
-     * the leading dimension is a multiple of 8. */
+    /* The direct store writes a lane's run of consecutive rows as one sized buffer store, so the
+     * run has to be aligned, which needs the leading dimension to divide it. Kept at 8 rather than
+     * loosened to the run length: every tested shape satisfies it and it stays sufficient if a
+     * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
             "gemm_deepk: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());

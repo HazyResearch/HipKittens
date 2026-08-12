@@ -22,7 +22,8 @@ namespace gfx1250_gemm {
  * warps. Bigger tiles do more math per byte of operand fetched -- arithmetic intensity for a
  * square tile is M*N/(M+N) FLOP per byte -- which is why the ladder climbs through 64x64,
  * 128x128 and 256x256. 256x256 is the largest the register file allows: at four waves per
- * SIMD the accumulator alone sits at 244 VGPRs of 256.
+ * SIMD a warp's 64x64 accumulator takes 128 VGPRs of the 256 a lane gets, and doubling the
+ * tile again would need 512.
  *
  * K_STEP is the matrix instruction's K depth, fixed at 32. BLOCK_K is how much K one LDS
  * stage holds, so BLOCK_K / K_STEP sub-steps run per fill. Deepening it amortises the

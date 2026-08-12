@@ -2,16 +2,25 @@
  * @file gemm_naive.cpp
  * @brief Rung 1 -- the naive baseline the rest of the ladder is built on.
  *
+ * Kernel Specification
+ *   tile        64x64 macro, 32x32 per warp, 2x2 warps; BLOCK_K 32 = 1 x K_STEP 32
+ *   occupancy   4 warps / 128 threads / 1 wave per SIMD; 12 workgroups per CU, register-bound
+ *   registers   68 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 32 SGPR
+ *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
+ *   LDS         1 stage x 8.5 KB = 8.5 KB of 320 KB (2.7%)
+ *   sync        per K-block: 2 barriers (full), 2 LDS drains, 2 global-load drains
+ *   intensity   32 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
+ *
  * One LDS slab and nothing overlapped. A K-block's fill cannot run under the previous block's
  * compute, and every iteration needs two barriers: one to publish the slab, one to establish
  * that every warp has finished reading it before the next fill overwrites it. The correctness
  * baseline: the smallest kernel here that computes the right answer. Uses only:
  *   - `kittens::load(st,gl,idx)`  : register-mediated global -> LDS copy.
- *   - `kittens::sync::fence`      : drain LDS traffic before each barrier.
+ *   - `kittens::sync::fence`      : drain global-load and LDS traffic before each barrier.
  *   - `kittens::sync::sync`       : block-wide barrier (-1). Orders execution, not memory.
  *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
  *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
- *   - `kittens::store(gl,rt,st,...)`   : staged column-major epilogue.
+ *   - `kittens::store(gl,rt,idx)` : direct column-major epilogue.
  */
 
 #ifndef GFX1250_BLOCK_M
@@ -79,18 +88,21 @@ void gemm_naive_kernel(const gemm_globals g, int M, int N, int K)
         kittens::sync::sync();
     }
 
-    // Epilogue: stage C through LDS so the global store coalesces.
-    kittens::store<NUM_THREADS>(
-        g.c, C_acc, *reinterpret_cast<C_tile*>(&__shm[0]),
-        tile_m * BLOCK_M, tile_n * BLOCK_N, warp_r * WARP_M, warp_c * WARP_N);
+    /* Epilogue: each warp converts its accumulator to bf16 straight into global C. Column-major C
+     * makes a lane's run of consecutive rows unit-stride, so store WIDTH is fine; what the direct
+     * store gives up is transaction SIZE -- a warp's 32 lanes span 16 columns, so the writes
+     * scatter per column. Rung 11 stages through LDS so the block's rows leave as one stream. */
+    kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
 void dispatch(gemm_globals g)
 {
     const size_t mem_size = g.dynamic_shared_memory<1>();
 
-    /* The column-major stream writes 8-element chunks down a column, so it is aligned only if
-     * the leading dimension is a multiple of 8. */
+    /* The direct store writes a lane's run of consecutive rows as one sized buffer store, so the
+     * run has to be aligned, which needs the leading dimension to divide it. Kept at 8 rather than
+     * loosened to the run length: every tested shape satisfies it and it stays sufficient if a
+     * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
             "gemm_naive: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
