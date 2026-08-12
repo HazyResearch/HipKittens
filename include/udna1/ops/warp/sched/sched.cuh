@@ -61,17 +61,8 @@ constexpr int SCHED_MODE_CLAIM_SIMD_SIMM16 = 26 | (2 << 6) | (0 << 11);  // back
  * does both at the start and end of a scope.
  */
 __device__ __forceinline__ void set_expert(bool on) {
-#if defined(KITTENS_UDNA1_ENABLE_EXPERT_MODE)
-    // Value 2 selects the scheduling mode that lifts *only* the memory<->math
-    // overlap interlock these loops rely on, so a single `wait_alu()` at each
-    // genuine dependency is the complete fix. (The more aggressive value 1
-    // also lifts the scalar-side interlocks, which clang-generated scalar code
-    // in these kernels cannot safely take responsibility for.)
     __builtin_amdgcn_s_setreg(detail::SCHED_MODE_EXPERT_SIMM16,
                               on ? 2u : 0u);
-#else
-    (void)on;
-#endif
 }
 
 /**
