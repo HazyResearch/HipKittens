@@ -37,9 +37,6 @@ namespace detail {
 // Opaque, gfx1250-specific operands for the s_setreg instructions that
 // toggle this wave's expert-scheduling controls.
 constexpr int SCHED_MODE_EXPERT_SIMM16    = 26 | (0 << 6) | (1 << 11);  // expert mode on/off
-// Bit 2, per ISA sect.5.7.2.1: DISABLE_XDL_ARB_STALL, "allows a wave to declare that it wants
-// to be able to issue multiple WMMA ops back to back". Pointing this at bit 4 writes a bit that
-// is not the documented control, which is why `lock_simd` was once recorded as doing nothing.
 constexpr int SCHED_MODE_CLAIM_SIMD_SIMM16 = 26 | (2 << 6) | (0 << 11);  // back-to-back WMMAs
 } // namespace detail
 
@@ -121,8 +118,9 @@ struct expert_scope {
  * that pause for the issuing wave, letting it stream WMMAs one after another
  * with no forced break.
  *
- * **Use it** when a single wave owns the SIMD (one-wave-per-SIMD kernels):
- * there is no one else to hand the gap to, so the pause is pure overhead.
+ * **Use it** whem a wave wants to issue multiple WMMA instructions back-to-back 
+ * with no opportunity for other waves to issue v_alu or wmma (they share the 
+ * same pipe) instructions.
  *
  * **Avoid it** when two or more waves share a SIMD and you rely on them to
  * fill each other's gaps -- removing the pause starves the others.
