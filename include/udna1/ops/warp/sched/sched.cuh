@@ -86,12 +86,10 @@ __device__ __forceinline__ void set_expert(bool on) {
 struct expert_scope {
     __device__ __forceinline__ expert_scope()  { set_expert(true);  }
     __device__ __forceinline__ ~expert_scope() {
-#if defined(KITTENS_UDNA1_ENABLE_EXPERT_MODE)
         // Drain outstanding results and load/store source reads before leaving, so the following
         // non-expert code does not race work that is still in flight.
         asm volatile("s_wait_alu depctr_va_vdst(0)" ::: "memory");
         asm volatile("s_wait_alu depctr_vm_vsrc(0)" ::: "memory");
-#endif
         set_expert(false);
     }
 
