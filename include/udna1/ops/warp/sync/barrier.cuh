@@ -244,17 +244,6 @@ __device__ __forceinline__ void wait_async() {
  * Lowers to `s_wait_tensorcnt N`. Drains anything started by
  * `__builtin_amdgcn_tensor_load_to_lds` or `tensor_store_from_lds`.
  *
- * @code
- *   tdm::load_async(buf[0], ...);
- *   tdm::load_async(buf[1], ...);
- *   tdm::load_async(buf[2], ...);
- *   for (int k = 0; k + 3 < K; ++k) {
- *       tdm::wait<2>();              // drain one slot, two stay in flight
- *       consume(buf[k % 3]);
- *       tdm::load_async(buf[k % 3], ...);
- *   }
- *   tdm::wait<0>();                  // drain the tail
- * @endcode
  */
 template<int N = 0>
 __device__ __forceinline__ void wait_tdm() {
