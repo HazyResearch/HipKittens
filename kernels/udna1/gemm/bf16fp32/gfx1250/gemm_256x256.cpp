@@ -21,7 +21,7 @@
  * stages in one LDS segment, plain split barrier, direct column-major epilogue. A stage still
  * covers exactly one matrix sub-step, so what overlaps here is the cross-K-block prefetch, one
  * stage ahead. Uses only:
- *   - `kittens::load_async`       : cooperative `global_load_async_to_lds_b128` fill.
+ *   - `kittens::load`       : cooperative `global_load_async_to_lds_b128` fill.
  *   - `kittens::sync::wait_async` : drain the async fill.
  *   - `kittens::sync::arrive/wait`: split workgroup barrier (-1).
  *   - `kittens::sync::wait_ds`    : drain LDS reads before the matrix op and the handoff.
@@ -79,10 +79,10 @@ void gemm_256x256_kernel(const gemm_globals g, int M, int N, int K)
     const int warp_off_a = warp_r * WARP_M * K_STEP;
     const int warp_off_b = warp_c * WARP_N * K_STEP;
 
-    // Every thread participates: `load_async` spreads the tile across all NUM_THREADS lanes.
+    // Every thread participates: `load` spreads the tile across all NUM_THREADS lanes.
     auto issue_fill = [&](int slot, int kblock) {
-        kittens::load_async<NUM_THREADS>(ring[slot].a, g.a, {0, 0, tile_m, kblock}, K);
-        kittens::load_async<NUM_THREADS>(ring[slot].b, g.b, {0, 0, tile_n, kblock}, K);
+        kittens::load<NUM_THREADS>(ring[slot].a, g.a, {0, 0, tile_m, kblock}, K);
+        kittens::load<NUM_THREADS>(ring[slot].b, g.b, {0, 0, tile_n, kblock}, K);
     };
 
     // Prologue: fill the ring ahead of the loop.

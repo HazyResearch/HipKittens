@@ -20,7 +20,7 @@
  * is LDS: a stage is four times the bytes, and that is what fixes the ring at two stages from
  * here up. Same 256x256 tile, 4x4 warps, two async-filled stages interleaved in one segment,
  * plain split barrier, direct column-major epilogue. Uses only:
- *   - `kittens::load_async`       : cooperative `global_load_async_to_lds_b128` fill.
+ *   - `kittens::load`       : cooperative `global_load_async_to_lds_b128` fill.
  *   - `kittens::sync::wait_async` : drain the async fill.
  *   - `kittens::sync::arrive/wait`: split workgroup barrier (-1).
  *   - `kittens::sync::wait_ds`    : partial and full LDS-read drains.
@@ -87,12 +87,12 @@ void gemm_deepk_kernel(const gemm_globals g, int M, int N, int K)
     constexpr int DS_SUB = ds_loads_per_subblock<WARP_M>()
                          + ds_loads_per_subblock<WARP_N>();
 
-    // Every thread participates: `load_async` spreads the tile across all NUM_THREADS lanes.
+    // Every thread participates: `load` spreads the tile across all NUM_THREADS lanes.
     auto issue_fill = [&](int slot, int kblock) {
         #pragma unroll
         for (int j = 0; j < KS; ++j) {
-            kittens::load_async<NUM_THREADS>(ring[slot][j].a, g.a, {0, 0, tile_m, kblock * KS + j}, K);
-            kittens::load_async<NUM_THREADS>(ring[slot][j].b, g.b, {0, 0, tile_n, kblock * KS + j}, K);
+            kittens::load<NUM_THREADS>(ring[slot][j].a, g.a, {0, 0, tile_m, kblock * KS + j}, K);
+            kittens::load<NUM_THREADS>(ring[slot][j].b, g.b, {0, 0, tile_n, kblock * KS + j}, K);
         }
     };
 

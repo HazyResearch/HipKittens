@@ -23,11 +23,11 @@
  * fill slower, and it costs nothing.
  *
  * A K-block is held as K_SUBBLOCKS separate sub-tiles rather than one deep tile, because
- * `load_async` and the shared -> register `load` only agree on layout for a tile one subtile
+ * the global -> shared `load` and the shared -> register `load` only agree on layout for a tile one subtile
  * column wide. A deep tile filled this way reads back scrambled. Same 256x256 tile, BLOCK_K=128,
  * 4x4 warps, two async-filled stages, plain split barrier, direct column-major epilogue.
  * Uses only:
- *   - `kittens::load_async`       : cooperative `global_load_async_to_lds_b128` fill.
+ *   - `kittens::load`       : cooperative `global_load_async_to_lds_b128` fill.
  *   - `kittens::sync::wait_async` : drain the async fill.
  *   - `kittens::sync::arrive/wait`: split workgroup barrier (-1).
  *   - `kittens::sync::wait_ds`    : partial and full LDS-read drains.
@@ -91,12 +91,12 @@ void gemm_segment_kernel(const gemm_globals g, int M, int N, int K)
     constexpr int DS_SUB = ds_loads_per_subblock<WARP_M>()
                          + ds_loads_per_subblock<WARP_N>();
 
-    // Every thread participates: `load_async` spreads the tile across all NUM_THREADS lanes.
+    // Every thread participates: `load` spreads the tile across all NUM_THREADS lanes.
     auto issue_fill = [&](int slot, int kblock) {
         #pragma unroll
         for (int j = 0; j < KS; ++j) {
-            kittens::load_async<NUM_THREADS>(A_st[slot][j], g.a, {0, 0, tile_m, kblock * KS + j}, K);
-            kittens::load_async<NUM_THREADS>(B_st[slot][j], g.b, {0, 0, tile_n, kblock * KS + j}, K);
+            kittens::load<NUM_THREADS>(A_st[slot][j], g.a, {0, 0, tile_m, kblock * KS + j}, K);
+            kittens::load<NUM_THREADS>(B_st[slot][j], g.b, {0, 0, tile_n, kblock * KS + j}, K);
         }
     };
 

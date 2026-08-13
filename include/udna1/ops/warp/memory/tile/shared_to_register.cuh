@@ -820,8 +820,8 @@ __device__ inline static void store(ST &dst, const RT &src) {
 /* ========================================================================== *
  * gfx1250 shared -> register load  (row-major + padded LDS layout)
  *
- * A single `load(reg, st, warp_origin_flat)` overload reads a warp's
- * `WARP_M x WARP_K` slice out of a block-level `st` tile, issuing two wide
+ * A single `load(reg, st, warp_origin_flat)` overload reads a warp's slice --
+ * the destination tile's own dimensions -- out of a block-level `st` tile, issuing two wide
  * `ds_load_b128`s per 16x32 subtile into the WMMA bf16 operand layout. The
  * per-`pad_interval` padding carried by the tile shape keeps the wide LDS
  * access bank-conflict-free.
@@ -832,7 +832,7 @@ __device__ inline static void store(ST &dst, const RT &src) {
  * shape. That is what both the hardware TDM and `load_async` write, so both fills compose with
  * this one `load`.
  *
- * The destination is a `rt_bf<WARP_M, WARP_K, row_l, rt_16x32_s>` whose lane
+ * The destination is an `rt_bf<..., row_l, rt_16x32_s>` whose lane
  * storage is `bf16_2 data[8]` per subtile when `WARP_THREADS == 32`. This is
  * the operand layout consumed directly by `__builtin_amdgcn_wmma_f32_16x16x32_bf16`.
  * ========================================================================== */
@@ -845,7 +845,7 @@ inline constexpr int st_subtile_padded_stride =
 /**
  * @brief Shared -> register load of a warp's tile slice on gfx1250.
  *
- * Reads the warp's `WARP_M x WARP_K` region into the WMMA bf16 operand layout,
+ * Reads the region named by the destination tile into the WMMA bf16 operand layout,
  * row-major + padded (see the layout contract above). Each 16x32 subtile is
  * filled by two wide `ds_load_b128`s from `src.data + Shape::padded(grow*C+gcol)`.
  *
@@ -861,17 +861,21 @@ inline constexpr int st_subtile_padded_stride =
  * Both paths issue their `ds_load`s in the same order; only the address computation differs, so the
  * special case cannot perturb the load schedule.
  *
- * @tparam WARP_M, WARP_K   Per-warp tile dimensions (multiples of 16/32); deduced from `dst`.
- * @param dst              Destination register tile.
- * @param src              Source shared tile (`st`, row-major + padded layout).
+ * @tparam RT              Destination register tile; its dimensions are the warp's tile slice.
+ * @tparam ST              Source shared tile (row-major + padded layout).
  * @param warp_origin_flat Row-major element-flat index of the warp's tile origin
- *                         in `src` (i.e. `origin_row * C + origin_col`).
+ *                         in `src` (i.e. `origin_row * ST::cols + origin_col`).
  */
-template<int WARP_M, int WARP_K, typename E, typename T, int R, int C, ducks::st_shape::all Shape>
-__device__ inline void load(
-    rt<E, WARP_M, WARP_K, ducks::rt_layout::row, ducks::rt_shape::rt_16x32>& dst,
-    const st<T, R, C, Shape>& src, int warp_origin_flat)
+template<ducks::rt::row_layout RT, ducks::st::all ST>
+__device__ inline void load(RT& dst, const ST& src, int warp_origin_flat)
 {
+    using E     = typename RT::T;
+    using T     = typename ST::dtype;
+    using Shape = typename ST::shape;
+    constexpr int C = ST::cols;
+
+    static_assert(std::is_same_v<typename RT::shape, ducks::rt_shape::rt_16x32>,
+        "gfx1250 shared->register load fills the 16x32 WMMA operand layout");
     static_assert(Shape::pad_interval > 0,
         "gfx1250 shared->register load requires a padded tile (e.g. st_bf<R,C>)");
     static_assert(sizeof(E) == 2 && sizeof(T) == 2,
@@ -879,8 +883,8 @@ __device__ inline void load(
 
     constexpr int sub_rows  = Shape::rows;   // 16
     constexpr int sub_cols  = Shape::cols;   // 32
-    constexpr int height    = WARP_M / sub_rows;
-    constexpr int width     = WARP_K / sub_cols;
+    constexpr int height    = RT::rows / sub_rows;
+    constexpr int width     = RT::cols / sub_cols;
     constexpr int half_cols = sub_cols / 2;  // 16
 
     const int L    = kittens::laneid();

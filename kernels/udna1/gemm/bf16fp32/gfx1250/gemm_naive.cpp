@@ -8,15 +8,16 @@
  *   registers   68 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 32 SGPR
  *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
  *   LDS         1 stage x 8.5 KB = 8.5 KB of 320 KB (2.7%)
- *   sync        per K-block: 2 barriers (full), 2 LDS drains, 2 global-load drains
+ *   sync        per K-block: 2 barriers (full), 1 LDS drain, 1 async drain
  *   intensity   32 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
  * One LDS slab and nothing overlapped. A K-block's fill cannot run under the previous block's
  * compute, and every iteration needs two barriers: one to publish the slab, one to establish
  * that every warp has finished reading it before the next fill overwrites it. The correctness
  * baseline: the smallest kernel here that computes the right answer. Uses only:
- *   - `kittens::load(st,gl,idx)`  : register-mediated global -> LDS copy.
- *   - `kittens::sync::fence`      : drain global-load and LDS traffic before each barrier.
+ *   - `kittens::load(st,gl,idx)`  : cooperative global -> LDS fill.
+ *   - `kittens::sync::wait_async` : drain the fill before publishing the slab.
+ *   - `kittens::sync::wait_ds`    : drain this warp's reads before the slab is refilled.
  *   - `kittens::sync::sync`       : block-wide barrier (-1). Orders execution, not memory.
  *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
  *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
@@ -74,14 +75,14 @@ void gemm_naive_kernel(const gemm_globals g, int M, int N, int K)
         kittens::load<NUM_THREADS>(A_st, g.a, {0, 0, tile_m, kb}, K);
         kittens::load<NUM_THREADS>(B_st, g.b, {0, 0, tile_n, kb}, K);
 
-        kittens::sync::fence();                   // wait for data (global + LDS): the slab has landed
+        kittens::sync::wait_async<0>();           // wait for data (async copy): the slab has landed
         kittens::sync::sync();                    // wait for everyone (workgroup): the slab is readable
 
         kittens::load(A_reg, A_st, warp_off_a);
         kittens::load(B_reg, B_st, warp_off_b);
         mma_ABt(C_acc, A_reg, B_reg, C_acc);
 
-        kittens::sync::fence();                   // wait for data (LDS): our reads of the slab are done
+        kittens::sync::wait_ds<0>();              // wait for data (LDS): our reads of the slab are done
         kittens::sync::sync();                    // wait for everyone (workgroup): safe to refill it
     }
 

@@ -8,21 +8,19 @@
  *   registers   67 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 29 SGPR
  *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
  *   LDS         2 stages x 8.5 KB = 17 KB of 320 KB (5.3%)
- *   sync        per K-block: 1 barrier (full), 1 LDS drain, 1 global-load drain
+ *   sync        per K-block: 1 barrier (full), 1 LDS drain, 1 async drain
  *   intensity   32 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
  * Two interleaved stages in one segment rather than a single slab, so a K-block's fill runs
  * under the previous block's compute and the publish-then-drain barrier pair collapses to one
- * rendezvous. Same 64x64 tile and the same register-mediated `global_load` -> VGPR -> `ds_store`
- * fill, which needs no counter drained by hand because the barrier's own release fence already
- * covers a `ds_store`.
+ * rendezvous. Same 64x64 tile and the same fill.
  *
- * The fill has to lead the operand reads here. Nothing else covers its global latency, so it
+ * The fill still leads the operand reads here. Nothing else covers its global latency, so it
  * must be in flight across the reads and the matrix op below. Uses only:
- *   - `kittens::load(st,gl,idx)`  : register-mediated global -> LDS copy.
- *   - `kittens::sync::fence`      : drain global-load and LDS traffic before the barrier.
+ *   - `kittens::load(st,gl,idx)`  : cooperative global -> LDS fill.
+ *   - `kittens::sync::wait_async` : drain the fill before the rendezvous.
  *   - `kittens::sync::sync`       : block-wide barrier (-1).
- *   - `kittens::sync::wait_ds`    : drain the wave's LDS reads before exit.
+ *   - `kittens::sync::wait_ds`    : drain the wave's LDS reads before the handoff and before exit.
  *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
  *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
  *   - `kittens::store(gl,rt,idx)` : direct column-major epilogue.
@@ -87,7 +85,7 @@ void gemm_double_buf_kernel(const gemm_globals g, int M, int N, int K)
     for (int s = 0; s < S - 1; ++s)
         if (s < k_blocks) issue_fill(s, s);
 
-    kittens::sync::fence();                           // wait for data (global + LDS): stage 0 landed
+    kittens::sync::wait_async<0>();                   // wait for data (async copy): stage 0 landed
     kittens::sync::sync();                            // wait for everyone (workgroup): stage 0 readable
 
     rt_e<WARP_M, K_STEP> A_reg;
@@ -106,8 +104,9 @@ void gemm_double_buf_kernel(const gemm_globals g, int M, int N, int K)
         kittens::load(B_reg, ring[cur].b, warp_off_b);
         mma_ABt(C_acc, A_reg, B_reg, C_acc);
 
-        kittens::sync::fence();      // wait for data (global + LDS): the fill landed, our reads are done
-        kittens::sync::sync();       // wait for everyone (workgroup): publish the fill, free the stage
+        kittens::sync::wait_ds<0>();    // wait for data (LDS): our reads of this stage are done
+        kittens::sync::wait_async<0>(); // wait for data (async copy): the next stage's fill landed
+        kittens::sync::sync();          // wait for everyone (workgroup): publish the fill, free the stage
     }
 
     // Nothing reuses the ring now; this drains the wave's outstanding LDS traffic before exit.

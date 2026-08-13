@@ -300,58 +300,7 @@ __device__ static inline void store(const GL &dst, const ST &src, const COORD &i
  *
  */
 
-/// Refused: two independent row-major assumptions, a base composed as
-/// `((b*depth + d)*rows + gr)*cols + gc` rather than through `gl::idx()`, and a
-/// `row*row_stride + col` walk. Both invert under col_major, and `row_stride` cannot rescue
-/// either -- the base offset is wrong whatever is passed.
-template<int N_THREADS = WARP_THREADS, typename T, int ROWS, int COLS,
-         ducks::st_shape::all Shape, ducks::gl::col_layout GL, ducks::coord::tile COORD = coord<>>
-__device__ inline void load(st<T, ROWS, COLS, Shape>& dst, const GL& src,
-                            const COORD& idx, int row_stride)
-{
-    static_assert(ducks::gl_layout::unhandled<typename GL::layout>,
-        "load(shared_tile, src, coord, row_stride) is implemented for ducks::gl_layout::row_major "
-        "only: it composes its base address row-major and then indexes row*row_stride + col, "
-        "giving the column axis an implicit unit stride. A column-major source needs the walk "
-        "transposed as well as the base recomputed -- implement that path rather than passing "
-        "this descriptor.");
-}
-
-/**
- * @brief Cooperative register-mediated global -> LDS tile copy (gfx1250 baseline).
- *
- * Plain `global_load` -> VGPR -> `ds_store` path. Use this when no async
- * intrinsic is available or for correctness baselines. The destination
- * `st` tile owns the subtile-major + padding LDS address map.
- *
- * The LDS write is a plain subscript of the tile's own storage. It lowers to `ds_store` because
- * `shared_allocator` advances its cursor by pointer arithmetic, which keeps the allocation's
- * provenance traceable to the `addrspace(3)` cast on `&__shm[0]`.
- */
-template<int N_THREADS = WARP_THREADS, typename T, int ROWS, int COLS,
-         ducks::st_shape::all Shape, ducks::gl::row_layout GL, ducks::coord::tile COORD = coord<>>
-__device__ inline void load(st<T, ROWS, COLS, Shape>& dst, const GL& src,
-                            const COORD& idx, int row_stride)
-{
-    constexpr int total_elems = ROWS * COLS;
-    const int tid = threadIdx.x;
-    // The COORD is interpreted as tile-index coordinates `{b, d, tile_row, tile_col}`
-    // -- convert to element coordinates by multiplying the trailing two by ROWS/COLS.
-    const int gr_base = idx.r * ROWS;
-    const int gc_base = idx.c * COLS;
-    const T* base = src.raw_ptr
-                  + (((int64_t(idx.b) * src.depth() + idx.d) * src.rows() + gr_base)
-                     * src.cols() + gc_base);
-
-    #pragma unroll
-    for (int i = tid; i < total_elems; i += N_THREADS) {
-        const int row = i / COLS;
-        const int col = i % COLS;
-        dst.data[dst.idx(row, col)] = base[row * row_stride + col];
-    }
-}
-
-/// Refused: the inverse of the load above, with the same two row-major assumptions, and it
+/// Refused: the inverse of the store below, with the same two row-major assumptions, and it
 /// inverts under col_major the same way.
 template<int N_THREADS = WARP_THREADS, typename T, int ROWS, int COLS,
          ducks::st_shape::all Shape, ducks::gl::col_layout GL, ducks::coord::tile COORD = coord<>>
@@ -367,13 +316,12 @@ __device__ inline void store(const GL& dst, const st<T, ROWS, COLS, Shape>& src,
 }
 
 /**
- * @brief Cooperative register-mediated LDS -> global tile copy (gfx1250).
+ * @brief Cooperative LDS -> global tile copy (gfx1250).
  *
- * Inverse of the register-mediated `load(st, gl, idx, row_stride)`: reads each element from its
- * slot via `ST::idx` and scatters it back to global memory. Pairs with `load` / `load_async` /
- * `tdm::load_async`, which all land data in the same LDS address map.
- *
- * The LDS read is a plain subscript, for the same reason the `load` above writes with one.
+ * Reads each element from its slot via `ST::idx` and scatters it back to global memory. Pairs
+ * with `load` and `tdm::load_async`, which land data in the same LDS address map. There is no
+ * direct LDS -> global engine outside `tdm::store_async`, so this one does stage through
+ * registers.
  */
 template<int N_THREADS = WARP_THREADS, typename T, int ROWS, int COLS,
          ducks::st_shape::all Shape, ducks::gl::row_layout GL, ducks::coord::tile COORD = coord<>>
@@ -412,11 +360,11 @@ __device__ inline void store(const GL& dst, const st<T, ROWS, COLS, Shape>& src,
 */
 template<int N_THREADS = WARP_THREADS, bool RATE_ONLY = false, typename T, int ROWS, int COLS,
          ducks::st_shape::all Shape, ducks::gl::col_layout GL, ducks::coord::tile COORD = coord<>>
-__device__ inline void load_async(st<T, ROWS, COLS, Shape>& dst, const GL& src,
+__device__ inline void load(st<T, ROWS, COLS, Shape>& dst, const GL& src,
                                   const COORD& idx, int row_stride, uint32_t cluster_mask = 0)
 {
     static_assert(ducks::gl_layout::unhandled<typename GL::layout>,
-        "load_async is implemented for ducks::gl_layout::row_major only. It composes its base "
+        "load is implemented for ducks::gl_layout::row_major only. It composes its base "
         "address row-major and indexes row*row_stride + col, and -- decisively -- each lane's "
         "single b128 assumes its run of columns is 16 contiguous bytes, which holds only when "
         "the column axis is unit-stride. A column-major source needs a different transfer "
@@ -447,12 +395,12 @@ __device__ inline void load_async(st<T, ROWS, COLS, Shape>& dst, const GL& src,
  */
 template<int N_THREADS = WARP_THREADS, bool RATE_ONLY = false, typename T, int ROWS, int COLS,
          ducks::st_shape::all Shape, ducks::gl::row_layout GL, ducks::coord::tile COORD = coord<>>
-__device__ inline void load_async(st<T, ROWS, COLS, Shape>& dst, const GL& src,
+__device__ inline void load(st<T, ROWS, COLS, Shape>& dst, const GL& src,
                                   const COORD& idx, int row_stride, uint32_t cluster_mask = 0)
 {
-    static_assert(sizeof(T) * 8 == 16, "load_async issues one b128 (16B) per lane");
+    static_assert(sizeof(T) * 8 == 16, "load issues one b128 (16B) per lane");
     static_assert(RATE_ONLY || COLS == Shape::cols,
-        "load_async is restricted to tiles one subtile column wide (cols == Shape::cols). "
+        "load is restricted to tiles one subtile column wide (cols == Shape::cols). "
         "Ignoring this corrupts roughly "
         "half the output, silently and deterministically, while looking correct at small "
         "sizes. Either keep the tile at cols == Shape::cols, or fill it with tdm::load_async, or -- "
