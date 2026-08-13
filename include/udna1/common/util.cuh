@@ -329,37 +329,52 @@ struct segment {
 };
 
 /**
- * @brief Checks whether two multi-buffered operand rings land in different 64 KB LDS segments
- *        at every ring slot. Compile-time, and independent of where the allocation starts.
+ * @brief Whether two byte ranges of `bytes` each touch a common 64 KB segment.
  *
- * Whether two tiles occupy different segments depends on the LDS base, which is not a property
- * of the rings. Requiring separation for every possible base reduces to a base-free condition:
- * corresponding slots must be at least one full segment apart, `|b_i - a_i| >= 64 KB`.
- *
- * @param a_base,a_stride  first ring's byte offset and per-slot stride
- * @param b_base,b_stride  second ring's byte offset and per-slot stride
- * @param stages           number of ring slots
+ * Offsets are from the start of the allocation, which `allocate_in<segment<I>>` has already
+ * aligned to a segment boundary, so a byte's segment is just its offset divided by the segment
+ * size. Distance is not the test: a tile bigger than a segment spans two of them, so two 68 KB
+ * tiles 68 KB apart still meet in the segment between them.
  */
-__device__ __host__ constexpr bool operand_rings_segment_separated(
-    int a_base, int a_stride, int b_base, int b_stride, int stages)
+__device__ __host__ constexpr bool on_disjoint_segments(int a_begin, int b_begin, int bytes)
 {
-    for (int i = 0; i < stages; ++i) {
-        const int d = (b_base + i * b_stride) - (a_base + i * a_stride);
-        if ((d < 0 ? -d : d) < MAX_SHARED_MEMORY_PER_SEGMENT) return false;
-    }
-    return true;
+    const int a_lo =  a_begin                  / MAX_SHARED_MEMORY_PER_SEGMENT;
+    const int a_hi = (a_begin + bytes - 1)     / MAX_SHARED_MEMORY_PER_SEGMENT;
+    const int b_lo =  b_begin                  / MAX_SHARED_MEMORY_PER_SEGMENT;
+    const int b_hi = (b_begin + bytes - 1)     / MAX_SHARED_MEMORY_PER_SEGMENT;
+    return a_hi < b_lo || b_hi < a_lo;
 }
 
 /**
- * @brief The same test for one bump allocation of `A[stages]` immediately followed by
- *        `B[stages]`, with equal tile sizes.
+ * @brief How a kernel's two operand rings are ordered in one LDS allocation.
  *
- * Corresponding slots are then a fixed `stages * tile_bytes` apart, so the condition reduces to
- * `stages * tile_bytes >= 64 KB`.
+ * `blocked` is `[A0][A1]..[B0][B1]..`, `interleaved` is `[A0][B0][A1][B1]..`.
  */
-__device__ __host__ constexpr bool blocked_rings_segment_separated(int tile_bytes, int stages)
+enum class ring_layout { blocked, interleaved };
+
+/**
+ * @brief Whether the A and B tiles a wave reads together land on different LDS segments, at
+ *        every slot of the ring.
+ *
+ * A GEMM overlaps the fill of the next K-block with the math on the current one, so each operand
+ * gets `stages` tiles in LDS that it cycles through -- a ring. A wave reads one A tile and one B
+ * tile together, and the two LDS ports co-issue only when they target different segments (see
+ * `segment` above), so a slot whose A and B share a segment reads at half bandwidth. With more
+ * than one slot that has to hold at every slot, not just the first, which is what this checks.
+ *
+ * @tparam L           ring order within the allocation
+ * @param tile_bytes   one tile's padded footprint; both operands are assumed the same size
+ * @param stages       number of ring slots
+ */
+template<ring_layout L>
+__device__ __host__ constexpr bool operands_on_different_segments(int tile_bytes, int stages)
 {
-    return operand_rings_segment_separated(0, tile_bytes, stages * tile_bytes, tile_bytes, stages);
+    for (int i = 0; i < stages; ++i) {
+        const int a = (L == ring_layout::blocked ? i              : 2 * i    ) * tile_bytes;
+        const int b = (L == ring_layout::blocked ? stages + i     : 2 * i + 1) * tile_bytes;
+        if (!on_disjoint_segments(a, b, tile_bytes)) return false;
+    }
+    return true;
 }
 
 namespace ducks {
