@@ -251,17 +251,6 @@ __device__ __forceinline__ void wait_tdm() {
     __builtin_amdgcn_s_wait_tensorcnt(N);
 }
 
-/**
- * @brief Memory fence covering both global loads and LDS ops.
- *
- * Convenience for the common "producer side" pattern: ensure all in-flight
- * loads have settled into LDS before signalling consumers.
- */
-__device__ __forceinline__ void fence() {
-    wait_load<0>();
-    wait_ds<0>();
-}
-
 /* ----------  LDS BARRIER CELLS (FOR TDM / ASYNC ARRIVE)  ---------- */
 //
 // 64-bit LDS-resident barrier cell, per SP3 section 9.8.13
