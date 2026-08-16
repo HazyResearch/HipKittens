@@ -515,6 +515,8 @@ __device__ static inline void mma_ABt(D &d,
     static_assert(
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, bf16> &&
             std::is_same_v<typename B::T, bf16> && std::is_same_v<typename C::T, float>) ||
+        (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, half> &&
+            std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, float>) ||
         (std::is_same_v<typename D::T, half> && std::is_same_v<typename A::T, half> &&
             std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, half>) ||
         (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, fp8e4m3> &&

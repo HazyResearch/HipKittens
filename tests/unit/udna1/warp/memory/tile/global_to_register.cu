@@ -50,7 +50,9 @@ template<typename test, typename RT_SHAPE, typename ST_SHAPE, int MAX_H=8, int M
 template<typename T>
 struct load_store {
     using dtype = T;
-    template<typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NW, kittens::ducks::rt_layout::all L> using valid = std::bool_constant<NW == 1 && W*H<=64>; // this is warp-level
+    template<typename RT_SHAPE, typename ST_SHAPE, int H, int W, int NW, kittens::ducks::rt_layout::all L> using valid = std::bool_constant<
+        NW == 1 && W*H<=64 // this is warp-level
+        && std::is_same_v<L, kittens::ducks::rt_layout::row>>;
     static inline const std::string test_identifier = std::is_same_v<T, kittens::bf16> ? "reg_loadstore_gmem=bf16" :
                                                       std::is_same_v<T, kittens::half> ? "reg_loadstore_gmem=half" :
                                                       std::is_same_v<T, kittens::fp8e4m3> ? "reg_loadstore_gmem=fp8e4m3" :

@@ -76,36 +76,39 @@ __host__ __device__ inline int ceil_div(int a, int b) {
   }
 
 /**
-   * @brief Transform a workgroup ID to a new workgroup ID based on the chunk size and number of XCDs.
+   * @brief Regroup workgroup IDs so that each NUMA domain receives a contiguous run of them.
+   *
+   * The dispatcher assigns consecutive workgroup IDs round-robin across NUMA domains, so
+   * domain `d` natively owns IDs `d, d+num_numa, d+2*num_numa, ...`. This maps that stride
+   * back to a contiguous chunk, giving domain `d` the IDs it would have owned had the
+   * dispatcher blocked instead of interleaved. Workgroups past the last whole
+   * `num_numa * chunk_size` block are left alone, since a partial block has no domain to
+   * balance against.
+   *
    * @param workgroup_id The original workgroup ID.
    * @param num_workgroups The total number of workgroups.
-   * @param num_xcds The number of XCDs.
-   * @param chunk_size The chunk size.
+   * @param num_numa The number of NUMA domains to spread across.
+   * @param chunk_size How many consecutive IDs each domain receives per block.
    * @return The new workgroup ID.
    */
-   __host__ __device__ inline int chiplet_transform_chunked(
+   __host__ __device__ inline int numa_transform_chunked(
     int workgroup_id, 
     int num_workgroups,
-    int num_xcds,
+    int num_numa,
     int chunk_size 
 ) {
-    // Current XCD
-    int xcd = workgroup_id % num_xcds;
+    int numa = workgroup_id % num_numa;
 
-    // Largest full (NUM_XCDS*CHUNK_SIZE)-aligned block
-    int block = num_xcds * chunk_size;
+    int block = num_numa * chunk_size;
     int limit = (num_workgroups / block) * block;
 
-    // If pid beyond the last full block, leave unchanged
-    if (workgroup_id > limit) return workgroup_id;
+    if (workgroup_id >= limit) return workgroup_id;
 
-    // Local PID (within round-robin assignment)
-    int local_pid    = workgroup_id / num_xcds;
+    int local_pid    = workgroup_id / num_numa;
     int chunk_idx    = local_pid / chunk_size;
     int pos_in_chunk = local_pid % chunk_size;
 
-    // New PID
-    return chunk_idx * block + xcd * chunk_size + pos_in_chunk;
+    return chunk_idx * block + numa * chunk_size + pos_in_chunk;
 }
 
 
@@ -128,6 +131,15 @@ constexpr int MAX_SHARED_MEMORY             = MAX_SHARED_MEMORY_PER_SEGMENT * SH
 constexpr int NUM_XCDS = 1;
 constexpr int CUS_PER_XCD = 64;
 constexpr int NUM_CUS = CUS_PER_XCD * NUM_XCDS;
+
+/**
+ * @brief Number of NUMA domains, meaning independent L2 slices, to spread workgroups over.
+ *
+ */
+#ifndef KITTENS_NUM_NUMA
+#define KITTENS_NUM_NUMA 2
+#endif
+constexpr int NUM_NUMA = KITTENS_NUM_NUMA;
 
 /* ----------  CUSTOM TYPES  ---------- */
 typedef uint32_t      uint2_t __attribute__((ext_vector_type(2)));
@@ -316,6 +328,55 @@ struct segment {
     static constexpr int byte_offset = IDX * MAX_SHARED_MEMORY_PER_SEGMENT;
 };
 
+/**
+ * @brief Whether two byte ranges of `bytes` each touch a common 64 KB segment.
+ *
+ * Offsets are from the start of the allocation, which `allocate_in<segment<I>>` has already
+ * aligned to a segment boundary, so a byte's segment is just its offset divided by the segment
+ * size. Distance is not the test: a tile bigger than a segment spans two of them, so two 68 KB
+ * tiles 68 KB apart still meet in the segment between them.
+ */
+__device__ __host__ constexpr bool on_disjoint_segments(int a_begin, int b_begin, int bytes)
+{
+    const int a_lo =  a_begin                  / MAX_SHARED_MEMORY_PER_SEGMENT;
+    const int a_hi = (a_begin + bytes - 1)     / MAX_SHARED_MEMORY_PER_SEGMENT;
+    const int b_lo =  b_begin                  / MAX_SHARED_MEMORY_PER_SEGMENT;
+    const int b_hi = (b_begin + bytes - 1)     / MAX_SHARED_MEMORY_PER_SEGMENT;
+    return a_hi < b_lo || b_hi < a_lo;
+}
+
+/**
+ * @brief How a kernel's two operand rings are ordered in one LDS allocation.
+ *
+ * `blocked` is `[A0][A1]..[B0][B1]..`, `interleaved` is `[A0][B0][A1][B1]..`.
+ */
+enum class ring_layout { blocked, interleaved };
+
+/**
+ * @brief Whether the A and B tiles a wave reads together land on different LDS segments, at
+ *        every slot of the ring.
+ *
+ * A GEMM overlaps the fill of the next K-block with the math on the current one, so each operand
+ * gets `stages` tiles in LDS that it cycles through -- a ring. A wave reads one A tile and one B
+ * tile together, and the two LDS ports co-issue only when they target different segments (see
+ * `segment` above), so a slot whose A and B share a segment reads at half bandwidth. With more
+ * than one slot that has to hold at every slot, not just the first, which is what this checks.
+ *
+ * @tparam L           ring order within the allocation
+ * @param tile_bytes   one tile's padded footprint; both operands are assumed the same size
+ * @param stages       number of ring slots
+ */
+template<ring_layout L>
+__device__ __host__ constexpr bool operands_on_different_segments(int tile_bytes, int stages)
+{
+    for (int i = 0; i < stages; ++i) {
+        const int a = (L == ring_layout::blocked ? i              : 2 * i    ) * tile_bytes;
+        const int b = (L == ring_layout::blocked ? stages + i     : 2 * i + 1) * tile_bytes;
+        if (!on_disjoint_segments(a, b, tile_bytes)) return false;
+    }
+    return true;
+}
+
 namespace ducks {
 namespace segment_tag {
 template<typename T> struct is_segment : std::false_type {};
@@ -355,13 +416,19 @@ struct shared_allocator {
         template<typename A, size_t... dims> 
         using variadic_array_t = typename variadic_array<A, dims...>::type;
 
+        /**
+         * @brief Advance the cursor to an `alignment` boundary by POINTER arithmetic.
+         * @tparam alignment The alignment to enforce.
+         */
         template<int alignment>
         __device__ inline void align_ptr() {
             if constexpr (alignment > 0) {
-                uint64_t p = reinterpret_cast<uint64_t>(ptr);
-                if(p % alignment != 0) {
-                    ptr = (int*)(p + (alignment-(p%alignment)));
-                }
+                static_assert(alignment % sizeof(int) == 0,
+                    "shared_allocator alignment must be a multiple of sizeof(int): the cursor is an "
+                    "int* and advances in whole ints, so a finer alignment is unreachable by pointer "
+                    "arithmetic and would need the provenance-destroying integer round trip back.");
+                const uint64_t misalign = reinterpret_cast<uint64_t>(ptr) % alignment;
+                if (misalign != 0) ptr += (alignment - misalign) / sizeof(int);
             }
         }
 

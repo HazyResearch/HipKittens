@@ -1,16 +1,42 @@
 /**
  * @file gemm_naive.cpp
- * @brief Rung 1 -- naive bf16 -> fp32 GEMM for gfx1250.
+ * @brief Rung 1 -- the naive baseline the rest of the ladder is built on.
  *
- * Correctness baseline. Single-buffered padded LDS, register-mediated
- * global -> LDS copy, wide `ds_load_b128` shared -> register, plain WMMA via
- * `mma_ABt`. Uses only:
- *   - `kittens::load(st,gl,idx)` : register-mediated global -> LDS copy.
- *   - `kittens::sync::sync`      : block-wide split barrier.
- *   - `kittens::sync::wait_ds`   : drain LDS reads before WMMA.
- *   - `kittens::load(rt,st,off)` : shared -> register load (wide `ds_load_b128`).
- *   - `kittens::mma_ABt`         : 16x16x32 WMMA via the bf16 builtin.
+ * Kernel Specification
+ *   tile        64x64 macro, 32x32 per warp, 2x2 warps; BLOCK_K 32 = 1 x K_STEP 32
+ *   occupancy   4 warps / 128 threads / 1 wave per SIMD; 12 workgroups per CU, register-bound
+ *   registers   68 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 32 SGPR
+ *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
+ *   LDS         1 stage x 8.5 KB = 8.5 KB of 320 KB (2.7%)
+ *   sync        per K-block: 2 barriers (full), 1 LDS drain, 1 async drain
+ *   intensity   32 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
+ *
+ * One LDS slab and nothing overlapped. A K-block's fill cannot run under the previous block's
+ * compute, and every iteration needs two barriers: one to publish the slab, one to establish
+ * that every warp has finished reading it before the next fill overwrites it. The correctness
+ * baseline: the smallest kernel here that computes the right answer. Uses only:
+ *   - `kittens::load(st,gl,idx)`  : cooperative global -> LDS fill.
+ *   - `kittens::sync::wait_async` : drain the fill before publishing the slab.
+ *   - `kittens::sync::wait_ds`    : drain this warp's reads before the slab is refilled.
+ *   - `kittens::sync::sync`       : block-wide barrier (-1). Orders execution, not memory.
+ *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
+ *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
+ *   - `kittens::store(gl,rt,idx)` : direct column-major epilogue.
  */
+
+#include "kittens.cuh"
+
+constexpr int BLOCK_M     = 64;
+constexpr int BLOCK_N     = 64;
+constexpr int BLOCK_K     = 32;
+constexpr int K_STEP      = 32;
+constexpr int WARPS_M     = 2;
+constexpr int WARPS_N     = 2;
+constexpr int WARP_M      = BLOCK_M / WARPS_M;
+constexpr int WARP_N      = BLOCK_N / WARPS_N;
+constexpr int NUM_WARPS   = WARPS_M * WARPS_N;
+constexpr int NUM_THREADS = NUM_WARPS * kittens::WARP_THREADS;
+constexpr int K_SUBBLOCKS = BLOCK_K / K_STEP;
 
 #include "common.h"
 
@@ -29,41 +55,60 @@ void gemm_naive_kernel(const gemm_globals g, int M, int N, int K)
     rt_fl<WARP_M, WARP_N, col_l, rt_16x16_s> C_acc;
     zero(C_acc);
 
-    const int tile_m  = blockIdx.x;
-    const int tile_n  = blockIdx.y;
-    const int wid     = warpid();
-    const int warp_r  = wid / WARPS_N;
-    const int warp_c  = wid % WARPS_N;
-    const int k_iters = K / K_STEP;
+    const int tile_m   = blockIdx.x;
+    const int tile_n   = blockIdx.y;
+    const int wid      = warpid();
+    const int warp_r   = wid / WARPS_N;
+    const int warp_c   = wid % WARPS_N;
+    const int k_blocks = K / BLOCK_K;
+    if (k_blocks <= 0) return;                    // K shorter than one block: nothing to compute
 
-    for (int k = 0; k < k_iters; ++k) {
-        kittens::load<NUM_THREADS>(A_st, g.a, {0, 0, tile_m, k}, K);
-        kittens::load<NUM_THREADS>(B_st, g.b, {0, 0, tile_n, k}, K);
+    const int warp_off_a = warp_r * WARP_M * K_STEP;
+    const int warp_off_b = warp_c * WARP_N * K_STEP;
 
-        kittens::sync::sync();
+    rt_e<WARP_M, K_STEP> A_reg;
+    rt_e<WARP_N, K_STEP> B_reg;
 
-        rt_bf<WARP_M, K_STEP, row_l, rt_16x32_s> A_reg;
-        rt_bf<WARP_N, K_STEP, row_l, rt_16x32_s> B_reg;
-        kittens::load(A_reg, A_st, warp_r * WARP_M * K_STEP);
-        kittens::load(B_reg, B_st, warp_c * WARP_N * K_STEP);
+    // Main loop: one K-block per iteration.
+    for (int kb = 0; kb < k_blocks; ++kb) {
+        // Every thread participates: `load` spreads the tile across all NUM_THREADS lanes.
+        kittens::load<NUM_THREADS>(A_st, g.a, {0, 0, tile_m, kb}, K);
+        kittens::load<NUM_THREADS>(B_st, g.b, {0, 0, tile_n, kb}, K);
 
-        kittens::sync::wait_ds();
+        kittens::sync::wait_async<0>();           // wait for data (async copy): the slab has landed
+        kittens::sync::sync();                    // wait for everyone (workgroup): the slab is readable
+
+        kittens::load(A_reg, A_st, warp_off_a);
+        kittens::load(B_reg, B_st, warp_off_b);
         mma_ABt(C_acc, A_reg, B_reg, C_acc);
 
-        kittens::sync::sync();
+        kittens::sync::wait_ds<0>();              // wait for data (LDS): our reads of the slab are done
+        kittens::sync::sync();                    // wait for everyone (workgroup): safe to refill it
     }
 
-    bf16* c_base = reinterpret_cast<bf16*>(&g.c[{0, 0, 0, 0}]);
-    store_acc<WARP_M / 16, WARP_N / 16>(
-        c_base,
-        tile_m * BLOCK_M + warp_r * WARP_M,
-        tile_n * BLOCK_N + warp_c * WARP_N,
-        N, C_acc);
+    /* Epilogue: each warp converts its accumulator to bf16 straight into global C. Column-major C
+     * makes a lane's run of consecutive rows unit-stride, so store WIDTH is fine; what the direct
+     * store gives up is transaction SIZE -- a warp's 32 lanes span 16 columns, so the writes
+     * scatter per column. Rung 11 stages through LDS so the block's rows leave as one stream. */
+    kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
 void dispatch(gemm_globals g)
 {
     const size_t mem_size = g.dynamic_shared_memory<1>();
+
+    /* The direct store writes a lane's run of consecutive rows as one sized buffer store, so the
+     * run has to be aligned, which needs the leading dimension to divide it. Kept at 8 rather than
+     * loosened to the run length: every tested shape satisfies it and it stays sufficient if a
+     * wider accumulator shape lengthens the run. */
+    if (g.c.rows() % 8 != 0) {
+        std::fprintf(stderr,
+            "gemm_naive: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+        std::abort();
+    }
+
+    gfx1250_gemm::require_k_blocks(g.K(), "gemm_naive");
+
     hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_naive_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
     gemm_naive_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());

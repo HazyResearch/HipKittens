@@ -138,4 +138,21 @@ template<ducks::sv::all SV> struct size_info<SV> {
 template<typename... Args>                       inline constexpr uint32_t size_bytes             = 0; // base case
 template<typename T, typename... Args>           inline constexpr uint32_t size_bytes<T, Args...> = detail::size_info<T>::bytes + size_bytes<Args...>; // recursive case
 
+/**
+ * @brief The unsigned integer type `BYTES` wide, for the ops that move a run of elements as one
+ * sized access.
+ *
+ * Casting a run through this type is what names the width to the compiler: a loop over contiguous
+ * addresses does not on its own come out as a wide load or store.
+ */
+template<int BYTES> using sized_word_t =
+    std::conditional_t<BYTES == 16, __uint128_t,
+    std::conditional_t<BYTES ==  8, uint64_t,
+    std::conditional_t<BYTES ==  4, uint32_t, uint16_t>>>;
+
+/// @brief Whether `BYTES` is a width the ISA has, and so one `sized_word_t` maps. A run of any
+/// other width has to keep the element-at-a-time path.
+template<int BYTES> inline constexpr bool sized_word_ok =
+    (BYTES == 2 || BYTES == 4 || BYTES == 8 || BYTES == 16);
+
 } // namespace kittens

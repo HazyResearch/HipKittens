@@ -18,7 +18,26 @@ namespace kittens {
  * @param[in] src The source shared memory vector.
  * @param[in] idx The coord of the global memory array.
  */
-template<ducks::sv::all SV, ducks::gl::all GL, ducks::coord::vec COORD=coord<SV>, int N_THREADS=WARP_THREADS>
+/**
+* @brief Refused: this store streams the vector linearly, which assumes a unit-stride column axis.
+*
+* `coord<SV>::unit_coord<-1,3>()` places the vector at `(b, d, r, c*SV::length)`, so it runs along
+* the column axis. The base is layout-correct because `gl::idx()` is, but the distribution below
+* is `dst_ptr + lane_elem_offset` -- a contiguous walk shared with the LDS side, which is what
+* makes the two offsets interchangeable. Contiguous is the column axis only under `row_major`;
+* under `col_major` the row axis is unit-stride, so the same offsets would scatter the vector down
+* a column. An unconstrained `gl::all` takes a column-major descriptor and writes to the wrong
+* addresses with no diagnostic.
+*/
+template<ducks::sv::all SV, ducks::gl::col_layout GL, ducks::coord::vec COORD=coord<SV>, int N_THREADS=WARP_THREADS>
+__device__ static inline void store(const GL &dst, const SV &src, const COORD &idx) {
+    static_assert(ducks::gl_layout::unhandled<typename GL::layout>,
+        "store() of a shared vector to global is implemented for ducks::gl_layout::row_major only: "
+        "the vector lies along the column axis and the global offset is reused verbatim as the LDS "
+        "offset, which is a unit-stride walk. Implement the strided walk (stride rows(), from "
+        "stride<3>()) rather than passing this descriptor.");
+}
+template<ducks::sv::all SV, ducks::gl::row_layout GL, ducks::coord::vec COORD=coord<SV>, int N_THREADS=WARP_THREADS>
 __device__ static inline void store(const GL &dst, const SV &src, const COORD &idx) {
     using T = typename SV::dtype;
     using U = typename GL::dtype;

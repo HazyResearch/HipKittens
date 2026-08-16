@@ -1,6 +1,6 @@
 /**
- * @file gemm_segment.cpp
- * @brief Rung 7 -- gemm_deepk with the operand rings separated into different LDS segments.
+ * @file gemm_deepk.cpp
+ * @brief Rung 6 -- gemm_256x256 with the LDS stage deepened, BLOCK_K 32 -> 128.
  *
  * Kernel Specification
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
@@ -8,25 +8,18 @@
  *   registers   226 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator
  *               (WARP_M*WARP_N/32), 26 SGPR
  *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
- *   LDS         2 stages x 4 sub-blocks x 34 KB = 272 KB of 320 KB (85%)
+ *   LDS         2 stages x 4 sub-blocks x 34 KB = 272 KB of 320 KB (85%); a third stage would
+ *               need 408 KB, which is what pins the ring at two from here up
  *   sync        per K-block: 1 barrier (split), 4 LDS waits (3 partial, 1 full), 1 async drain
  *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
- * The A ring and the B ring are placed a full 64 KB segment apart rather than interleaved, so
- * the two 256 B/cycle LDS read ports can serve an A read and a B read in the same cycle:
- * corresponding operands go from 17,408 B apart to 139,264 B. Drawing on both ports is what the
- * segmented LDS is there for, and on a kernel that is waiting on them it is worth about 12%.
- *
- * This recipe at 8192^3 is not waiting on them. The tile is large enough that one port already
- * supplies enough bandwidth to keep the matrix units fed, so the step buys nothing here. It is
- * still how the rings should be placed: the win is there as soon as the tile is smaller or the
- * fill slower, and it costs nothing.
- *
- * A K-block is held as K_SUBBLOCKS separate sub-tiles rather than one deep tile, because
- * the global -> shared `load` and the shared -> register `load` only agree on layout for a tile one subtile
- * column wide. A deep tile filled this way reads back scrambled. Same 256x256 tile, BLOCK_K=128,
- * 4x4 warps, two async-filled stages, plain split barrier, direct column-major epilogue.
- * Uses only:
+ * A stage now holds four matrix sub-steps instead of one, so the per-K-block rendezvous count
+ * drops four-fold and a register double-buffer inside the K-block has something to overlap.
+ * Deepening the stage also puts the LDS row at 256 B for a 2-byte element, which is eight lanes
+ * per cache line and half the fill requests. Together that is worth about 1.17x. What it costs
+ * is LDS: a stage is four times the bytes, and that is what fixes the ring at two stages from
+ * here up. Same 256x256 tile, 4x4 warps, two async-filled stages interleaved in one segment,
+ * plain split barrier, direct column-major epilogue. Uses only:
  *   - `kittens::load`       : cooperative `global_load_async_to_lds_b128` fill.
  *   - `kittens::sync::wait_async` : drain the async fill.
  *   - `kittens::sync::arrive/wait`: split workgroup barrier (-1).
@@ -56,21 +49,24 @@ constexpr int K_SUBBLOCKS = BLOCK_K / K_STEP;
 using namespace kittens;
 using namespace gfx1250_gemm;
 
-/* LDS holds two stages at this tile size, not three -- see `kittens::MAX_SHARED_MEMORY`. */
 static constexpr int S = 2;                    // stages in the LDS ring
 
+/* One ring slot, with A and B adjacent. Both members are 16-byte aligned and a multiple of 16
+ * bytes long, so the pair carries no padding and the ring is exactly the operand bytes. */
+struct KITTENS_DEFAULT_ALIGN ab_pair { A_tile a; B_tile b; };
+static_assert(sizeof(ab_pair) == sizeof(A_tile) + sizeof(B_tile),
+              "an interleaved pair must not introduce padding");
+
 __global__ __launch_bounds__(NUM_THREADS, 1)
-void gemm_segment_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_deepk_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
 
     constexpr int KS = K_SUBBLOCKS;            // BLOCK_K / K_STEP = 4 sub-steps
 
-    // Blocked: every A sub-tile, then every B sub-tile. That ordering is what puts the two
-    // rings a full segment apart.
-    A_tile(&A_st)[S][KS] = al.allocate_in<segment<0>, A_tile, S, KS>();
-    B_tile(&B_st)[S][KS] = al.allocate_in<segment<0>, B_tile, S, KS>();
+    // Interleaved: A(s,j) then B(s,j), then A(s,j+1), so a pair shares one segment.
+    ab_pair(&ring)[S][KS] = al.allocate_in<segment<0>, ab_pair, S, KS>();
 
     rt_fl<WARP_M, WARP_N, col_l, rt_16x16_s> C_acc;
     zero(C_acc);
@@ -95,8 +91,8 @@ void gemm_segment_kernel(const gemm_globals g, int M, int N, int K)
     auto issue_fill = [&](int slot, int kblock) {
         #pragma unroll
         for (int j = 0; j < KS; ++j) {
-            kittens::load<NUM_THREADS>(A_st[slot][j], g.a, {0, 0, tile_m, kblock * KS + j}, K);
-            kittens::load<NUM_THREADS>(B_st[slot][j], g.b, {0, 0, tile_n, kblock * KS + j}, K);
+            kittens::load<NUM_THREADS>(ring[slot][j].a, g.a, {0, 0, tile_m, kblock * KS + j}, K);
+            kittens::load<NUM_THREADS>(ring[slot][j].b, g.b, {0, 0, tile_n, kblock * KS + j}, K);
         }
     };
 
@@ -120,8 +116,8 @@ void gemm_segment_kernel(const gemm_globals g, int M, int N, int K)
         const int cur = kb % S, nxt = (kb + 1) % S;
 
         kittens::sched::compiler_fence();
-        kittens::load(A_reg[0], A_st[cur][0], warp_off_a);
-        kittens::load(B_reg[0], B_st[cur][0], warp_off_b);
+        kittens::load(A_reg[0], ring[cur][0].a, warp_off_a);
+        kittens::load(B_reg[0], ring[cur][0].b, warp_off_b);
 
         // Branch-free tail: a clamped index rather than an `if`. An async copy has no null
         // form, so the last iteration refills a stage nothing reads again.
@@ -133,16 +129,15 @@ void gemm_segment_kernel(const gemm_globals g, int M, int N, int K)
         #pragma unroll
         for (int si = 0; si < KS - 1; ++si) {
             const int c = si & 1, n = 1 - c;
-            kittens::load(A_reg[n], A_st[cur][si + 1], warp_off_a);
-            kittens::load(B_reg[n], B_st[cur][si + 1], warp_off_b);
+            kittens::load(A_reg[n], ring[cur][si + 1].a, warp_off_a);
+            kittens::load(B_reg[n], ring[cur][si + 1].b, warp_off_b);
             // wait for data (LDS): partial -- LDS reads finish in order, so some stay in flight.
             kittens::sync::wait_ds<DS_SUB>();
             mma_ABt(C_acc, A_reg[c], B_reg[c], C_acc);
         }
 
-        /* The stage handoff. Both counters drain before the signal. The async drain has to
-         * be full: unlike the LDS and tensor counters it does not retire in order, so a
-         * partial `wait_async<N>` establishes nothing. */
+        /* The stage handoff. The async drain has to be full: that counter does not retire
+         * in order, so a partial `wait_async<N>` establishes nothing. */
         constexpr int c_last = (KS - 1) & 1;
         kittens::sync::wait_ds<0>();     // wait for data (LDS): done reading the current stage
         mma_ABt(C_acc, A_reg[c_last], B_reg[c_last], C_acc);
@@ -164,9 +159,9 @@ void gemm_segment_kernel(const gemm_globals g, int M, int N, int K)
 
 void dispatch(gemm_globals g)
 {
-    /* The C staging tile reuses the operand rings, so the request is the larger of the two, not
-     * the sum. At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
-    const size_t load_lds  = S * K_SUBBLOCKS * (sizeof(A_tile) + sizeof(B_tile));
+    /* The C staging tile reuses the ring, so the request is the larger of the two, not the sum.
+     * At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
+    const size_t load_lds  = S * K_SUBBLOCKS * sizeof(ab_pair);
     const size_t mem_size  = load_lds;   // no C staging tile to make room for
 
     /* The direct store writes a lane's run of consecutive rows as one sized buffer store, so the
@@ -175,15 +170,15 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_segment: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "gemm_deepk: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_segment");
+    gfx1250_gemm::require_k_blocks(g.K(), "gemm_deepk");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_segment_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_deepk_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
-    gemm_segment_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
+    gemm_deepk_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
 }
 
 #include "harness.h"

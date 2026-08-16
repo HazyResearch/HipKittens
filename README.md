@@ -85,12 +85,20 @@ python3 setup.py develop
 
 ## Unit tests
 
-We provide unit tests for you to optionally test the correctness of library functions. 
+We provide unit tests for you to optionally test the correctness of library functions. The suite is
+split by architecture; build and run the one matching your GPU.
 
 ```bash
-cd HipKittens/tests/unit
-make -j64
+# CDNA4 (MI350X / MI355X, gfx950)
+cd HipKittens/tests/unit/cdna4
+make -j64 && ./unit_tests
+
+# UDNA1 (MI400 / MI450, gfx1250)
+cd HipKittens/tests/unit/udna1
+make -j64 && ./unit_tests
 ```
+
+`TEST_INTENSITY` (0–4, default 2) bounds the tile-size sweep — 2 is the intended configuration.
 
 ## Quick start: running kernels
 

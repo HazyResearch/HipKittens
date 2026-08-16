@@ -15,7 +15,8 @@ struct st_load_store {
         && (W*H*ST_SHAPE::cols*ST_SHAPE::rows*sizeof(T) <= kittens::MAX_SHARED_MEMORY)
         && ((W*H*ST_SHAPE::cols*ST_SHAPE::rows*sizeof(T)) % (kittens::WARP_THREADS * ST_SHAPE::template bytes_per_thread<T>()) == 0)
         && (MECH == g2s_mech::reg_mediated
-            || (sizeof(T) == 2 && std::is_same_v<ST_SHAPE, kittens::ducks::st_shape::st_16x32_padded<>>))
+            || (sizeof(T) == 2 && W == 1
+                && std::is_same_v<ST_SHAPE, kittens::ducks::st_shape::st_16x32_padded<>>))
     >;
     static inline const std::string test_identifier =
         (MECH == g2s_mech::async ?

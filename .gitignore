@@ -33,7 +33,20 @@ utils/__pycache__/
 
 # Host-specific build/test scripts.
 kernels/udna1/gemm/bf16fp32/gfx1250/*.sh
+# ...but the autoresearch protocol scripts are NOT host-specific: they are the
+# measure-and-verify protocol itself and must survive a fresh checkout, because
+# the loop that uses them runs across many agent restarts.
+!kernels/udna1/gemm/bf16fp32/gfx1250/hk_*.sh
+# gate.sh is the same kind of thing and misses the hk_ prefix only by age. It is the
+# byte-exact correctness gate for the ladder and is cited by name from README.md,
+# GL_LAYOUT_REFACTOR.md and TN_MIGRATION.md, so it is un-ignored rather than renamed.
+!kernels/udna1/gemm/bf16fp32/gfx1250/gate.sh
 kernels/udna1/gemm/bf16fp32/gfx1250/*.sbatch
 kernels/udna1/gemm/bf16fp32/gfx1250/*.out
+# The rules above are anchored to one directory, so retiring a host-specific
+# script into archive/ would otherwise un-ignore it.
+kernels/udna1/gemm/bf16fp32/gfx1250/archive/*.sh
+kernels/udna1/gemm/bf16fp32/gfx1250/archive/*.sbatch
+kernels/udna1/gemm/bf16fp32/gfx1250/archive/*.out
 
 !CMakeLists.txt

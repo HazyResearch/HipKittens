@@ -8,6 +8,7 @@
 #include "../../common/common.cuh"
 #include "../shared/shared.cuh"
 #include "util.cuh"
+#include "gl_layout.cuh"
 
 namespace kittens {
 
@@ -30,9 +31,15 @@ struct identifier {};
 }
 }
 
-template<typename _T, int b, int d, int r, int c, typename... TMA_Types>
+template<typename _T, int b, int d, int r, int c,
+         ducks::gl_layout::all _Layout = ducks::gl_layout::row_major, typename... TMA_Types>
 struct gl {
     using identifier = ducks::gl::identifier;
+
+    /* Layout sits BEFORE the TMA pack because a variadic pack must come last. That is safe
+     * here: no source in this tree passes TMA types to `gl` (the only two forms in use are
+     * `gl<T,-1,-1,-1,-1>`), so no existing declaration binds a TMA type to this slot. */
+    using layout = _Layout; ///< Memory layout of the descriptor.
 
     using T     = base_types::packing<_T>::unpacked_type;
     using T2    = base_types::packing<_T>::packed_type;
@@ -69,10 +76,18 @@ struct gl {
     __host__ __device__ inline gl(const gl &other) :
             raw_ptr(other.raw_ptr), batch_internal(other.batch_internal), depth_internal(other.depth_internal), rows_internal(other.rows_internal), cols_internal(other.cols_internal), tma_descs(other.tma_descs) {}
     __device__ inline T& operator[](const coord<ducks::default_type> &idx) const {
-        return raw_ptr[((int64_t(idx.b)*depth() + idx.d)*rows() + idx.r)*cols() + idx.c];
+        return raw_ptr[this->idx(idx)];
     }
-    __device__ inline int64_t idx(const coord<ducks::default_type> &idx) const {
+    /* One constrained overload per layout, so selection is by resolution rather than by a
+     * branch. A layout with no overload here is not a silent fall-through: it is "no viable
+     * member" at the call site. */
+    __device__ inline int64_t idx(const coord<ducks::default_type> &idx) const
+        requires std::is_same_v<layout, ducks::gl_layout::row_major> {
         return ((int64_t(idx.b)*depth() + idx.d)*rows() + idx.r)*cols() + idx.c;
+    }
+    __device__ inline int64_t idx(const coord<ducks::default_type> &idx) const
+        requires std::is_same_v<layout, ducks::gl_layout::col_major> {
+        return ((int64_t(idx.b)*depth() + idx.d)*cols() + idx.c)*rows() + idx.r;
     }
     template<int axis> __device__ inline size_t shape() const {
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
@@ -81,12 +96,42 @@ struct gl {
         else if constexpr (axis==2) { return size_t(rows()); }
         else if constexpr (axis==3) { return size_t(cols()); }
     }
-    template<int axis> __device__ inline size_t stride() const { 
+    /* Strides follow the layout. Under col_major the ROW axis is the unit-stride one, which is
+     * the whole point: it is what lets a store whose register-contiguous axis is M emit a wide
+     * store instead of a scatter. */
+    /* Likewise per layout. The `axis` branching stays a branch -- axis is an int, not a layout,
+     * and there is nothing for resolution to select on. */
+    template<int axis> __device__ inline size_t stride() const
+        requires std::is_same_v<layout, ducks::gl_layout::row_major> {
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
         if      constexpr (axis==0) { return depth()*rows()*cols(); }
         else if constexpr (axis==1) { return rows()*cols(); }
         else if constexpr (axis==2) { return cols(); }
-        else if constexpr (axis==3) { return 1; }
+        else                        { return 1; }
+    }
+    template<int axis> __device__ inline size_t stride() const
+        requires std::is_same_v<layout, ducks::gl_layout::col_major> {
+        static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
+        if      constexpr (axis==0) { return depth()*rows()*cols(); }
+        else if constexpr (axis==1) { return rows()*cols(); }
+        else if constexpr (axis==2) { return 1; }
+        else                        { return rows(); }
+    }
+
+    /* Element offset of (row, col) from a tile base, in the units `raw_ptr` is indexed in. The one
+     * place a layout becomes an address: the contiguous axis contributes its coordinate unscaled and
+     * the other is scaled by its stride. `axis` names the tile's row axis, as it does for `stride`.
+     *
+     * The multiply stays 32-bit on purpose. Both coordinates are bounded by the tile and the stride by
+     * the tensor, so the product cannot overflow, while widening it makes the backend give up on
+     * proving the base wave-uniform and materialise it into a VGPR pair. */
+    template<int axis> __device__ inline int64_t offset(int row, int col) const
+        requires std::is_same_v<layout, ducks::gl_layout::row_major> {
+        return (int64_t)row * (int)stride<axis>() + col;
+    }
+    template<int axis> __device__ inline int64_t offset(int row, int col) const
+        requires std::is_same_v<layout, ducks::gl_layout::col_major> {
+        return (int64_t)col * (int)stride<3>() + row;
     }
 };
 
@@ -102,6 +147,26 @@ namespace gl {
 template<typename T> concept all = requires {
     typename T::identifier; // Checks if T::identifier exists
 } && std::is_same_v<typename T::identifier, identifier>; // Checks if T::identifier is ducks::gl::identifier
+/**
+* @brief Concept for global layouts with row-major layout.
+* @tparam T The type to check against the concept requirements.
+*
+* Requires:
+* - T is a global layout.
+* - T has an internal type layout that is ducks::gl_layout::row_major.
+*/
+template<typename T>
+concept row_layout = all<T> && std::is_same_v<typename T::layout, ducks::gl_layout::row_major>;
+/**
+* @brief Concept for global layouts with column-major layout.
+* @tparam T The type to check against the concept requirements.
+*
+* Requires:
+* - T is a global layout.
+* - T has an internal type layout that is ducks::gl_layout::col_major.
+*/
+template<typename T>
+concept col_layout = all<T> && std::is_same_v<typename T::layout, ducks::gl_layout::col_major>;
 }
 }
 
