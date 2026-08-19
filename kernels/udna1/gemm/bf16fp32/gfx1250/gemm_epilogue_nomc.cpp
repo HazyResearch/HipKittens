@@ -1,5 +1,5 @@
 /**
- * @file gemm_cluster_epilogue.cpp
+ * @file gemm_epilogue_nomc.cpp
  * @brief Rung 11 (A0-safe) -- staging C through LDS as a feature of the kernel rather than of the ops, and a
  *        wave that issues its matrix ops back to back.
  *
@@ -51,7 +51,7 @@
  * prologue, which is worth about +1.9% for a single scalar register write and no extra register.
  * The reasoning is at the call site.
  *
- * Everything else is `gemm_cluster_bar` at the shape above: a two-stage TDM-filled LDS ring, the
+ * Everything else is `gemm_wgc_cluster` at the shape above: a two-stage TDM-filled LDS ring, the
  * split barrier, and a 4x4 cluster with non-multicast operand loads (A0-safe). Uses only:
  *   - `kittens::sched::lock_simd` : clear the post-matrix-op arbitration stall for this wave.
  *   - `kittens::tdm::load_async`  : descriptor-driven global -> LDS tile DMA, non-multicast, mask 0).
@@ -128,7 +128,7 @@ static_assert(sizeof(C_col) <= sizeof(C_tile),
 __global__
 __cluster_dims__(CLUSTER_DIM, CLUSTER_DIM, 1)
 __launch_bounds__(NUM_THREADS, 1)
-void gemm_cluster_epilogue_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_epilogue_nomc_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -265,19 +265,19 @@ void dispatch(gemm_globals g)
      * the leading dimension is a multiple of 8. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_cluster_epilogue: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "gemm_epilogue_nomc: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_cluster_epilogue");
+    gfx1250_gemm::require_k_blocks(g.K(), "gemm_epilogue_nomc");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_cluster_epilogue_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_epilogue_nomc_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
 
     const dim3 grid = g.grid();
 
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
-        printf("!! gemm_cluster_epilogue: a %dx%d cluster needs grid.x and grid.y both divisible "
+        printf("!! gemm_epilogue_nomc: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
         return;
     }
@@ -296,9 +296,9 @@ void dispatch(gemm_globals g)
     cfg.attrs    = attrs;
     cfg.numAttrs = 1;
 
-    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_cluster_epilogue_kernel, g, g.M(), g.N(), g.K());
+    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_epilogue_nomc_kernel, g, g.M(), g.N(), g.K());
     if (e != hipSuccess)
-        printf("!! gemm_cluster_epilogue: cluster launch REJECTED: %s\n", hipGetErrorString(e));
+        printf("!! gemm_epilogue_nomc: cluster launch REJECTED: %s\n", hipGetErrorString(e));
 }
 
 #include "harness.h"

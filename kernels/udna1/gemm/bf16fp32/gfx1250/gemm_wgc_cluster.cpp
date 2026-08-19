@@ -1,5 +1,5 @@
 /**
- * @file gemm_cluster_bar.cpp
+ * @file gemm_wgc_cluster.cpp
  * @brief Rung 10 (A0-safe) -- gemm_split_bar plus a workgroup cluster without multicast loads.
  *
  * Kernel Specification
@@ -70,7 +70,7 @@ using B_deep = st_e<BLOCK_N, BLOCK_K>;
 __global__
 __cluster_dims__(CLUSTER_DIM, CLUSTER_DIM, 1)
 __launch_bounds__(NUM_THREADS, 1)
-void gemm_cluster_bar_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_wgc_cluster_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -191,13 +191,13 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_cluster_bar: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "gemm_wgc_cluster: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_cluster_bar");
+    gfx1250_gemm::require_k_blocks(g.K(), "gemm_wgc_cluster");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_cluster_bar_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_wgc_cluster_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
 
     const dim3 grid = g.grid();
@@ -205,7 +205,7 @@ void dispatch(gemm_globals g)
     /* Refuse rather than launch without a cluster. Cluster barriers require co-scheduled
      * workgroups even though operand fills are per-workgroup on A0. */
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
-        printf("!! gemm_cluster_bar: a %dx%d cluster needs grid.x and grid.y both divisible "
+        printf("!! gemm_wgc_cluster: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
         return;
     }
@@ -224,9 +224,9 @@ void dispatch(gemm_globals g)
     cfg.attrs    = attrs;
     cfg.numAttrs = 1;
 
-    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_cluster_bar_kernel, g, g.M(), g.N(), g.K());
+    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_wgc_cluster_kernel, g, g.M(), g.N(), g.K());
     if (e != hipSuccess)
-        printf("!! gemm_cluster_bar: cluster launch REJECTED: %s\n", hipGetErrorString(e));
+        printf("!! gemm_wgc_cluster: cluster launch REJECTED: %s\n", hipGetErrorString(e));
 }
 
 #include "harness.h"

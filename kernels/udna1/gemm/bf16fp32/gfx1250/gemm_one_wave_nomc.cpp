@@ -1,6 +1,6 @@
 /**
- * @file gemm_cluster_one_wave.cpp
- * @brief Rung 12 (A0-safe) -- gemm_cluster_epilogue (rung 11) dropped to one wave per SIMD, with the software-
+ * @file gemm_one_wave_nomc.cpp
+ * @brief Rung 12 (A0-safe) -- gemm_epilogue_nomc (rung 11) dropped to one wave per SIMD, with the software-
  *        pipelined operand feed on a pinned schedule that the drop requires.
  *
  * Kernel Specification
@@ -86,7 +86,7 @@ using C_col = kittens::st<elem_t, BLOCK_M, BLOCK_N,
 __global__
 __cluster_dims__(CLUSTER_DIM, CLUSTER_DIM, 1)
 __launch_bounds__(NUM_THREADS, 1)
-void gemm_cluster_one_wave_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_one_wave_nomc_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -234,20 +234,20 @@ void dispatch(gemm_globals g)
      * leading dimension is a multiple of 8. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_cluster_one_wave: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "gemm_one_wave_nomc: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_cluster_one_wave");
+    gfx1250_gemm::require_k_blocks(g.K(), "gemm_one_wave_nomc");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_cluster_one_wave_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_one_wave_nomc_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
 
     const dim3 grid = g.grid();
 
     /* Refuse rather than launch without a cluster (A0-safe: per-workgroup TDM fills). */
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
-        printf("!! gemm_cluster_one_wave: a %dx%d cluster needs grid.x and grid.y both divisible "
+        printf("!! gemm_one_wave_nomc: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
         return;
     }
@@ -266,9 +266,9 @@ void dispatch(gemm_globals g)
     cfg.attrs    = attrs;
     cfg.numAttrs = 1;
 
-    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_cluster_one_wave_kernel, g, g.M(), g.N(), g.K());
+    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_one_wave_nomc_kernel, g, g.M(), g.N(), g.K());
     if (e != hipSuccess)
-        printf("!! gemm_cluster_one_wave: cluster launch REJECTED: %s\n", hipGetErrorString(e));
+        printf("!! gemm_one_wave_nomc: cluster launch REJECTED: %s\n", hipGetErrorString(e));
 }
 
 #include "harness.h"

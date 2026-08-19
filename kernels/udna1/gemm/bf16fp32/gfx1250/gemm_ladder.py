@@ -31,7 +31,7 @@ from utils import compare, gemm_reference, init_c, init_uniform
 # paired delta over that rung's own parent.
 LADDER = ["gemm_naive", "gemm_double_buf", "gemm_async", "gemm_128x128", "gemm_256x256",
           "gemm_deepk", "gemm_segment", "gemm_tdm", "gemm_split_bar",
-          "gemm_cluster_bar", "gemm_cluster_epilogue", "gemm_cluster_one_wave",
+          "gemm_wgc_cluster", "gemm_epilogue_nomc", "gemm_one_wave_nomc",
           "gemm_wgc_multicast", "gemm_epilogue", "gemm_one_wave"]
 
 HERE = Path(__file__).resolve().parent

@@ -25,9 +25,12 @@ with mask 0 (same fills as rung 9):
 
 | Rung | Kernel | Adds over previous |
 |------|--------|-------------------|
-| 10 | `gemm_cluster_bar` | 4×4 cluster + split cluster/workgroup barriers (no multicast) |
-| 11 | `gemm_cluster_epilogue` | Staged C through LDS, `lock_simd` |
-| 12 | `gemm_cluster_one_wave` | 1 wave/SIMD, 128×128 warp tile, pipelined operand ring |
+| 10 | `gemm_wgc_cluster` | 4×4 cluster + split cluster/workgroup barriers (no multicast) |
+| 11 | `gemm_epilogue_nomc` | Staged C through LDS, `lock_simd` |
+| 12 | `gemm_one_wave_nomc` | 1 wave/SIMD, 128×128 warp tile, pipelined operand ring |
+
+The `_nomc` suffix marks the A0-safe non-multicast variants of `gemm_epilogue` and `gemm_one_wave`
+(the multicast modules keep the bare names for A1+ silicon).
 
 The multicast rungs remain in the tree for future A1+ silicon where multicast is supported.
 
@@ -54,7 +57,7 @@ The rungs collectively use ten sync calls, which is a lot to meet at once -- but
 than one new one. Reading upward, `gemm_naive` and `gemm_double_buf` use only the full barrier
 `sync::sync`. `gemm_async` splits it into `arrive`/`wait` and adds `wait_async`, because the fill is
 now a copy engine that has to be waited on separately. `gemm_tdm` swaps that engine, and with it
-`wait_async` for `wait_tdm`. `gemm_cluster_bar` (A0-safe) and `gemm_wgc_multicast` (A1+ multicast) add the cluster barrier. `gemm_one_wave` adds no
+`wait_async` for `wait_tdm`. `gemm_wgc_cluster` (A0-safe) and `gemm_wgc_multicast` (A1+ multicast) add the cluster barrier. `gemm_one_wave` adds no
 new primitive at all -- it only wraps the ones already there in `sched::compiler_fence`.
 
 Each call in a kernel is labelled with the job it does and the resource it does it on: `wait for
@@ -87,8 +90,8 @@ ladder. Set `HIP_VISIBLE_DEVICES` to pick a card.
 
 ## Build
 
-The kernels target `gfx1250`. All seven cluster rungs (`gemm_cluster_*` and the multicast
-`gemm_wgc_multicast`, `gemm_epilogue`, `gemm_one_wave`) use `__cluster_dims__` and the `hipLaunchAttributeClusterDimension` launch
+The kernels target `gfx1250`. All seven cluster rungs (`gemm_wgc_cluster`, `gemm_epilogue_nomc`,
+`gemm_one_wave_nomc`, and the multicast `gemm_wgc_multicast`, `gemm_epilogue`, `gemm_one_wave`) use `__cluster_dims__` and the `hipLaunchAttributeClusterDimension` launch
 attribute; ROCm 7.2.4 and earlier have neither and fail those three with a cascade of errors that
 read as `shared_allocator` problems. Those seven need **ROCm 7.15 (clang 23)**; the other eight build
 on ROCm 7.2+. Correctness needs PyTorch with gfx1250 support, which is **torch 2.11.0+rocm7.14.0**.

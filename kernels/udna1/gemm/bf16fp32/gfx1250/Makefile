@@ -24,7 +24,7 @@ CUSTOM_RULES := 1
 # adds to the rung below it, and the list is every kernel on disk: the ladder is a single chain that
 # ends at its fastest kernel. See README.md.
 # A0-safe cluster path (top); multicast rungs below are A1+ only (hang on gfx1250 A0).
-LADDER := gemm_cluster_one_wave gemm_cluster_epilogue gemm_cluster_bar \
+LADDER := gemm_one_wave_nomc gemm_epilogue_nomc gemm_wgc_cluster \
           gemm_one_wave gemm_epilogue gemm_wgc_multicast gemm_split_bar \
           gemm_tdm gemm_segment gemm_deepk gemm_256x256 gemm_128x128 gemm_async \
           gemm_double_buf gemm_naive
