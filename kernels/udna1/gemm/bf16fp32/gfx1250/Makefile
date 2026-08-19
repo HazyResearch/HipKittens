@@ -12,7 +12,7 @@
 #   make test                            # the rungs, then check every one vs torch.matmul
 #   make clean
 #
-# The three cluster kernels (`gemm_wgc_multicast`, `gemm_epilogue`, `gemm_one_wave`) need `__cluster_dims__` and `hipLaunchAttributeClusterDimension`.
+# Six cluster kernels need `__cluster_dims__` and `hipLaunchAttributeClusterDimension`.
 # ROCm 7.2.4 and earlier have neither and fail these four with a cascade that reads as
 # `shared_allocator` errors; ROCm 7.15 (clang 23) supports both. The nine non-cluster
 # kernels build on ROCm 7.2+.
@@ -23,7 +23,9 @@ CUSTOM_RULES := 1
 # The twelve rungs, listed top down. Each is named for the one hardware or algorithmic feature it
 # adds to the rung below it, and the list is every kernel on disk: the ladder is a single chain that
 # ends at its fastest kernel. See README.md.
-LADDER := gemm_one_wave gemm_epilogue gemm_wgc_multicast gemm_split_bar \
+# A0-safe cluster path (top); multicast rungs below are A1+ only (hang on gfx1250 A0).
+LADDER := gemm_cluster_one_wave gemm_cluster_epilogue gemm_cluster_bar \
+          gemm_one_wave gemm_epilogue gemm_wgc_multicast gemm_split_bar \
           gemm_tdm gemm_segment gemm_deepk gemm_256x256 gemm_128x128 gemm_async \
           gemm_double_buf gemm_naive
 
@@ -51,7 +53,7 @@ $(PYEXT): $(SRC) $(LOCAL_HEADERS) $(TK_HEADERS)
 	$(HIPCXX) $(HIPFLAGS) $(ICPPFLAGS) $(PY_INCLUDES) $(PY_LDFLAGS) -shared -fPIC \
 		-DHARNESS_PYEXT -DHK_PYEXT_NAME=$(KERNEL) $(SRC) -o $(PYEXT)
 
-# Everything on disk, so a toolchain or header change is checked against all 13 kernels.
+# Everything on disk, so a toolchain or header change is checked against all 15 kernels.
 # `all-kernels` is kept as an alias because scripts and docs name it.
 ladder all-kernels:
 	@for k in $(LADDER); do $(MAKE) KERNEL=$$k || exit 1; done

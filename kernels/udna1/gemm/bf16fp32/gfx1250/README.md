@@ -12,6 +12,25 @@ rather than silently transposed. They are written against
 `include/udna1/ops/warp/{sync,sched,cluster}/` and the gfx1250-only extensions to
 `memory/tile/global_to_shared.cuh`, `memory/tile/shared_to_register.cuh` and `register/tile/mma.cuh`.
 
+
+## gfx1250 A0 (MI450) multicast limitation
+
+**Multicast TDM loads are not supported on gfx1250 A0 silicon.** The original rungs 10–12
+(`gemm_wgc_multicast`, `gemm_epilogue`, `gemm_one_wave`) use multicast operand fills inside a
+4×4 workgroup cluster and **must not be run on A0** — they wedge the GPU.
+
+The A0-safe ladder path forks at rung 9 (`gemm_split_bar`) into three non-multicast cluster
+rungs that keep cluster barriers and launch attributes but use per-workgroup `tdm::load_async`
+with mask 0 (same fills as rung 9):
+
+| Rung | Kernel | Adds over previous |
+|------|--------|-------------------|
+| 10 | `gemm_cluster_bar` | 4×4 cluster + split cluster/workgroup barriers (no multicast) |
+| 11 | `gemm_cluster_epilogue` | Staged C through LDS, `lock_simd` |
+| 12 | `gemm_cluster_one_wave` | 1 wave/SIMD, 128×128 warp tile, pipelined operand ring |
+
+The multicast rungs remain in the tree for future A1+ silicon where multicast is supported.
+
 ## Tile geometry
 
 Each rung declares its own `BLOCK_M`, `BLOCK_N`, `BLOCK_K`, `K_STEP`, `WARPS_M` and `WARPS_N` at the
@@ -35,7 +54,7 @@ The rungs collectively use ten sync calls, which is a lot to meet at once -- but
 than one new one. Reading upward, `gemm_naive` and `gemm_double_buf` use only the full barrier
 `sync::sync`. `gemm_async` splits it into `arrive`/`wait` and adds `wait_async`, because the fill is
 now a copy engine that has to be waited on separately. `gemm_tdm` swaps that engine, and with it
-`wait_async` for `wait_tdm`. `gemm_wgc_multicast` adds the cluster barrier. `gemm_one_wave` adds no
+`wait_async` for `wait_tdm`. `gemm_cluster_bar` (A0-safe) and `gemm_wgc_multicast` (A1+ multicast) add the cluster barrier. `gemm_one_wave` adds no
 new primitive at all -- it only wraps the ones already there in `sched::compiler_fence`.
 
 Each call in a kernel is labelled with the job it does and the resource it does it on: `wait for
@@ -54,7 +73,7 @@ intensity -- so the per-kernel facts sit next to the code rather than here.
 `test.py` is the correctness gate and `gemm_ladder.py` is the measurement campaign; a rung number for publication comes from the latter.
 
 ```
-make all-kernels                                    # 12 pybind11 modules, no executables
+make all-kernels                                    # 15 pybind11 modules, no executables
 python3 test.py                                     # every rung, four shapes, against torch.matmul
 ./gemm_ladder.py -r 25 -i 100                       # the table above
 ./gemm_ladder.py -r 25 -i 100 --torch gemm_tdm gemm_one_wave
@@ -68,9 +87,10 @@ ladder. Set `HIP_VISIBLE_DEVICES` to pick a card.
 
 ## Build
 
-The kernels target `gfx1250`. `gemm_wgc_multicast`, `gemm_epilogue` and `gemm_one_wave` use `__cluster_dims__` and the `hipLaunchAttributeClusterDimension` launch
+The kernels target `gfx1250`. All seven cluster rungs (`gemm_cluster_*` and the multicast
+`gemm_wgc_multicast`, `gemm_epilogue`, `gemm_one_wave`) use `__cluster_dims__` and the `hipLaunchAttributeClusterDimension` launch
 attribute; ROCm 7.2.4 and earlier have neither and fail those three with a cascade of errors that
-read as `shared_allocator` problems. Those three need **ROCm 7.15 (clang 23)**; the other nine build
+read as `shared_allocator` problems. Those seven need **ROCm 7.15 (clang 23)**; the other eight build
 on ROCm 7.2+. Correctness needs PyTorch with gfx1250 support, which is **torch 2.11.0+rocm7.14.0**.
 
 ```
