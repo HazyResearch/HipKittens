@@ -1,6 +1,6 @@
 /**
- * @file gemm_deepk.cpp
- * @brief Rung 6 -- gemm_256x256 with the LDS stage deepened, BLOCK_K 32 -> 128.
+ * @file 05_gemm_deepk.cpp
+ * @brief Rung 05 -- 04_gemm_256x256 with the LDS stage deepened, BLOCK_K 32 -> 128.
  *
  * Kernel Specification
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
@@ -153,11 +153,11 @@ void gemm_deepk_kernel(const gemm_globals g, int M, int N, int K)
     kittens::sync::wait_async<0>();      // wait for data (async copy): no fill outlives the workgroup
     kittens::sync::wait_ds<0>();         // wait for data (LDS): nor any read of the ring
 
-    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    // Direct store: warp accumulator to bf16 in global C; rung 00 has the transaction-size cost.
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     /* The C staging tile reuses the ring, so the request is the larger of the two, not the sum.
      * At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
@@ -170,15 +170,16 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_deepk: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "05_gemm_deepk: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_deepk");
+    gfx1250_gemm::require_k_blocks(g.K(), "05_gemm_deepk");
 
     hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_deepk_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
-    gemm_deepk_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
+    gemm_deepk_kernel<<<launch.grid, launch.block, mem_size, launch.stream>>>(
+        g, g.M(), g.N(), g.K());
 }
 
 #include "harness.h"

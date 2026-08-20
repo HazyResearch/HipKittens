@@ -4,16 +4,17 @@
 # point it has: `test.py` checks it against torch.matmul and `gemm_ladder.py` times it. Arch flags
 # and the Python discovery (PY_INCLUDES, PY_LDFLAGS, PY_EXT_SUFFIX) come from the shared
 # kernels/common.mk via GPU_TARGET=UDNA1; the rules are local (CUSTOM_RULES=1) because common.mk
-# builds one TARGET and this directory builds thirteen, each with its own module name.
+# builds one TARGET and this directory builds twelve, each with its own module name.
 #
 # Invocation:
-#   make KERNEL=gemm_naive               # one module, `import gemm_naive`
-#   make ladder                          # all thirteen rungs (all-kernels is the same target)
+#   make KERNEL=00_gemm_naive            # one module, loaded as `00_gemm_naive`
+#   make ladder                          # all twelve rungs (all-kernels is the same target)
 #   make test                            # the rungs, then check every one vs torch.matmul
 #   make clean
 #
-# The three cluster kernels (`gemm_wgc_multicast`, `gemm_epilogue`, `gemm_one_wave`) need `__cluster_dims__` and `hipLaunchAttributeClusterDimension`.
-# ROCm 7.2.4 and earlier have neither and fail these four with a cascade that reads as
+# The three cluster kernels (`09_gemm_wgc_multicast`, `10_gemm_epilogue`, `11_gemm_one_wave`) use
+# static `__cluster_dims__`; their ordinary HIP launches pick up the required 4x4 cluster metadata.
+# ROCm 7.2.4 and earlier lack this support and fail these three with a cascade that reads as
 # `shared_allocator` errors; ROCm 7.15 (clang 23) supports both. The nine non-cluster
 # kernels build on ROCm 7.2+.
 
@@ -23,14 +24,14 @@ CUSTOM_RULES := 1
 # The twelve rungs, listed top down. Each is named for the one hardware or algorithmic feature it
 # adds to the rung below it, and the list is every kernel on disk: the ladder is a single chain that
 # ends at its fastest kernel. See README.md.
-LADDER := gemm_one_wave gemm_epilogue gemm_wgc_multicast gemm_split_bar \
-          gemm_tdm gemm_segment gemm_deepk gemm_256x256 gemm_128x128 gemm_async \
-          gemm_double_buf gemm_naive
+LADDER := 00_gemm_naive 01_gemm_double_buf 02_gemm_async 03_gemm_128x128 \
+          04_gemm_256x256 05_gemm_deepk 06_gemm_segment 07_gemm_tdm \
+          08_gemm_split_bar 09_gemm_wgc_multicast 10_gemm_epilogue 11_gemm_one_wave
 
 # KERNEL names the artifact and SRC the source it is built from, separately, so one source can be
-# built under a second name: `make KERNEL=nullctl SRC=gemm_epilogue.cpp` is how `gemm_ladder.py`
+# built under a second name: `make KERNEL=nullctl SRC=11_gemm_one_wave.cpp` is how `gemm_ladder.py`
 # builds its null control.
-KERNEL ?= gemm_naive
+KERNEL ?= 00_gemm_naive
 SRC    := $(KERNEL).cpp
 
 include ../../../../common.mk
@@ -51,7 +52,7 @@ $(PYEXT): $(SRC) $(LOCAL_HEADERS) $(TK_HEADERS)
 	$(HIPCXX) $(HIPFLAGS) $(ICPPFLAGS) $(PY_INCLUDES) $(PY_LDFLAGS) -shared -fPIC \
 		-DHARNESS_PYEXT -DHK_PYEXT_NAME=$(KERNEL) $(SRC) -o $(PYEXT)
 
-# Everything on disk, so a toolchain or header change is checked against all 13 kernels.
+# Everything on disk, so a toolchain or header change is checked against all 12 kernels.
 # `all-kernels` is kept as an alias because scripts and docs name it.
 ladder all-kernels:
 	@for k in $(LADDER); do $(MAKE) KERNEL=$$k || exit 1; done

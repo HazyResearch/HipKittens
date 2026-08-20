@@ -4,8 +4,9 @@
  *
  * Included by `harness.h` under `-DHARNESS_PYEXT`, once per rung: each rung declares its own tile
  * geometry before including `common.h` and each names its entry point `dispatch`, so one module
- * cannot serve all thirteen. The module's name must match the .so basename, so both come from
- * `-DHK_PYEXT_NAME` and `make KERNEL=gemm_naive` gives Python `import gemm_naive`.
+ * cannot serve all twelve. The module's name must match the .so basename, so both come from
+ * `-DHK_PYEXT_NAME`; `make KERNEL=00_gemm_naive` builds the dynamically imported
+ * `00_gemm_naive` module.
  *
  * The tensor contract, which is the whole of what is easy to get wrong here because getting it
  * wrong produces a wrong answer rather than an error:
@@ -132,11 +133,7 @@ static gfx1250_gemm::gemm_globals make_globals(const pyb::object& a_obj,
     gfx1250_gemm::gl_c c_gl(reinterpret_cast<dev_elem*>(c.ptr),
                             size_t(1), size_t(1), size_t(M), size_t(N));
 
-    /* The null stream, which is also torch's default. A caller can be on another one and this
-     * module cannot read torch's current stream without linking libtorch, so both exports
-     * synchronise the whole device around the launch: before, so the operands are written; after,
-     * so `c` is readable by torch on return. */
-    return gfx1250_gemm::gemm_globals{a_gl, b_gl, c_gl, /*stream=*/ 0};
+    return gfx1250_gemm::gemm_globals{a_gl, b_gl, c_gl};
 }
 
 static void check_launch(const char* what)
@@ -149,8 +146,9 @@ static void check_launch(const char* what)
 static void py_dispatch(const pyb::object& a, const pyb::object& b, const pyb::object& c)
 {
     gfx1250_gemm::gemm_globals g = make_globals(a, b, c);
+    const gfx1250_gemm::launch_config launch(g, /*stream=*/ 0);
     HIP_OK(hipDeviceSynchronize());
-    dispatch(g);
+    dispatch(g, launch);
     check_launch("dispatch");
     HIP_OK(hipDeviceSynchronize());
 }
@@ -159,9 +157,10 @@ static pyb::dict py_bench(const pyb::object& a, const pyb::object& b, const pyb:
                           int iters)
 {
     gfx1250_gemm::gemm_globals g = make_globals(a, b, c);
+    const gfx1250_gemm::launch_config launch(g, /*stream=*/ 0);
     const int M = g.M(), N = g.N(), K = g.K();
     HIP_OK(hipDeviceSynchronize());
-    const hk_timing t = hk_run_protocol(g, iters);
+    const hk_timing t = hk_run_protocol(g, launch, iters);
     check_launch("bench");
 
     pyb::dict d;

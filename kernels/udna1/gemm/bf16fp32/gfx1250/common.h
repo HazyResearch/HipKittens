@@ -77,12 +77,23 @@ __device__ __host__ constexpr int ds_loads_per_subblock() { return (WARP_DIM / 1
 struct gemm_globals {
     gl_e a, b;
     gl_c c;
-    hipStream_t stream;
     int M() const { return a.rows(); }
     int N() const { return c.cols(); }
     int K() const { return a.cols(); }
-    dim3 grid()  const { return dim3(M() / BLOCK_M, N() / BLOCK_N); }
-    dim3 block() const { return dim3(NUM_THREADS); }
+};
+
+/* Host-only launch state stays beside, never inside, the object copied into the kernel argument
+ * buffer. A dispatch may compute its own LDS byte count when it has a nonstandard allocation. */
+struct launch_config {
+    hipStream_t stream;
+    dim3 grid;
+    dim3 block;
+
+    explicit launch_config(const gemm_globals& g, hipStream_t launch_stream = 0)
+        : stream(launch_stream),
+          grid(g.M() / BLOCK_M, g.N() / BLOCK_N),
+          block(NUM_THREADS) {}
+
     template <int STAGES = 2>
     size_t dynamic_shared_memory() const { return STAGES * (sizeof(A_tile) + sizeof(B_tile)); }
 };

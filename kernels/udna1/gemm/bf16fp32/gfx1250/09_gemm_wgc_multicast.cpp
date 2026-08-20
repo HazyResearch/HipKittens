@@ -1,6 +1,6 @@
 /**
- * @file gemm_wgc_multicast.cpp
- * @brief Rung 10 -- gemm_split_bar plus a workgroup cluster multicasting both operands.
+ * @file 09_gemm_wgc_multicast.cpp
+ * @brief Rung 09 -- 08_gemm_split_bar plus a workgroup cluster multicasting both operands.
  *
  * Kernel Specification
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
@@ -15,10 +15,10 @@
  *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
  * Sixteen workgroups form a 4x4 cluster and share each fetched panel four ways, which removes
- * 75% of the fill transactions and is worth about 5%. What it costs is a second rendezvous: the
+ * 75% of the fill transactions and is worth about 7.2%. What it costs is a second rendezvous: the
  * barrier grows a cluster half alongside the workgroup one, and the launch now has a shape
  * requirement, since a cluster only forms if the grid divides by the cluster dimension.
- * Everything else is `gemm_split_bar`: 256x256 macro tile, BLOCK_K=128 walked in four K_STEP=32
+ * Everything else is `08_gemm_split_bar`: 256x256 macro tile, BLOCK_K=128 walked in four K_STEP=32
  * sub-steps, 4x4 warps, a two-stage TDM-filled LDS ring, the barrier in its split form, and a
  * direct column-major epilogue. Uses only:
  *   - `kittens::tdm::load_async`         : descriptor-driven global -> LDS tile DMA, with multicast.
@@ -188,7 +188,7 @@ void gemm_wgc_multicast_kernel(const gemm_globals g, int M, int N, int K)
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     /* C is stored straight out of registers, so the LDS request is the operand ring alone.
      * At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
@@ -201,42 +201,30 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_wgc_multicast: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "09_gemm_wgc_multicast: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_wgc_multicast");
+    gfx1250_gemm::require_k_blocks(g.K(), "09_gemm_wgc_multicast");
 
     hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_wgc_multicast_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
 
-    const dim3 grid = g.grid();
+    const dim3 grid = launch.grid;
 
     /* Refuse rather than launch without a cluster. The multicast masks name peers by cluster
      * position, so without the cluster they name workgroups that are not co-scheduled. */
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
-        printf("!! gemm_wgc_multicast: a %dx%d cluster needs grid.x and grid.y both divisible "
+        printf("!! 09_gemm_wgc_multicast: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
         return;
     }
 
-    hipLaunchConfig_t cfg = {};
-    cfg.gridDim          = grid;
-    cfg.blockDim         = g.block();
-    cfg.dynamicSmemBytes = mem_size;
-    cfg.stream           = g.stream;
-
-    hipLaunchAttribute attrs[1];
-    attrs[0].id               = hipLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = CLUSTER_DIM;
-    attrs[0].val.clusterDim.y = CLUSTER_DIM;
-    attrs[0].val.clusterDim.z = 1;
-    cfg.attrs    = attrs;
-    cfg.numAttrs = 1;
-
-    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_wgc_multicast_kernel, g, g.M(), g.N(), g.K());
+    hipLaunchKernelGGL(gemm_wgc_multicast_kernel, grid, launch.block, mem_size, launch.stream,
+                       g, g.M(), g.N(), g.K());
+    const hipError_t e = hipGetLastError();
     if (e != hipSuccess)
-        printf("!! gemm_wgc_multicast: cluster launch REJECTED: %s\n", hipGetErrorString(e));
+        printf("!! 09_gemm_wgc_multicast: cluster launch REJECTED: %s\n", hipGetErrorString(e));
 }
 
 #include "harness.h"

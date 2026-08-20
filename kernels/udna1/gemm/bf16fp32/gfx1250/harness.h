@@ -2,7 +2,7 @@
  * @file harness.h
  * @brief Host entry point for the gfx1250 GEMM ladder.
  *
- * Every rung defines `dispatch(gemm_globals)` and includes this at the end of the file. Under
+ * Every rung defines `dispatch(gemm_globals, launch_config)` and includes this at the end of the file. Under
  * `-DHARNESS_PYEXT` that becomes a pybind11 module exporting `dispatch` for correctness checks and
  * `bench` for timing (see `pyext.h`). It is the only entry point a rung has, so every rung is
  * reached from Python: `test.py` is the correctness gate and `gemm_ladder.py` is the benchmark.
@@ -107,10 +107,12 @@ struct hk_timing {
     double spread_pct() const { return 100.0 * (ms_max - ms_min) / ms_per; }
 };
 
-static hk_timing hk_run_protocol(gfx1250_gemm::gemm_globals& g, int measured)
+static hk_timing hk_run_protocol(gfx1250_gemm::gemm_globals& g,
+                                 const gfx1250_gemm::launch_config& launch,
+                                 int measured)
 {
     if (measured <= 0) measured = HK_MEASURED_ITERS;
-    const hipStream_t stream = g.stream;
+    const hipStream_t stream = launch.stream;
 
     int dev = 0;
     HIP_OK(hipGetDevice(&dev));
@@ -120,7 +122,10 @@ static hk_timing hk_run_protocol(gfx1250_gemm::gemm_globals& g, int measured)
     cache_flusher flusher;
     flusher.init(props);
 
-    for (int i = 0; i < HK_WARMUP_ITERS; ++i) { flusher.run(stream); dispatch(g); }
+    for (int i = 0; i < HK_WARMUP_ITERS; ++i) {
+        flusher.run(stream);
+        dispatch(g, launch);
+    }
     HIP_OK(hipDeviceSynchronize());
 
     std::vector<hipEvent_t> ev_beg(measured), ev_end(measured);
@@ -131,7 +136,7 @@ static hk_timing hk_run_protocol(gfx1250_gemm::gemm_globals& g, int measured)
     for (int i = 0; i < measured; ++i) {
         flusher.run(stream);
         HIP_OK(hipEventRecord(ev_beg[i], stream));
-        dispatch(g);
+        dispatch(g, launch);
         HIP_OK(hipEventRecord(ev_end[i], stream));
     }
     HIP_OK(hipEventSynchronize(ev_end[measured - 1]));

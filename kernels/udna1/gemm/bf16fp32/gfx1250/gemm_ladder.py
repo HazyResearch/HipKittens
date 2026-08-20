@@ -12,7 +12,9 @@ same module object in the same process that then gets timed.
 """
 
 import argparse
+import datetime
 import importlib
+import json
 import socket
 import statistics
 import subprocess
@@ -29,9 +31,10 @@ from utils import compare, gemm_reference, init_c, init_uniform
 # Worst to best, and every kernel on disk: the ladder is a single chain in which each rung adds one
 # feature to the rung below, ending at the fastest kernel. So each step in the table below is a
 # paired delta over that rung's own parent.
-LADDER = ["gemm_naive", "gemm_double_buf", "gemm_async", "gemm_128x128", "gemm_256x256",
-          "gemm_deepk", "gemm_segment", "gemm_tdm", "gemm_split_bar", "gemm_wgc_multicast",
-          "gemm_epilogue", "gemm_one_wave"]
+LADDER = ["00_gemm_naive", "01_gemm_double_buf", "02_gemm_async", "03_gemm_128x128",
+          "04_gemm_256x256", "05_gemm_deepk", "06_gemm_segment", "07_gemm_tdm",
+          "08_gemm_split_bar", "09_gemm_wgc_multicast", "10_gemm_epilogue",
+          "11_gemm_one_wave"]
 
 HERE = Path(__file__).resolve().parent
 
@@ -45,7 +48,6 @@ FLUSH_MB = 512
 # 95% two-sided t, by degrees of freedom; 1.96 once n is large enough not to matter.
 T95 = {1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31, 9: 2.26,
        10: 2.23, 12: 2.18, 15: 2.13, 19: 2.09, 20: 2.09, 25: 2.06, 29: 2.05}
-
 
 def build(arms, nullctl):
     """One module per arm, through the Makefile so the flags live in one place."""
@@ -134,6 +136,7 @@ def ci95(xs):
 
 
 def main():
+    started_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("rungs", nargs="*", default=LADDER,
@@ -147,6 +150,8 @@ def main():
                    help="skip the null control, and with it this campaign's resolution floor")
     p.add_argument("--torch", action="store_true",
                    help="time torch.matmul as a baseline arm, rotated alongside the rungs")
+    p.add_argument("--json-out", type=Path,
+                   help="write protocol metadata and every raw round to this JSON file")
     a = p.parse_args()
 
     shape = [int(x) for x in a.shape.split()]
@@ -186,22 +191,28 @@ def main():
     print(f"\n{socket.gethostname()}  {a.shape}  iters={a.iters}  rounds={a.rounds}")
     print(f"correctness: all {len(mods)} arms verified bad=0 against torch.matmul at {a.shape} "
           f"before timing began; the cells below report timing only\n")
-    print(f"{'#':>3}  {'rung':<17} {'TFLOP/s':>9} {'sd':>7} {'n':>3}   adds over the rung below")
+    print(f"{'#':>3}  {'rung':<22} {'TFLOP/s':>9} {'sd':>7} {'n':>3}   adds over the rung below")
     prev = None
-    for i, arm in enumerate(arms, 1):
+    summaries = {}
+    for i, arm in enumerate(arms):
         if not vals[arm]:
-            print(f"{i:>3}  {arm:<17} {'-':>9} {'-':>7} {0:>3}   NO CELLS")
+            print(f"{i:>3}  {arm:<22} {'-':>9} {'-':>7} {0:>3}   NO CELLS")
             prev = arm
             continue
         mean, sd, _, _ = ci95(vals[arm])
         step = ""
+        step_stats = None
         if prev:
             d = [100 * (rounds[r][arm] - rounds[r][prev]) / rounds[r][prev]
                  for r in rounds if arm in rounds[r] and prev in rounds[r]]
             if len(d) > 1:
                 dm, dsd, lo, hi = ci95(d)
                 step = f"{dm:+.2f}% [{lo:+.2f}, {hi:+.2f}] n={len(d)}"
-        print(f"{i:>3}  {arm:<17} {mean:>9.1f} {100 * sd / mean:>6.2f}% {len(vals[arm]):>3}   "
+                step_stats = {"mean_pct": dm, "sd_pct": dsd, "ci95_low_pct": lo,
+                              "ci95_high_pct": hi, "n": len(d)}
+        summaries[arm] = {"mean_tflops": mean, "sd_tflops": sd, "n": len(vals[arm]),
+                          "step_over_parent": step_stats}
+        print(f"{i:>3}  {arm:<22} {mean:>9.1f} {100 * sd / mean:>6.2f}% {len(vals[arm]):>3}   "
               f"{step}")
         prev = arm
 
@@ -211,11 +222,14 @@ def main():
         print(f"\ntorch.matmul baseline: {tm:.1f} TFLOP/s sd {100 * tsd / tm:.2f}% "
               f"n={len(vals[TORCH_ARM])}  ->  {arms[-1]} is {top / tm:.1f}x it")
 
+    null_stats = None
     if not a.no_null and vals["nullctl"]:
         d = [100 * (rounds[r]["nullctl"] - rounds[r][arms[-1]]) / rounds[r][arms[-1]]
              for r in rounds if "nullctl" in rounds[r] and arms[-1] in rounds[r]]
         if len(d) > 1:
             dm, dsd, _, _ = ci95(d)
+            null_stats = {"mean_delta_pct": dm, "sd_pct": dsd, "n": len(d),
+                          "resolution_pct": abs(dm) + 2 * dsd}
             print(f"\nnull control ({arms[-1]} built twice): {dm:+.3f}% sd {dsd:.3f} n={len(d)}"
                   f"  ->  resolution {abs(dm) + 2 * dsd:.2f}%")
 
@@ -223,6 +237,27 @@ def main():
         print(f"\n{len(dropped)} cell(s) dropped:")
         for r, arm, st in dropped:
             print(f"  round {r + 1} {arm}: {st}")
+
+    if a.json_out:
+        payload = {
+            "host": socket.gethostname(),
+            "started_utc": started_utc,
+            "finished_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "shape": {"m": m, "n": n, "k": k},
+            "protocol": {"warmups_per_cell": WARMUP, "measured_iters_per_cell": a.iters,
+                         "rounds": a.rounds, "order_rotation": True,
+                         "cache_flush_mb": FLUSH_MB, "seed": 0,
+                         "correctness_gate": "torch.matmul before timing"},
+            "device": {"gcn_arch": torch.cuda.get_device_properties(0).gcnArchName,
+                       "torch": torch.__version__},
+            "arms": arms,
+            "raw_rounds_tflops": rounds,
+            "summaries": summaries,
+            "null_control": null_stats,
+            "dropped": [{"round": r, "arm": arm, "status": st} for r, arm, st in dropped],
+        }
+        a.json_out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        print(f"\nwrote raw results: {a.json_out}")
 
 
 if __name__ == "__main__":
