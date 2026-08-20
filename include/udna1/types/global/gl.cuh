@@ -12,17 +12,6 @@
 
 namespace kittens {
 
-/* ----------   Associative dictionary for global layouts  ---------- */
-
-namespace detail {
-template<typename... Args>
-struct descriptor_dict {
-    __host__ descriptor_dict() {}
-    template<typename T> __host__ descriptor_dict(T _, int b, int d, int r, int c) {}
-    __host__ __device__ descriptor_dict(const descriptor_dict &other) {}
-};
-}
-
 /* ----------  Global layout descriptor  ---------- */
 
 namespace ducks {
@@ -32,13 +21,10 @@ struct identifier {};
 }
 
 template<typename _T, int b, int d, int r, int c,
-         ducks::gl_layout::all _Layout = ducks::gl_layout::row_major, typename... TMA_Types>
+         ducks::gl_layout::all _Layout = ducks::gl_layout::row_major>
 struct gl {
     using identifier = ducks::gl::identifier;
 
-    /* Layout sits BEFORE the TMA pack because a variadic pack must come last. That is safe
-     * here: no source in this tree passes TMA types to `gl` (the only two forms in use are
-     * `gl<T,-1,-1,-1,-1>`), so no existing declaration binds a TMA type to this slot. */
     using layout = _Layout; ///< Memory layout of the descriptor.
 
     using T     = base_types::packing<_T>::unpacked_type;
@@ -63,18 +49,14 @@ struct gl {
     template <int C=__c__> __device__ __host__ static constexpr std::enable_if_t<(C > 0), int> cols() { return C; }
     template <int C=__c__> __device__ __host__ std::enable_if_t<(C == -1), int> cols() const { return cols_internal; }
 
-    detail::descriptor_dict<TMA_Types...> tma_descs;
-
     __host__ inline gl(T *_data,
                         ducks::gl::make_arg_t<b> _batch,
                         ducks::gl::make_arg_t<d> _depth,
                         ducks::gl::make_arg_t<r> _rows,
                         ducks::gl::make_arg_t<c> _cols) :
-            raw_ptr(_data), batch_internal(_batch), depth_internal(_depth), rows_internal(_rows), cols_internal(_cols) {
-        tma_descs = detail::descriptor_dict<TMA_Types...>(raw_ptr, batch_internal, depth_internal, rows_internal, cols_internal);
-    }
+            raw_ptr(_data), batch_internal(_batch), depth_internal(_depth), rows_internal(_rows), cols_internal(_cols) {}
     __host__ __device__ inline gl(const gl &other) :
-            raw_ptr(other.raw_ptr), batch_internal(other.batch_internal), depth_internal(other.depth_internal), rows_internal(other.rows_internal), cols_internal(other.cols_internal), tma_descs(other.tma_descs) {}
+            raw_ptr(other.raw_ptr), batch_internal(other.batch_internal), depth_internal(other.depth_internal), rows_internal(other.rows_internal), cols_internal(other.cols_internal) {}
     __device__ inline T& operator[](const coord<ducks::default_type> &idx) const {
         return raw_ptr[this->idx(idx)];
     }
