@@ -12,12 +12,13 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda:0"
 
 # Every kernel on disk, worst to best, which is also the chain `gemm_ladder.py` walks.
-RUNGS = ["gemm_naive", "gemm_double_buf", "gemm_async", "gemm_128x128", "gemm_256x256",
-         "gemm_deepk", "gemm_segment", "gemm_tdm", "gemm_split_bar", "gemm_wgc_multicast",
-         "gemm_epilogue", "gemm_one_wave"]
+RUNGS = ["00_gemm_naive", "01_gemm_double_buf", "02_gemm_async", "03_gemm_128x128",
+         "04_gemm_256x256", "05_gemm_deepk", "06_gemm_segment", "07_gemm_tdm",
+         "08_gemm_split_bar", "09_gemm_wgc_multicast", "10_gemm_epilogue",
+         "11_gemm_one_wave"]
 
-# Legal for all thirteen rungs at once, so a failure is about the rung and not the shape. The
-# binding constraint is the four cluster rungs: they launch a 4x4 cluster over a grid of
+# Legal for all twelve rungs at once, so a failure is about the rung and not the shape. The
+# binding constraint is the three cluster rungs: they launch a 4x4 cluster over a grid of
 # (M/256, N/256) workgroups and refuse a grid that is not a multiple of 4 in both axes, which makes
 # M and N multiples of 1024. K must be a multiple of the deepest BLOCK_K, 128. At least one shape
 # has to be non-square, because a layout error in C is invisible at M == N -- a transposed output

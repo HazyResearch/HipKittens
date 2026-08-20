@@ -1,6 +1,6 @@
 /**
- * @file gemm_one_wave.cpp
- * @brief Rung 12 -- gemm_epilogue (rung 11) dropped to one wave per SIMD, with the software-
+ * @file 11_gemm_one_wave.cpp
+ * @brief Rung 11 -- 10_gemm_epilogue dropped to one wave per SIMD, with the software-
  *        pipelined operand feed on a pinned schedule that the drop requires.
  *
  * Kernel Specification
@@ -17,11 +17,11 @@
  *   pipeline    R = 3 register operand ring; 2 sub-steps primed ahead of the first matrix op
  *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
- * Rungs 1 to 11 run four waves per SIMD. This one runs 2x2 warps, 128 threads, one wave. A lane's
+ * Rungs 00 to 10 run four waves per SIMD. This one runs 2x2 warps, 128 threads, one wave. A lane's
  * register budget is 131072 divided by the thread count, so taking threads from 512 to 128 takes a
  * lane from 256 registers to 1024.
  *
- * Those registers hold a 128x128 warp tile in place of rung 11's 64x64. The accumulator alone is
+ * Those registers hold a 128x128 warp tile in place of rung 10's 64x64. The accumulator alone is
  * 512 of the 1024, where 64x64 needs 128 of 256, so the wider tile only fits at this occupancy. It
  * also makes operands cheaper: a warp's LDS reads scale with its tile's perimeter and its matrix
  * ops with the area, so doubling both sides doubles the reads and quadruples the math. Each read
@@ -43,7 +43,7 @@
  * different 64 KB segments and the two reads do not contend. That is free at four waves, where a
  * barrier already separates them, and load-bearing here where they are adjacent.
  *
- * Uses only what rung 11 uses, plus a `kittens::sched::compiler_fence` around each sub-step's
+ * Uses only what rung 10 uses, plus a `kittens::sched::compiler_fence` around each sub-step's
  * matrix op.
  */
 
@@ -77,7 +77,7 @@ static_assert(NUM_WARPS == 4, "the one-wave-per-SIMD point: 4 warps, 128 threads
 using A_deep = st_e<BLOCK_M, BLOCK_K>;
 using B_deep = st_e<BLOCK_N, BLOCK_K>;
 
-/* Column-major C staging tile, as rung 11 introduced it. Here it is not a
+/* Column-major C staging tile, as rung 10 introduced it. Here it is not a
  * choice at all -- see the epilogue comment. */
 using C_col = kittens::st<elem_t, BLOCK_M, BLOCK_N,
                           kittens::ducks::st_shape::st_16x32_padded<128, 8>,
@@ -124,7 +124,7 @@ void gemm_one_wave_kernel(const gemm_globals g, int M, int N, int K)
                          + ds_loads_per_subblock<WARP_N>();
     static_assert(DS_SUB < 64, "the partial LDS wait must fit the 6-bit dscnt field");
 
-    /* Multicast delivery masks, as rung 10 sets them: a workgroup's id within the cluster is
+    /* Multicast delivery masks, as rung 09 sets them: a workgroup's id within the cluster is
      * cx + 4*cy, so the four sharing its A panel have the same cx and the four sharing its B panel
      * the same cy. A wrong ordering is a wrong answer. */
     const uint32_t cx = blockIdx.x & 3u;
@@ -190,7 +190,7 @@ void gemm_one_wave_kernel(const gemm_globals g, int M, int N, int K)
         }
 
         /* Stage handoff, in order: drain LDS, drain TDM, signal both barriers, the last matrix op,
-         * then wait on both. This is rung 9's split form. */
+         * then wait on both. This is rung 08's split form. */
         constexpr int c_last = (KS - 1) % R;
         kittens::sync::wait_ds<0>();               // wait for data (LDS): done reading this stage
         kittens::sync::wait_tdm<S - 2>();          // wait for data (TDM): the next stage has landed
@@ -226,7 +226,7 @@ void gemm_one_wave_kernel(const gemm_globals g, int M, int N, int K)
     kittens::store<NUM_THREADS>(g.c, c_st, {0, 0, tile_m, tile_n});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     /* The C staging tile reuses the operand rings, so the request is the larger of the two, not the
      * sum. At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
@@ -238,42 +238,30 @@ void dispatch(gemm_globals g)
      * leading dimension is a multiple of 8. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_one_wave: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "11_gemm_one_wave: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_one_wave");
+    gfx1250_gemm::require_k_blocks(g.K(), "11_gemm_one_wave");
 
     hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_one_wave_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
 
-    const dim3 grid = g.grid();
+    const dim3 grid = launch.grid;
 
     /* Refuse rather than launch without a cluster. The multicast masks name peers by cluster
      * position, so without the cluster they name workgroups that are not co-scheduled. */
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
-        printf("!! gemm_one_wave: a %dx%d cluster needs grid.x and grid.y both divisible "
+        printf("!! 11_gemm_one_wave: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
         return;
     }
 
-    hipLaunchConfig_t cfg = {};
-    cfg.gridDim          = grid;
-    cfg.blockDim         = g.block();
-    cfg.dynamicSmemBytes = mem_size;
-    cfg.stream           = g.stream;
-
-    hipLaunchAttribute attrs[1];
-    attrs[0].id               = hipLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = CLUSTER_DIM;
-    attrs[0].val.clusterDim.y = CLUSTER_DIM;
-    attrs[0].val.clusterDim.z = 1;
-    cfg.attrs    = attrs;
-    cfg.numAttrs = 1;
-
-    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_one_wave_kernel, g, g.M(), g.N(), g.K());
+    hipLaunchKernelGGL(gemm_one_wave_kernel, grid, launch.block, mem_size, launch.stream,
+                       g, g.M(), g.N(), g.K());
+    const hipError_t e = hipGetLastError();
     if (e != hipSuccess)
-        printf("!! gemm_one_wave: cluster launch REJECTED: %s\n", hipGetErrorString(e));
+        printf("!! 11_gemm_one_wave: cluster launch REJECTED: %s\n", hipGetErrorString(e));
 }
 
 #include "harness.h"

@@ -1,22 +1,26 @@
 /**
- * @file gemm_128x128.cpp
- * @brief Rung 4 -- gemm_async with the macro tile doubled to 128x128.
+ * @file 04_gemm_256x256.cpp
+ * @brief Rung 04 -- 03_gemm_128x128 with the macro tile doubled again, to 256x256.
  *
  * Kernel Specification
- *   tile        128x128 macro, 32x32 per warp, 4x4 warps; BLOCK_K 32 = 1 x K_STEP 32
- *   occupancy   16 warps / 512 threads / 4 waves per SIMD; 2 workgroups per CU, register-bound
- *   registers   94 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 26 SGPR
+ *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 32 = 1 x K_STEP 32
+ *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
+ *   registers   220 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator
+ *               (WARP_M*WARP_N/32), 26 SGPR
  *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
- *   LDS         2 stages x 17 KB = 34 KB of 320 KB (10.6%)
+ *   LDS         2 stages x 34 KB = 68 KB of 320 KB (21.3%)
  *   sync        per K-block: 1 barrier (split), 1 LDS drain, 1 async drain
- *   intensity   64 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
+ *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
- * Arithmetic intensity for a square bf16 tile is M*N/(M+N) FLOP per byte, so it rises from 32 to
- * 64 across this step and the operand traffic per output element halves. That is worth about
- * 1.8x, the largest step on the ladder. The warp grid has to double with the tile, 2x2 -> 4x4, to
- * hold the warp tile at 32x32: a 2x2 grid on a 128x128 tile gives each warp four times the
- * accumulator and spills. Same BLOCK_K=32, two async-filled stages interleaved in one LDS
- * segment, plain split barrier, direct column-major epilogue. Uses only:
+ * Arithmetic intensity rises from 64 to 128 FLOP per byte, and each warp's output tile goes from
+ * 32x32 to 64x64, worth about 1.25x. This is the largest tile the register file allows at four
+ * waves per SIMD: the accumulator alone is 128 VGPRs of the 256 a lane gets there, and the kernel
+ * totals 220. Doubling the warp tile again needs 512 accumulator VGPRs, which fits only by dropping
+ * to one wave per SIMD for a 1024-VGPR budget. So the ladder stops growing the tile here and starts
+ * deepening it instead. Same BLOCK_K=32, 4x4 warps, two async-filled
+ * stages in one LDS segment, plain split barrier, direct column-major epilogue. A stage still
+ * covers exactly one matrix sub-step, so what overlaps here is the cross-K-block prefetch, one
+ * stage ahead. Uses only:
  *   - `kittens::load`       : cooperative `global_load_async_to_lds_b128` fill.
  *   - `kittens::sync::wait_async` : drain the async fill.
  *   - `kittens::sync::arrive/wait`: split workgroup barrier (-1).
@@ -29,8 +33,8 @@
 
 #include "kittens.cuh"
 
-constexpr int BLOCK_M     = 128;
-constexpr int BLOCK_N     = 128;
+constexpr int BLOCK_M     = 256;
+constexpr int BLOCK_N     = 256;
 constexpr int BLOCK_K     = 32;
 constexpr int K_STEP      = 32;
 constexpr int WARPS_M     = 4;
@@ -54,7 +58,7 @@ static_assert(sizeof(ab_pair) == sizeof(A_tile) + sizeof(B_tile),
               "an interleaved pair must not introduce padding");
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
-void gemm_128x128_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_256x256_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -124,11 +128,11 @@ void gemm_128x128_kernel(const gemm_globals g, int M, int N, int K)
     kittens::sync::wait_async<0>();      // wait for data (async copy): no fill outlives the workgroup
     kittens::sync::wait_ds<0>();         // wait for data (LDS): nor any read of the ring
 
-    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    // Direct store: warp accumulator to bf16 in global C; rung 00 has the transaction-size cost.
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     // The C staging tile reuses the ring, so the request is the larger of the two, not the sum.
     const size_t load_lds  = S * sizeof(ab_pair);
@@ -140,15 +144,16 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_128x128: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "04_gemm_256x256: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_128x128");
+    gfx1250_gemm::require_k_blocks(g.K(), "04_gemm_256x256");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_128x128_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_256x256_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
-    gemm_128x128_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
+    gemm_256x256_kernel<<<launch.grid, launch.block, mem_size, launch.stream>>>(
+        g, g.M(), g.N(), g.K());
 }
 
 #include "harness.h"

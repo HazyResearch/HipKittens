@@ -1,26 +1,23 @@
 /**
- * @file gemm_256x256.cpp
- * @brief Rung 5 -- gemm_128x128 with the macro tile doubled again, to 256x256.
+ * @file 02_gemm_async.cpp
+ * @brief Rung 02 -- 01_gemm_double_buf plus the cooperative async fill.
  *
  * Kernel Specification
- *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 32 = 1 x K_STEP 32
- *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
- *   registers   220 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator
- *               (WARP_M*WARP_N/32), 26 SGPR
+ *   tile        64x64 macro, 32x32 per warp, 2x2 warps; BLOCK_K 32 = 1 x K_STEP 32
+ *   occupancy   4 warps / 128 threads / 1 wave per SIMD; 10 workgroups per CU, register-bound
+ *   registers   83 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 30 SGPR
  *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
- *   LDS         2 stages x 34 KB = 68 KB of 320 KB (21.3%)
+ *   LDS         2 stages x 8.5 KB = 17 KB of 320 KB (5.3%)
  *   sync        per K-block: 1 barrier (split), 1 LDS drain, 1 async drain
- *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
+ *   intensity   32 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
- * Arithmetic intensity rises from 64 to 128 FLOP per byte, and each warp's output tile goes from
- * 32x32 to 64x64, worth about 1.25x. This is the largest tile the register file allows at four
- * waves per SIMD: the accumulator alone is 128 VGPRs of the 256 a lane gets there, and the kernel
- * totals 220. Doubling the warp tile again needs 512 accumulator VGPRs, which fits only by dropping
- * to one wave per SIMD for a 1024-VGPR budget. So the ladder stops growing the tile here and starts
- * deepening it instead. Same BLOCK_K=32, 4x4 warps, two async-filled
- * stages in one LDS segment, plain split barrier, direct column-major epilogue. A stage still
- * covers exactly one matrix sub-step, so what overlaps here is the cross-K-block prefetch, one
- * stage ahead. Uses only:
+ * `global_load_async_to_lds_b128` lands operands in LDS without staging them through VGPRs, so
+ * the registers and issue slots the register-mediated copy spent go back to the K-loop and the
+ * fill no longer has to lead the operand reads. It is worth about 1.47x, one of the two largest
+ * steps on the ladder. What it costs is a second counter to reason about: the fill retires on the
+ * async counter, the operand reads on the LDS counter, and the stage handoff has to drain both.
+ * Same 64x64 tile, two interleaved stages of a padded 64x32 LDS tile in one segment, plain split
+ * barrier, direct column-major epilogue. Uses only:
  *   - `kittens::load`       : cooperative `global_load_async_to_lds_b128` fill.
  *   - `kittens::sync::wait_async` : drain the async fill.
  *   - `kittens::sync::arrive/wait`: split workgroup barrier (-1).
@@ -33,12 +30,12 @@
 
 #include "kittens.cuh"
 
-constexpr int BLOCK_M     = 256;
-constexpr int BLOCK_N     = 256;
+constexpr int BLOCK_M     = 64;
+constexpr int BLOCK_N     = 64;
 constexpr int BLOCK_K     = 32;
 constexpr int K_STEP      = 32;
-constexpr int WARPS_M     = 4;
-constexpr int WARPS_N     = 4;
+constexpr int WARPS_M     = 2;
+constexpr int WARPS_N     = 2;
 constexpr int WARP_M      = BLOCK_M / WARPS_M;
 constexpr int WARP_N      = BLOCK_N / WARPS_N;
 constexpr int NUM_WARPS   = WARPS_M * WARPS_N;
@@ -58,7 +55,7 @@ static_assert(sizeof(ab_pair) == sizeof(A_tile) + sizeof(B_tile),
               "an interleaved pair must not introduce padding");
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
-void gemm_256x256_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_async_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -103,6 +100,8 @@ void gemm_256x256_kernel(const gemm_globals g, int M, int N, int K)
         const int cur = kb % S, nxt = (kb + 1) % S;
 
         kittens::sched::compiler_fence();
+        // The operand reads lead the fill: an async fill carries its own latency, so
+        // reading first gets the matrix op started sooner.
         kittens::load(A_reg, ring[cur].a, warp_off_a);
         kittens::load(B_reg, ring[cur].b, warp_off_b);
 
@@ -132,7 +131,7 @@ void gemm_256x256_kernel(const gemm_globals g, int M, int N, int K)
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     // The C staging tile reuses the ring, so the request is the larger of the two, not the sum.
     const size_t load_lds  = S * sizeof(ab_pair);
@@ -144,15 +143,16 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_256x256: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "02_gemm_async: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_256x256");
+    gfx1250_gemm::require_k_blocks(g.K(), "02_gemm_async");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_256x256_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_async_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
-    gemm_256x256_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
+    gemm_async_kernel<<<launch.grid, launch.block, mem_size, launch.stream>>>(
+        g, g.M(), g.N(), g.K());
 }
 
 #include "harness.h"

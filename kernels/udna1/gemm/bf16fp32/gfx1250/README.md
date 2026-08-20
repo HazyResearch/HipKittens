@@ -31,12 +31,13 @@ requests.
 
 ## Synchronization
 
-The rungs collectively use ten sync calls, which is a lot to meet at once -- but no rung meets more
-than one new one. Reading upward, `gemm_naive` and `gemm_double_buf` use only the full barrier
-`sync::sync`. `gemm_async` splits it into `arrive`/`wait` and adds `wait_async`, because the fill is
-now a copy engine that has to be waited on separately. `gemm_tdm` swaps that engine, and with it
-`wait_async` for `wait_tdm`. `gemm_wgc_multicast` adds the cluster barrier. `gemm_one_wave` adds no
-new primitive at all -- it only wraps the ones already there in `sched::compiler_fence`.
+The rungs collectively use eleven sync calls, which is a lot to meet at once -- but no rung meets
+more than one new one. Reading upward, `00_gemm_naive` and `01_gemm_double_buf` use the full barrier
+`sync::sync` and `wait_load` for their explicit GL -> RT -> ST path. `02_gemm_async` splits the
+barrier into `arrive`/`wait` and adds `wait_async`, because the fill is now a copy engine that has to
+be waited on separately. `07_gemm_tdm` swaps that engine, and with it `wait_async` for `wait_tdm`.
+`09_gemm_wgc_multicast` adds the cluster barrier. `11_gemm_one_wave` adds no new primitive at all --
+it only wraps the ones already there in `sched::compiler_fence`.
 
 Each call in a kernel is labelled with the job it does and the resource it does it on: `wait for
 data (LDS)`, `wait for data (TDM)`, `wait for everyone (workgroup)`, and so on. The two jobs are
@@ -56,8 +57,8 @@ intensity -- so the per-kernel facts sit next to the code rather than here.
 ```
 make all-kernels                                    # 12 pybind11 modules, no executables
 python3 test.py                                     # every rung, four shapes, against torch.matmul
-./gemm_ladder.py -r 25 -i 100                       # the table above
-./gemm_ladder.py -r 25 -i 100 --torch gemm_tdm gemm_one_wave
+./gemm_ladder.py -r 25 -i 100 --json-out results.json
+./gemm_ladder.py -r 25 -i 100 --torch 07_gemm_tdm 11_gemm_one_wave
 ```
 
 Rungs are positional and default to the whole ladder. Each cell is 500 warmup iterations then 100
@@ -68,10 +69,12 @@ ladder. Set `HIP_VISIBLE_DEVICES` to pick a card.
 
 ## Build
 
-The kernels target `gfx1250`. `gemm_wgc_multicast`, `gemm_epilogue` and `gemm_one_wave` use `__cluster_dims__` and the `hipLaunchAttributeClusterDimension` launch
-attribute; ROCm 7.2.4 and earlier have neither and fail those three with a cascade of errors that
-read as `shared_allocator` problems. Those three need **ROCm 7.15 (clang 23)**; the other nine build
-on ROCm 7.2+. Correctness needs PyTorch with gfx1250 support, which is **torch 2.11.0+rocm7.14.0**.
+The kernels target `gfx1250`. `09_gemm_wgc_multicast`, `10_gemm_epilogue` and
+`11_gemm_one_wave` use static `__cluster_dims__`; ordinary HIP launches pick up their required
+4x4 cluster metadata. ROCm 7.2.4 and earlier lack this support and fail those three with a cascade
+that reads as `shared_allocator` problems. Those three need **ROCm 7.15 (clang 23)**; the other nine
+build on ROCm 7.2+. Correctness needs PyTorch with gfx1250 support, which is
+**torch 2.11.0+rocm7.14.0**.
 
 ```
 pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ \

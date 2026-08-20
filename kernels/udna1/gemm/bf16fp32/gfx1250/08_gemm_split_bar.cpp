@@ -1,33 +1,40 @@
 /**
- * @file gemm_tdm.cpp
- * @brief Rung 8 -- gemm_segment with the fill moved onto the hardware tile-DMA engine.
+ * @file 08_gemm_split_bar.cpp
+ * @brief Rung 08 -- 07_gemm_tdm with the workgroup barrier actually split.
  *
  * Kernel Specification
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
  *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
- *   registers   222 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator
+ *   registers   234 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator
  *               (WARP_M*WARP_N/32), 46 SGPR
  *   spills      none: 0 VGPR, 0 SGPR, 0 scratch
  *   LDS         2 stages x 136 KB = 272 KB of 320 KB (85%)
  *   sync        per K-block: 1 barrier (split), 4 LDS waits (3 partial, 1 full), 1 TDM drain
- *   window      empty: the K-block's last mma_ABt issues before arrive()
+ *   window      the K-block's last mma_ABt issues between arrive() and wait()
  *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
- * `tdm::load_async` is a descriptor-driven global -> LDS copy: one wave posts one descriptor where the
- * async path had every lane issue its own transfer, so the waves stop spending issue slots on
- * the fill entirely. That is worth about 1.39x. It also drags two things along, because the API
- * requires them: the stage becomes one deep 256x128 panel instead of four sub-tiles, and the
- * tail skip becomes a count=0 descriptor, since a TDM cannot be EXEC-masked. The barrier is
- * plain: the K-block's last matrix op issues before the signal, so the signal-to-wait window is
- * empty. Same 256x256 tile, BLOCK_K=128, 4x4 warps, two stages, segment-separated LDS, direct
- * column-major epilogue. Uses only:
+ * Every rung below closes the barrier the instant it opens it -- rungs 00 and 01 through the fused
+ * `sync()`, rungs 02 to 07 by issuing `arrive()` and `wait()` back to back, which is the split API
+ * spent as a fused barrier. Here the two halves are finally pulled apart and the K-block's last
+ * matrix op is issued between them. What makes that legal is that the op reads registers only: a
+ * wave is done with the LDS stage the moment its `ds_load`s drain, which is strictly before it is
+ * done computing, so it can declare itself finished and keep working. A barrier costs skew rather
+ * than instructions -- every wave that arrives early idles until the slowest one shows up -- and
+ * this spends that idle time rather than shortening it. Sixteen `v_wmma` sit in the window, worth
+ * about 4.3%.
+ *
+ * It fails silently. Nothing in the language holds the op inside the window: the compiler will
+ * hoist it above the signal or sink it below the wait, and when it does the answers stay correct,
+ * verification still passes, and the 5% is simply gone. The fences around the matrix op are what
+ * pin it. Same 256x256 tile, BLOCK_K=128, 4x4 warps, two-stage TDM ring, segment-separated LDS,
+ * direct column-major epilogue. Uses only:
  *   - `kittens::tdm::load_async`         : descriptor-driven global -> LDS tile DMA.
  *   - `kittens::sync::wait_tdm`   : drain the tile DMA.
- *   - `kittens::sync::arrive/wait`: split workgroup barrier (-1).
+ *   - `kittens::sync::arrive/wait`: workgroup barrier (-1), in the split form.
  *   - `kittens::sync::wait_ds`    : partial and full LDS-read drains.
  *   - `kittens::load(rt,st,off)`  : shared -> register load (wide `ds_load_b128`).
  *   - `kittens::mma_ABt`          : 16x16x32 WMMA via the bf16 builtin.
- *   - `kittens::sched::compiler_fence` : keep the post-wait loads below the barrier.
+ *   - `kittens::sched::compiler_fence` : hold the matrix op inside the signal-to-wait window.
  *   - `kittens::store(gl,rt,idx)` : direct column-major epilogue.
  */
 
@@ -37,6 +44,9 @@ constexpr int BLOCK_M     = 256;
 constexpr int BLOCK_N     = 256;
 constexpr int BLOCK_K     = 128;
 constexpr int K_STEP      = 32;
+/* Four waves per SIMD is what the register file allows: at eight it cannot hold the
+ * double-buffered operands plus the matrix op held in the window, and the kernel spills. Wave
+ * count is co-designed with the split form rather than free to set on its own. */
 constexpr int WARPS_M     = 4;
 constexpr int WARPS_N     = 4;
 constexpr int WARP_M      = BLOCK_M / WARPS_M;
@@ -57,7 +67,7 @@ using A_deep = st_e<BLOCK_M, BLOCK_K>;
 using B_deep = st_e<BLOCK_N, BLOCK_K>;
 
 __global__ __launch_bounds__(NUM_THREADS, 1)
-void gemm_tdm_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_split_bar_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -94,6 +104,7 @@ void gemm_tdm_kernel(const gemm_globals g, int M, int N, int K)
         if (wid == 1) kittens::tdm::load_async(B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, 0, count);
     };
 
+    // Split into a signal half and a wait half so real work can be placed between them.
     // Prologue: fill the ring ahead of the loop.
     #pragma unroll
     for (int s = 0; s < S - 1; ++s)
@@ -101,7 +112,7 @@ void gemm_tdm_kernel(const gemm_globals g, int M, int N, int K)
 
     kittens::sync::wait_tdm<0>();                     // wait for data (TDM): stage 0 landed
     kittens::sched::compiler_fence();
-    kittens::sync::arrive(); kittens::sync::wait();   // wait for everyone (workgroup): stage 0 ready
+    kittens::sync::arrive(); kittens::sync::wait();   // wait for everyone (workgroup): no work to fill
     kittens::sched::compiler_fence();
 
     // Operands are double-buffered in registers: the matrix unit reads one buffer while the
@@ -124,8 +135,9 @@ void gemm_tdm_kernel(const gemm_globals g, int M, int N, int K)
         const uint32_t cnt = (kb + 1 < k_blocks) ? 1u : 0u;
         issue_fill(nxt, fk, cnt);
 
-        /* Sub-steps 0 .. KS-2. The wait is partial -- it lets DS_SUB loads stay in flight
-         * -- which is sound because the LDS counter retires in order. */
+        /* Sub-steps 0 .. KS-2. The partial wait leaves DS_SUB loads in flight, which is
+         * sound because the LDS counter retires in order. The last sub-step is peeled out
+         * below because it hands the stage over. */
         #pragma unroll
         for (int si = 0; si < KS - 1; ++si) {
             const int c = si & 1, n = 1 - c;
@@ -136,15 +148,19 @@ void gemm_tdm_kernel(const gemm_globals g, int M, int N, int K)
             mma_ABt(C_acc, A_reg[c], B_reg[c], C_acc);
         }
 
-        /* The stage handoff. Both counters drain before the signal: LDS says this wave is
-         * done with the current stage, TDM says the next has landed. The final matrix op
-         * issues below the wait, so nothing covers the rendezvous. */
+        /* The stage handoff, in the split form. Both counters drain first: LDS says this wave
+         * is done with the current stage, TDM says the next has landed. The final matrix op is
+         * then the independent work between signalling and waiting -- independent because it
+         * reads registers only. The fences hold it inside the window; without them it is
+         * hoisted above the signal or sunk below the wait. */
         constexpr int c_last = (KS - 1) & 1;
         kittens::sync::wait_ds<0>();       // wait for data (LDS): done reading the current stage
-        mma_ABt(C_acc, A_reg[c_last], B_reg[c_last], C_acc);
         kittens::sync::wait_tdm<S - 2>();  // wait for data (TDM): the next stage's fill has landed
         kittens::sched::compiler_fence();
         kittens::sync::arrive();           // wait for everyone (workgroup): publish next, protect this
+        kittens::sched::compiler_fence();
+        mma_ABt(C_acc, A_reg[c_last], B_reg[c_last], C_acc);   // 16 v_wmma inside the barrier window
+        kittens::sched::compiler_fence();
         kittens::sync::wait();
         kittens::sched::compiler_fence();
     }
@@ -153,11 +169,11 @@ void gemm_tdm_kernel(const gemm_globals g, int M, int N, int K)
     kittens::sync::wait_tdm<0>();          // wait for data (TDM): no fill outlives the workgroup
     kittens::sync::wait_ds<0>();           // wait for data (LDS): nor any read of the ring
 
-    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    // Direct store: warp accumulator to bf16 in global C; rung 00 has the transaction-size cost.
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     /* The C staging tile reuses the operand rings, so the request is the larger of the two, not
      * the sum. At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
@@ -170,15 +186,16 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_tdm: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "08_gemm_split_bar: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_tdm");
+    gfx1250_gemm::require_k_blocks(g.K(), "08_gemm_split_bar");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_tdm_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_split_bar_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
-    gemm_tdm_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
+    gemm_split_bar_kernel<<<launch.grid, launch.block, mem_size, launch.stream>>>(
+        g, g.M(), g.N(), g.K());
 }
 
 #include "harness.h"
