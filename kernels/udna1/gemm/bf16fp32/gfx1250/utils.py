@@ -15,10 +15,10 @@ DEVICE = "cuda:0"
 RUNGS = ["00_gemm_naive", "01_gemm_double_buf", "02_gemm_async", "03_gemm_128x128",
          "04_gemm_256x256", "05_gemm_deepk", "06_gemm_segment", "07_gemm_tdm",
          "08_gemm_split_bar", "09_gemm_wgc_multicast", "10_gemm_epilogue",
-         "11_gemm_one_wave"]
+         "11_gemm_one_wave", "12_gemm_two_waves"]
 
-# Legal for all twelve rungs at once, so a failure is about the rung and not the shape. The
-# binding constraint is the three cluster rungs: they launch a 4x4 cluster over a grid of
+# Legal for every rung at once, so a failure is about the rung and not the shape. The
+# binding constraint is the six cluster rungs: they launch a 4x4 cluster over a grid of
 # (M/256, N/256) workgroups and refuse a grid that is not a multiple of 4 in both axes, which makes
 # M and N multiples of 1024. K must be a multiple of the deepest BLOCK_K, 128. At least one shape
 # has to be non-square, because a layout error in C is invisible at M == N -- a transposed output
@@ -31,13 +31,11 @@ SHAPES = [
 ]
 
 
-def init_uniform(shape, dtype=DTYPE, device=DEVICE, lo=-1.0, hi=1.0):
-    """U(lo, hi) operands, which is the range `compare`'s tolerance was derived for.
+def init_operand(shape, dtype=DTYPE, device=DEVICE, lo=-3, hi=3):
+    """Integer-valued operands, drawn uniformly from [lo, hi] and cast to `dtype`.
 
-    |C| grows as sqrt(K) * sigma_ab, about 181 at K=8192 for U(-1,1) and comfortably inside bf16.
-    Unit-normal operands are three times wider and would need the tolerance rescaled with them.
     """
-    return torch.empty(shape, dtype=dtype, device=device).uniform_(lo, hi)
+    return torch.randint(lo, hi + 1, shape, dtype=torch.int8, device=device).to(dtype)
 
 
 def init_c(m, n, dtype=DTYPE, device=DEVICE):
