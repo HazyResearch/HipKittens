@@ -1,6 +1,6 @@
 /**
- * @file gemm_epilogue.cpp
- * @brief Rung 11 -- staging C through LDS as a feature of the kernel rather than of the ops, and a
+ * @file 10_gemm_epilogue_nomc.cpp
+ * @brief Rung 10 (A0-safe) -- staging C through LDS as a feature of the kernel rather than of the ops, and a
  *        wave that issues its matrix ops back to back.
  *
  * Kernel Specification
@@ -51,10 +51,10 @@
  * prologue, which is worth about +1.9% for a single scalar register write and no extra register.
  * The reasoning is at the call site.
  *
- * Everything else is `gemm_wgc_multicast` at the shape above: a two-stage TDM-filled LDS ring, the
- * split barrier, and a 4x4 cluster multicasting both operands. Uses only:
+ * Everything else is `gemm_wgc_cluster` at the shape above: a two-stage TDM-filled LDS ring, the
+ * split barrier, and a 4x4 cluster with non-multicast operand loads (A0-safe). Uses only:
  *   - `kittens::sched::lock_simd` : clear the post-matrix-op arbitration stall for this wave.
- *   - `kittens::tdm::load_async`  : descriptor-driven global -> LDS tile DMA, with multicast.
+ *   - `kittens::tdm::load_async`  : descriptor-driven global -> LDS tile DMA, non-multicast, mask 0).
  *   - `kittens::tdm::wait`        : drain the tile DMA.
  *   - `kittens::sync::arrive/wait`: workgroup barrier (-1), in the split form.
  *   - `kittens::cluster::arrive/wait` : cluster barrier (-3), likewise split.
@@ -128,7 +128,7 @@ static_assert(sizeof(C_col) <= sizeof(C_tile),
 __global__
 __cluster_dims__(CLUSTER_DIM, CLUSTER_DIM, 1)
 __launch_bounds__(NUM_THREADS, 1)
-void gemm_epilogue_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_epilogue_nomc_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -171,14 +171,10 @@ void gemm_epilogue_kernel(const gemm_globals g, int M, int N, int K)
     constexpr int DS_SUB = ds_loads_per_subblock<WARP_M>()
                          + ds_loads_per_subblock<WARP_N>();
 
-    const uint32_t cx = blockIdx.x & 3u;
-    const uint32_t cy = blockIdx.y & 3u;
-    const uint32_t a_mask = 0x1111u << cx;
-    const uint32_t b_mask = 0xFu << (4u * cy);
 
     auto issue_fill = [&](int slot, int kblock, uint32_t count = 1) {
-        if (wid == 0) kittens::tdm::load_async(A_st[slot], g.a, {0, 0, tile_m, kblock}, M, K, K, a_mask, count);
-        if (wid == 1) kittens::tdm::load_async(B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, b_mask, count);
+        if (wid == 0) kittens::tdm::load_async(A_st[slot], g.a, {0, 0, tile_m, kblock}, M, K, K, 0, count);
+        if (wid == 1) kittens::tdm::load_async(B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, 0, count);
     };
 
     // Prologue: fill the ring ahead of the loop.
@@ -259,7 +255,7 @@ void gemm_epilogue_kernel(const gemm_globals g, int M, int N, int K)
 #endif
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     const size_t load_lds  = S * (sizeof(A_deep) + sizeof(B_deep));
     const size_t store_lds = sizeof(C_col);
@@ -269,40 +265,28 @@ void dispatch(gemm_globals g)
      * the leading dimension is a multiple of 8. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_epilogue: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "10_gemm_epilogue_nomc: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_epilogue");
+    gfx1250_gemm::require_k_blocks(g.K(), "10_gemm_epilogue_nomc");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_epilogue_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_epilogue_nomc_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
 
-    const dim3 grid = g.grid();
+    const dim3 grid = launch.grid;
 
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
-        printf("!! gemm_epilogue: a %dx%d cluster needs grid.x and grid.y both divisible "
+        printf("!! 10_gemm_epilogue_nomc: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
         return;
     }
 
-    hipLaunchConfig_t cfg = {};
-    cfg.gridDim          = grid;
-    cfg.blockDim         = g.block();
-    cfg.dynamicSmemBytes = mem_size;
-    cfg.stream           = g.stream;
-
-    hipLaunchAttribute attrs[1];
-    attrs[0].id               = hipLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = CLUSTER_DIM;
-    attrs[0].val.clusterDim.y = CLUSTER_DIM;
-    attrs[0].val.clusterDim.z = 1;
-    cfg.attrs    = attrs;
-    cfg.numAttrs = 1;
-
-    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_epilogue_kernel, g, g.M(), g.N(), g.K());
+    hipLaunchKernelGGL(gemm_epilogue_nomc_kernel, grid, launch.block, mem_size, launch.stream,
+                       g, g.M(), g.N(), g.K());
+    const hipError_t e = hipGetLastError();
     if (e != hipSuccess)
-        printf("!! gemm_epilogue: cluster launch REJECTED: %s\n", hipGetErrorString(e));
+        printf("!! 10_gemm_epilogue_nomc: cluster launch REJECTED: %s\n", hipGetErrorString(e));
 }
 
 #include "harness.h"

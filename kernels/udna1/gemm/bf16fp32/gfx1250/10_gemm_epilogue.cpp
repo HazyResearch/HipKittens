@@ -1,9 +1,10 @@
 /**
- * @file gemm_epilogue_nomc.cpp
- * @brief Rung 11 (A0-safe) -- staging C through LDS as a feature of the kernel rather than of the ops, and a
- *        wave that issues its matrix ops back to back.
+ * @file 10_gemm_epilogue.cpp
+ * @brief Rung 10 -- 09_gemm_wgc_multicast plus an LDS-staged C epilogue and a wave that issues
+ *        its matrix ops back to back.
  *
  * Kernel Specification
+ *   layout      TN -- a is [M, K], b is [N, K], both K-contiguous; c is [M, N] column-major
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
  *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
  *   cluster     4x4 workgroup cluster (CLUSTER_DIM 4); grid.x and grid.y must both be divisible by 4
@@ -17,14 +18,14 @@
  *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
  * The rungs below store C straight out of registers with `store(gl, rt, idx)`. This rung stages it
- * through LDS first, worth **+5.43%** over `gemm_wgc_multicast`, the kernel it derives from, against a
- * 0.91% floor -- a ratio of absolutes rather than a paired step. Both paths are contiguous per lane --
- * a col-layout accumulator into a column-major C always is -- so what staging buys is two other
- * things. It doubles the run, because a lane's direct store is stuck with the accumulator's 4-element
- * share (`buffer_store_b64`) while the staged stream assigns 8 elements per thread
- * (`global_store_b128`). And a warp's 32 lanes sit on 16 different columns, which in a column-major C
- * are a leading dimension apart, so the direct store lands as scattered per-column transactions;
- * letting four warps' rows meet in LDS turns those into one long stream.
+ * through LDS and also locks SIMD arbitration; together the fresh full-ladder step is **+7.32%
+ * [+7.20, +7.43] n=25** over `09_gemm_wgc_multicast`, above the campaign's 0.61% resolution floor.
+ * Both paths are contiguous per lane -- a col-layout accumulator into a column-major C always is --
+ * so what staging buys is two other things. It doubles the run, because a lane's direct store is
+ * stuck with the accumulator's 4-element share (`buffer_store_b64`) while the staged stream assigns
+ * 8 elements per thread (`global_store_b128`). And a warp's 32 lanes sit on 16 different columns,
+ * which in a column-major C are a leading dimension apart, so the direct store lands as scattered
+ * per-column transactions; letting four warps' rows meet in LDS turns those into one long stream.
  *
  * The kernel owns the drain-stage-drain-stream sequence itself rather than calling into an op that
  * hides the barriers: `store(st, rt)` decides the transpose from the two tiles' layouts with no global
@@ -33,10 +34,10 @@
  * one `ds_store_b128` per eight values -- the wide path, selected by the types rather than by an
  * overload on the global descriptor.
  *
- * The +5.43% is entirely rung 10 giving this up rather than this rung gaining anything. In a
- * same-session A/B, rung 10 reads 2468.7 TFLOP/s with a staged epilogue and 2349.2 with the direct
+ * A controlled same-session ablation attributes +5.43% to staging: rung 09 reads 2468.7 TFLOP/s
+ * with a staged epilogue and 2349.2 with the direct
  * store, while this kernel reads 2475.4 and 2472.1 across the same pair -- unchanged, as it must be,
- * since only rung 10 differs between the two arms. With both arms staging, the step is +0.27%.
+ * since only rung 09 differs between the two arms. With both arms staging, the step is +0.27%.
  *
  * The stream out is the plain `store(gl, st)`, by measurement rather than by default. `tdm::store_async`
  * works and this kernel can use it -- build with `-DE_TDM=1 -DE_PAD=256` -- and it does exactly what it
@@ -51,10 +52,10 @@
  * prologue, which is worth about +1.9% for a single scalar register write and no extra register.
  * The reasoning is at the call site.
  *
- * Everything else is `gemm_wgc_cluster` at the shape above: a two-stage TDM-filled LDS ring, the
- * split barrier, and a 4x4 cluster with non-multicast operand loads (A0-safe). Uses only:
+ * Everything else is `09_gemm_wgc_multicast` at the shape above: a two-stage TDM-filled LDS ring, the
+ * split barrier, and a 4x4 cluster multicasting both operands. Uses only:
  *   - `kittens::sched::lock_simd` : clear the post-matrix-op arbitration stall for this wave.
- *   - `kittens::tdm::load_async`  : descriptor-driven global -> LDS tile DMA, non-multicast, mask 0).
+ *   - `kittens::tdm::load_async`  : descriptor-driven global -> LDS tile DMA, with multicast.
  *   - `kittens::tdm::wait`        : drain the tile DMA.
  *   - `kittens::sync::arrive/wait`: workgroup barrier (-1), in the split form.
  *   - `kittens::cluster::arrive/wait` : cluster barrier (-3), likewise split.
@@ -128,7 +129,7 @@ static_assert(sizeof(C_col) <= sizeof(C_tile),
 __global__
 __cluster_dims__(CLUSTER_DIM, CLUSTER_DIM, 1)
 __launch_bounds__(NUM_THREADS, 1)
-void gemm_epilogue_nomc_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_epilogue_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -171,10 +172,14 @@ void gemm_epilogue_nomc_kernel(const gemm_globals g, int M, int N, int K)
     constexpr int DS_SUB = ds_loads_per_subblock<WARP_M>()
                          + ds_loads_per_subblock<WARP_N>();
 
+    const uint32_t cx = blockIdx.x & 3u;
+    const uint32_t cy = blockIdx.y & 3u;
+    const uint32_t a_mask = 0x1111u << cx;
+    const uint32_t b_mask = 0xFu << (4u * cy);
 
     auto issue_fill = [&](int slot, int kblock, uint32_t count = 1) {
-        if (wid == 0) kittens::tdm::load_async(A_st[slot], g.a, {0, 0, tile_m, kblock}, M, K, K, 0, count);
-        if (wid == 1) kittens::tdm::load_async(B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, 0, count);
+        if (wid == 0) kittens::tdm::load_async(A_st[slot], g.a, {0, 0, tile_m, kblock}, M, K, K, a_mask, count);
+        if (wid == 1) kittens::tdm::load_async(B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, b_mask, count);
     };
 
     // Prologue: fill the ring ahead of the loop.
@@ -255,7 +260,7 @@ void gemm_epilogue_nomc_kernel(const gemm_globals g, int M, int N, int K)
 #endif
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     const size_t load_lds  = S * (sizeof(A_deep) + sizeof(B_deep));
     const size_t store_lds = sizeof(C_col);
@@ -265,40 +270,28 @@ void dispatch(gemm_globals g)
      * the leading dimension is a multiple of 8. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_epilogue_nomc: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "10_gemm_epilogue: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_epilogue_nomc");
+    gfx1250_gemm::require_k_blocks(g.K(), "10_gemm_epilogue");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_epilogue_nomc_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_epilogue_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
 
-    const dim3 grid = g.grid();
+    const dim3 grid = launch.grid;
 
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
-        printf("!! gemm_epilogue_nomc: a %dx%d cluster needs grid.x and grid.y both divisible "
+        printf("!! 10_gemm_epilogue: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
         return;
     }
 
-    hipLaunchConfig_t cfg = {};
-    cfg.gridDim          = grid;
-    cfg.blockDim         = g.block();
-    cfg.dynamicSmemBytes = mem_size;
-    cfg.stream           = g.stream;
-
-    hipLaunchAttribute attrs[1];
-    attrs[0].id               = hipLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = CLUSTER_DIM;
-    attrs[0].val.clusterDim.y = CLUSTER_DIM;
-    attrs[0].val.clusterDim.z = 1;
-    cfg.attrs    = attrs;
-    cfg.numAttrs = 1;
-
-    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_epilogue_nomc_kernel, g, g.M(), g.N(), g.K());
+    hipLaunchKernelGGL(gemm_epilogue_kernel, grid, launch.block, mem_size, launch.stream,
+                       g, g.M(), g.N(), g.K());
+    const hipError_t e = hipGetLastError();
     if (e != hipSuccess)
-        printf("!! gemm_epilogue_nomc: cluster launch REJECTED: %s\n", hipGetErrorString(e));
+        printf("!! 10_gemm_epilogue: cluster launch REJECTED: %s\n", hipGetErrorString(e));
 }
 
 #include "harness.h"

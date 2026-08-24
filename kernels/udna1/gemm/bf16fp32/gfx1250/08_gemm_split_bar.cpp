@@ -1,8 +1,9 @@
 /**
- * @file gemm_split_bar.cpp
- * @brief Rung 9 -- gemm_tdm with the workgroup barrier actually split.
+ * @file 08_gemm_split_bar.cpp
+ * @brief Rung 08 -- 07_gemm_tdm with the workgroup barrier actually split.
  *
  * Kernel Specification
+ *   layout      TN -- a is [M, K], b is [N, K], both K-contiguous; c is [M, N] column-major
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
  *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
  *   registers   234 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator
@@ -13,15 +14,15 @@
  *   window      the K-block's last mma_ABt issues between arrive() and wait()
  *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
- * Every rung below closes the barrier the instant it opens it -- rungs 1 and 2 through the fused
- * `sync()`, rungs 3 to 8 by issuing `arrive()` and `wait()` back to back, which is the split API
+ * Every rung below closes the barrier the instant it opens it -- rungs 00 and 01 through the fused
+ * `sync()`, rungs 02 to 07 by issuing `arrive()` and `wait()` back to back, which is the split API
  * spent as a fused barrier. Here the two halves are finally pulled apart and the K-block's last
  * matrix op is issued between them. What makes that legal is that the op reads registers only: a
  * wave is done with the LDS stage the moment its `ds_load`s drain, which is strictly before it is
  * done computing, so it can declare itself finished and keep working. A barrier costs skew rather
  * than instructions -- every wave that arrives early idles until the slowest one shows up -- and
  * this spends that idle time rather than shortening it. Sixteen `v_wmma` sit in the window, worth
- * about 5%.
+ * about 4.3%.
  *
  * It fails silently. Nothing in the language holds the op inside the window: the compiler will
  * hoist it above the signal or sink it below the wait, and when it does the answers stay correct,
@@ -169,11 +170,11 @@ void gemm_split_bar_kernel(const gemm_globals g, int M, int N, int K)
     kittens::sync::wait_tdm<0>();          // wait for data (TDM): no fill outlives the workgroup
     kittens::sync::wait_ds<0>();           // wait for data (LDS): nor any read of the ring
 
-    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    // Direct store: warp accumulator to bf16 in global C; rung 00 has the transaction-size cost.
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     /* The C staging tile reuses the operand rings, so the request is the larger of the two, not
      * the sum. At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
@@ -186,15 +187,16 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_split_bar: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "08_gemm_split_bar: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_split_bar");
+    gfx1250_gemm::require_k_blocks(g.K(), "08_gemm_split_bar");
 
     hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_split_bar_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
-    gemm_split_bar_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
+    gemm_split_bar_kernel<<<launch.grid, launch.block, mem_size, launch.stream>>>(
+        g, g.M(), g.N(), g.K());
 }
 
 #include "harness.h"

@@ -15,22 +15,25 @@ rather than silently transposed. They are written against
 
 ## gfx1250 A0 (MI450) multicast limitation
 
-**Multicast TDM loads are not supported on gfx1250 A0 silicon.** The original rungs 10–12
-(`gemm_wgc_multicast`, `gemm_epilogue`, `gemm_one_wave`) use multicast operand fills inside a
-4×4 workgroup cluster and **must not be run on A0** — they wedge the GPU.
+**Multicast TDM loads are not supported on gfx1250 A0 silicon.** The multicast rungs 09–12
+(`09_gemm_wgc_multicast`, `10_gemm_epilogue`, `11_gemm_one_wave`, `12_gemm_two_waves`) use
+multicast operand fills inside a 4×4 workgroup cluster and **must not be run on A0** — they wedge
+the GPU.
 
-The A0-safe ladder path forks at rung 9 (`gemm_split_bar`) into three non-multicast cluster
+The A0-safe ladder path forks at rung 08 (`08_gemm_split_bar`) into four non-multicast cluster
 rungs that keep cluster barriers and launch attributes but use per-workgroup `tdm::load_async`
-with mask 0 (same fills as rung 9):
+with mask 0 (same fills as rung 08):
 
 | Rung | Kernel | Adds over previous |
 |------|--------|-------------------|
-| 10 | `gemm_wgc_cluster` | 4×4 cluster + split cluster/workgroup barriers (no multicast) |
-| 11 | `gemm_epilogue_nomc` | Staged C through LDS, `lock_simd` |
-| 12 | `gemm_one_wave_nomc` | 1 wave/SIMD, 128×128 warp tile, pipelined operand ring |
+| 09 | `09_gemm_wgc_cluster` | 4×4 cluster + split cluster/workgroup barriers (no multicast) |
+| 10 | `10_gemm_epilogue_nomc` | Staged C through LDS, `lock_simd` |
+| 11 | `11_gemm_one_wave_nomc` | 1 wave/SIMD, 128×128 warp tile, pipelined operand ring |
+| 12 | `12_gemm_two_waves_nomc` | 2 waves/SIMD, 64×128 warp tile, interleaved schedule |
 
-The `_nomc` suffix marks the A0-safe non-multicast variants of `gemm_epilogue` and `gemm_one_wave`
-(the multicast modules keep the bare names for A1+ silicon).
+The `_nomc` suffix marks the A0-safe non-multicast variants of `10_gemm_epilogue`,
+`11_gemm_one_wave`, and `12_gemm_two_waves` (the multicast modules keep the bare names for A1+
+silicon). Rung 09 keeps `cluster` in the name to parallel `09_gemm_wgc_multicast`.
 
 The multicast rungs remain in the tree for future A1+ silicon where multicast is supported.
 
@@ -53,12 +56,14 @@ requests.
 
 ## Synchronization
 
-The rungs collectively use ten sync calls, which is a lot to meet at once -- but no rung meets more
-than one new one. Reading upward, `gemm_naive` and `gemm_double_buf` use only the full barrier
-`sync::sync`. `gemm_async` splits it into `arrive`/`wait` and adds `wait_async`, because the fill is
-now a copy engine that has to be waited on separately. `gemm_tdm` swaps that engine, and with it
-`wait_async` for `wait_tdm`. `gemm_wgc_cluster` (A0-safe) and `gemm_wgc_multicast` (A1+ multicast) add the cluster barrier. `gemm_one_wave` adds no
-new primitive at all -- it only wraps the ones already there in `sched::compiler_fence`.
+The rungs collectively use eleven sync calls, which is a lot to meet at once -- but no rung meets
+more than one new one. Reading upward, `00_gemm_naive` and `01_gemm_double_buf` use the full barrier
+`sync::sync` and `wait_load` for their explicit GL -> RT -> ST path. `02_gemm_async` splits the
+barrier into `arrive`/`wait` and adds `wait_async`, because the fill is now a copy engine that has to
+be waited on separately. `07_gemm_tdm` swaps that engine, and with it `wait_async` for `wait_tdm`.
+`09_gemm_wgc_cluster` (A0-safe) and `09_gemm_wgc_multicast` (A1+ multicast) add the cluster barrier.
+`11_gemm_one_wave` and `11_gemm_one_wave_nomc` add no new primitive at all -- they only wrap the
+ones already there in `sched::compiler_fence`.
 
 Each call in a kernel is labelled with the job it does and the resource it does it on: `wait for
 data (LDS)`, `wait for data (TDM)`, `wait for everyone (workgroup)`, and so on. The two jobs are
@@ -76,10 +81,10 @@ intensity -- so the per-kernel facts sit next to the code rather than here.
 `test.py` is the correctness gate and `gemm_ladder.py` is the measurement campaign; a rung number for publication comes from the latter.
 
 ```
-make all-kernels                                    # 15 pybind11 modules, no executables
+make all-kernels                                    # 17 pybind11 modules, no executables
 python3 test.py                                     # every rung, four shapes, against torch.matmul
-./gemm_ladder.py -r 25 -i 100                       # the table above
-./gemm_ladder.py -r 25 -i 100 --torch gemm_tdm gemm_one_wave
+./gemm_ladder.py -r 25 -i 100 --json-out results.json
+./gemm_ladder.py -r 25 -i 100 --torch 07_gemm_tdm 12_gemm_two_waves_nomc
 ```
 
 Rungs are positional and default to the whole ladder. Each cell is 500 warmup iterations then 100
@@ -90,11 +95,13 @@ ladder. Set `HIP_VISIBLE_DEVICES` to pick a card.
 
 ## Build
 
-The kernels target `gfx1250`. All seven cluster rungs (`gemm_wgc_cluster`, `gemm_epilogue_nomc`,
-`gemm_one_wave_nomc`, and the multicast `gemm_wgc_multicast`, `gemm_epilogue`, `gemm_one_wave`) use `__cluster_dims__` and the `hipLaunchAttributeClusterDimension` launch
-attribute; ROCm 7.2.4 and earlier have neither and fail those three with a cascade of errors that
-read as `shared_allocator` problems. Those seven need **ROCm 7.15 (clang 23)**; the other eight build
-on ROCm 7.2+. Correctness needs PyTorch with gfx1250 support, which is **torch 2.11.0+rocm7.14.0**.
+The kernels target `gfx1250`. The eight cluster kernels (`09_gemm_wgc_cluster` through
+`12_gemm_two_waves_nomc` on the A0 path, and `09_gemm_wgc_multicast` through `12_gemm_two_waves` on
+the A1+ path) use static `__cluster_dims__`; ordinary HIP launches pick up their required 4x4
+cluster metadata. ROCm 7.2.4 and earlier lack this support and fail those eight with a cascade that
+reads as `shared_allocator` problems. Those eight need **ROCm 7.15 (clang 23)**; the nine
+non-cluster kernels build on ROCm 7.2+. Correctness needs PyTorch with gfx1250 support, which is
+**torch 2.11.0+rocm7.14.0**.
 
 ```
 pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ \

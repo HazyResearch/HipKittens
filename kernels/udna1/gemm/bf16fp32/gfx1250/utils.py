@@ -12,15 +12,18 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda:0"
 
 # Every kernel on disk, worst to best, which is also the chain `gemm_ladder.py` walks.
-# A0-safe apex: gemm_wgc_cluster / gemm_epilogue_nomc / gemm_one_wave_nomc (non-multicast
-# cluster). Multicast rungs are A1+ only.
-RUNGS = ["gemm_naive", "gemm_double_buf", "gemm_async", "gemm_128x128", "gemm_256x256",
-         "gemm_deepk", "gemm_segment", "gemm_tdm", "gemm_split_bar",
-         "gemm_wgc_cluster", "gemm_epilogue_nomc", "gemm_one_wave_nomc",
-         "gemm_wgc_multicast", "gemm_epilogue", "gemm_one_wave"]
+# A0-safe apex: 09_gemm_wgc_cluster / 10_gemm_epilogue_nomc / 11_gemm_one_wave_nomc /
+# 12_gemm_two_waves_nomc (non-multicast cluster). Multicast rungs are A1+ only.
+RUNGS = ["00_gemm_naive", "01_gemm_double_buf", "02_gemm_async", "03_gemm_128x128",
+         "04_gemm_256x256", "05_gemm_deepk", "06_gemm_segment", "07_gemm_tdm",
+         "08_gemm_split_bar",
+         "09_gemm_wgc_cluster", "10_gemm_epilogue_nomc", "11_gemm_one_wave_nomc",
+         "12_gemm_two_waves_nomc",
+         "09_gemm_wgc_multicast", "10_gemm_epilogue", "11_gemm_one_wave",
+         "12_gemm_two_waves"]
 
-# Legal for all fifteen rungs at once, so a failure is about the rung and not the shape. The
-# binding constraint is the seven cluster rungs: they launch a 4x4 cluster over a grid of
+# Legal for all seventeen rungs at once, so a failure is about the rung and not the shape. The
+# binding constraint is the eight cluster rungs: they launch a 4x4 cluster over a grid of
 # (M/256, N/256) workgroups and refuse a grid that is not a multiple of 4 in both axes, which makes
 # M and N multiples of 1024. K must be a multiple of the deepest BLOCK_K, 128. At least one shape
 # has to be non-square, because a layout error in C is invisible at M == N -- a transposed output
@@ -33,13 +36,11 @@ SHAPES = [
 ]
 
 
-def init_uniform(shape, dtype=DTYPE, device=DEVICE, lo=-1.0, hi=1.0):
-    """U(lo, hi) operands, which is the range `compare`'s tolerance was derived for.
+def init_operand(shape, dtype=DTYPE, device=DEVICE, lo=-3, hi=3):
+    """Integer-valued operands, drawn uniformly from [lo, hi] and cast to `dtype`.
 
-    |C| grows as sqrt(K) * sigma_ab, about 181 at K=8192 for U(-1,1) and comfortably inside bf16.
-    Unit-normal operands are three times wider and would need the tolerance rescaled with them.
     """
-    return torch.empty(shape, dtype=dtype, device=device).uniform_(lo, hi)
+    return torch.randint(lo, hi + 1, shape, dtype=torch.int8, device=device).to(dtype)
 
 
 def init_c(m, n, dtype=DTYPE, device=DEVICE):

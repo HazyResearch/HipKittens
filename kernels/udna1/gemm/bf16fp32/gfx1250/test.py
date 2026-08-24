@@ -5,8 +5,8 @@ This is the ladder's correctness gate: every rung against `torch.matmul` at four
 pybind11 module each one builds. There is no CPU reference in the tree.
 
     make all-kernels && python3 test.py               # every rung, every shape
-    python3 test.py --rung gemm_epilogue              # one rung
-    python3 test.py --rung gemm_epilogue -s "8192 8192 8192" --terse
+    python3 test.py --rung 10_gemm_epilogue              # one rung
+    python3 test.py --rung 10_gemm_epilogue -s "8192 8192 8192" --terse
 
 `--terse` prints one `bad=<count>` line per cell and exits non-zero if any rung fails.
 
@@ -20,14 +20,14 @@ import sys
 
 import torch
 
-from utils import RUNGS, SHAPES, compare, gemm_reference, init_c, init_uniform, print_title
+from utils import RUNGS, SHAPES, compare, gemm_reference, init_c, init_operand, print_title
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--rung", action="append",
-                   help="rung to check; repeatable. Default is all thirteen.")
+                   help="rung to check; repeatable. Default is every rung in utils.RUNGS.")
     p.add_argument("-s", "--shape", action="append",
                    help='"M N K"; repeatable. Default is the four shapes in utils.SHAPES.')
     p.add_argument("--terse", action="store_true",
@@ -55,13 +55,13 @@ def main():
         print(f"device: {torch.cuda.get_device_properties(0).gcnArchName}  "
               f"torch {torch.__version__}")
         print_title("gfx1250 bf16 GEMM ladder vs torch", 78)
-        print(f"{'rung':<19} {'shape':<20} {'bad':>10} {'max_err':>9} {'mean_err':>9} "
+        print(f"{'rung':<24} {'shape':<20} {'bad':>10} {'max_err':>9} {'mean_err':>9} "
               f"{'gate':>7}  ok")
 
     failures = 0
     for (m, n, k) in shapes:
-        operand_a = init_uniform((m, k))
-        operand_b = init_uniform((n, k))
+        operand_a = init_operand((m, k))
+        operand_b = init_operand((n, k))
         ref = gemm_reference(operand_a, operand_b)
         for r in rungs:
             c = init_c(m, n)
@@ -74,11 +74,11 @@ def main():
                       f"max_abs_err={st['max_abs_err']:.4f} "
                       f"{'OK' if ok else 'FAIL'}", flush=True)
             else:
-                print(f"{r:<19} {f'{m}x{n}x{k}':<20} {st['bad']:>4}/{st['n']:<10} "
+                print(f"{r:<24} {f'{m}x{n}x{k}':<20} {st['bad']:>4}/{st['n']:<10} "
                       f"{st['max_abs_err']:>8.4f} {st['mean_abs_err']:>9.4f} "
                       f"{st['atol']:>7.3f}  {'PASS' if ok else 'FAIL'}", flush=True)
                 if not ok:
-                    print(f"{'':<19} nonfinite={st['nonfinite']} "
+                    print(f"{'':<24} nonfinite={st['nonfinite']} "
                           f"max|ref|={st['max_ref_abs']:.1f}")
         del operand_a, operand_b, ref
         torch.cuda.empty_cache()

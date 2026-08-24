@@ -1,8 +1,9 @@
 /**
- * @file gemm_tdm.cpp
- * @brief Rung 8 -- gemm_segment with the fill moved onto the hardware tile-DMA engine.
+ * @file 07_gemm_tdm.cpp
+ * @brief Rung 07 -- 06_gemm_segment with the fill moved onto the hardware tile-DMA engine.
  *
  * Kernel Specification
+ *   layout      TN -- a is [M, K], b is [N, K], both K-contiguous; c is [M, N] column-major
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
  *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
  *   registers   222 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator
@@ -15,7 +16,7 @@
  *
  * `tdm::load_async` is a descriptor-driven global -> LDS copy: one wave posts one descriptor where the
  * async path had every lane issue its own transfer, so the waves stop spending issue slots on
- * the fill entirely. That is worth about 1.39x. It also drags two things along, because the API
+ * the fill entirely. That is worth about 1.35x. It also drags two things along, because the API
  * requires them: the stage becomes one deep 256x128 panel instead of four sub-tiles, and the
  * tail skip becomes a count=0 descriptor, since a TDM cannot be EXEC-masked. The barrier is
  * plain: the K-block's last matrix op issues before the signal, so the signal-to-wait window is
@@ -153,11 +154,11 @@ void gemm_tdm_kernel(const gemm_globals g, int M, int N, int K)
     kittens::sync::wait_tdm<0>();          // wait for data (TDM): no fill outlives the workgroup
     kittens::sync::wait_ds<0>();           // wait for data (LDS): nor any read of the ring
 
-    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    // Direct store: warp accumulator to bf16 in global C; rung 00 has the transaction-size cost.
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     /* The C staging tile reuses the operand rings, so the request is the larger of the two, not
      * the sum. At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
@@ -170,15 +171,16 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_tdm: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "07_gemm_tdm: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_tdm");
+    gfx1250_gemm::require_k_blocks(g.K(), "07_gemm_tdm");
 
     hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_tdm_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
-    gemm_tdm_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
+    gemm_tdm_kernel<<<launch.grid, launch.block, mem_size, launch.stream>>>(
+        g, g.M(), g.N(), g.K());
 }
 
 #include "harness.h"

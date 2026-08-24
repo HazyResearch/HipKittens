@@ -1,6 +1,6 @@
 /**
- * @file gemm_one_wave.cpp
- * @brief Rung 12 -- gemm_epilogue (rung 11) dropped to one wave per SIMD, with the software-
+ * @file 11_gemm_one_wave_nomc.cpp
+ * @brief Rung 11 (A0-safe) -- 10_gemm_epilogue_nomc dropped to one wave per SIMD, with the software-
  *        pipelined operand feed on a pinned schedule that the drop requires.
  *
  * Kernel Specification
@@ -86,7 +86,7 @@ using C_col = kittens::st<elem_t, BLOCK_M, BLOCK_N,
 __global__
 __cluster_dims__(CLUSTER_DIM, CLUSTER_DIM, 1)
 __launch_bounds__(NUM_THREADS, 1)
-void gemm_one_wave_kernel(const gemm_globals g, int M, int N, int K)
+void gemm_one_wave_nomc_kernel(const gemm_globals g, int M, int N, int K)
 {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al(reinterpret_cast<int*>(&__shm[0]));
@@ -127,16 +127,12 @@ void gemm_one_wave_kernel(const gemm_globals g, int M, int N, int K)
     /* Multicast delivery masks, as rung 10 sets them: a workgroup's id within the cluster is
      * cx + 4*cy, so the four sharing its A panel have the same cx and the four sharing its B panel
      * the same cy. A wrong ordering is a wrong answer. */
-    const uint32_t cx = blockIdx.x & 3u;
-    const uint32_t cy = blockIdx.y & 3u;
-    const uint32_t a_mask = 0x1111u << cx;
-    const uint32_t b_mask = 0xFu << (4u * cy);
 
     /* The two issuers must differ in SIMD parity so both tile-DMA engines are used. With four warps
      * one per SIMD, warps 0 and 1 are on different SIMDs and so on different engine pairs. */
     auto issue_fill = [&](int slot, int kblock, uint32_t count = 1) {
-        if (wid == 0) kittens::tdm::load_async(*A_st[slot], g.a, {0, 0, tile_m, kblock}, M, K, K, a_mask, count);
-        if (wid == 1) kittens::tdm::load_async(*B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, b_mask, count);
+        if (wid == 0) kittens::tdm::load_async(*A_st[slot], g.a, {0, 0, tile_m, kblock}, M, K, K, 0, count);
+        if (wid == 1) kittens::tdm::load_async(*B_st[slot], g.b, {0, 0, tile_n, kblock}, N, K, K, 0, count);
     };
 
     // Prologue: fill the ring ahead of the loop.
@@ -226,7 +222,7 @@ void gemm_one_wave_kernel(const gemm_globals g, int M, int N, int K)
     kittens::store<NUM_THREADS>(g.c, c_st, {0, 0, tile_m, tile_n});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     /* The C staging tile reuses the operand rings, so the request is the larger of the two, not the
      * sum. At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
@@ -238,42 +234,29 @@ void dispatch(gemm_globals g)
      * leading dimension is a multiple of 8. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_one_wave: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "11_gemm_one_wave_nomc: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_one_wave");
+    gfx1250_gemm::require_k_blocks(g.K(), "11_gemm_one_wave_nomc");
 
-    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_one_wave_kernel),
+    hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_one_wave_nomc_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
 
-    const dim3 grid = g.grid();
+    const dim3 grid = launch.grid;
 
-    /* Refuse rather than launch without a cluster. The multicast masks name peers by cluster
-     * position, so without the cluster they name workgroups that are not co-scheduled. */
+    /* Refuse rather than launch without a cluster (A0-safe: per-workgroup TDM fills). */
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
-        printf("!! gemm_one_wave: a %dx%d cluster needs grid.x and grid.y both divisible "
+        printf("!! 11_gemm_one_wave_nomc: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
         return;
     }
 
-    hipLaunchConfig_t cfg = {};
-    cfg.gridDim          = grid;
-    cfg.blockDim         = g.block();
-    cfg.dynamicSmemBytes = mem_size;
-    cfg.stream           = g.stream;
-
-    hipLaunchAttribute attrs[1];
-    attrs[0].id               = hipLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = CLUSTER_DIM;
-    attrs[0].val.clusterDim.y = CLUSTER_DIM;
-    attrs[0].val.clusterDim.z = 1;
-    cfg.attrs    = attrs;
-    cfg.numAttrs = 1;
-
-    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_one_wave_kernel, g, g.M(), g.N(), g.K());
+    hipLaunchKernelGGL(gemm_one_wave_nomc_kernel, grid, launch.block, mem_size, launch.stream,
+                       g, g.M(), g.N(), g.K());
+    const hipError_t e = hipGetLastError();
     if (e != hipSuccess)
-        printf("!! gemm_one_wave: cluster launch REJECTED: %s\n", hipGetErrorString(e));
+        printf("!! 11_gemm_one_wave_nomc: cluster launch REJECTED: %s\n", hipGetErrorString(e));
 }
 
 #include "harness.h"

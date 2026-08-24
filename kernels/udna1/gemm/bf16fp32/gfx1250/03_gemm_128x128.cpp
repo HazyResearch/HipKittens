@@ -1,8 +1,9 @@
 /**
- * @file gemm_128x128.cpp
- * @brief Rung 4 -- gemm_async with the macro tile doubled to 128x128.
+ * @file 03_gemm_128x128.cpp
+ * @brief Rung 03 -- 02_gemm_async with the macro tile doubled to 128x128.
  *
  * Kernel Specification
+ *   layout      TN -- a is [M, K], b is [N, K], both K-contiguous; c is [M, N] column-major
  *   tile        128x128 macro, 32x32 per warp, 4x4 warps; BLOCK_K 32 = 1 x K_STEP 32
  *   occupancy   16 warps / 512 threads / 4 waves per SIMD; 2 workgroups per CU, register-bound
  *   registers   94 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 26 SGPR
@@ -124,11 +125,11 @@ void gemm_128x128_kernel(const gemm_globals g, int M, int N, int K)
     kittens::sync::wait_async<0>();      // wait for data (async copy): no fill outlives the workgroup
     kittens::sync::wait_ds<0>();         // wait for data (LDS): nor any read of the ring
 
-    // Direct store: warp accumulator to bf16 in global C; `gemm_naive` has the transaction-size cost.
+    // Direct store: warp accumulator to bf16 in global C; rung 00 has the transaction-size cost.
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     // The C staging tile reuses the ring, so the request is the larger of the two, not the sum.
     const size_t load_lds  = S * sizeof(ab_pair);
@@ -140,15 +141,16 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_128x128: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "03_gemm_128x128: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_128x128");
+    gfx1250_gemm::require_k_blocks(g.K(), "03_gemm_128x128");
 
     hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_128x128_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
-    gemm_128x128_kernel<<<g.grid(), g.block(), mem_size, g.stream>>>(g, g.M(), g.N(), g.K());
+    gemm_128x128_kernel<<<launch.grid, launch.block, mem_size, launch.stream>>>(
+        g, g.M(), g.N(), g.K());
 }
 
 #include "harness.h"

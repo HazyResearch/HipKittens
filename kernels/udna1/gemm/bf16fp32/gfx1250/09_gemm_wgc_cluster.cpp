@@ -1,6 +1,6 @@
 /**
- * @file gemm_wgc_cluster.cpp
- * @brief Rung 10 (A0-safe) -- gemm_split_bar plus a workgroup cluster without multicast loads.
+ * @file 09_gemm_wgc_cluster.cpp
+ * @brief Rung 09 (A0-safe) -- 08_gemm_split_bar plus a workgroup cluster without multicast loads.
  *
  * Kernel Specification
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
@@ -178,7 +178,7 @@ void gemm_wgc_cluster_kernel(const gemm_globals g, int M, int N, int K)
     kittens::store(g.c, C_acc, {0, 0, tile_m * WARPS_M + warp_r, tile_n * WARPS_N + warp_c});
 }
 
-void dispatch(gemm_globals g)
+void dispatch(gemm_globals g, const launch_config& launch)
 {
     /* C is stored straight out of registers, so the LDS request is the operand ring alone.
      * At 278,528 B of 327,680 B it also holds the kernel to one workgroup per CU. */
@@ -191,42 +191,30 @@ void dispatch(gemm_globals g)
      * wider accumulator shape lengthens the run. */
     if (g.c.rows() % 8 != 0) {
         std::fprintf(stderr,
-            "gemm_wgc_cluster: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
+            "09_gemm_wgc_cluster: column-major C requires M %% 8 == 0 (got M=%d)\n", g.c.rows());
         std::abort();
     }
 
-    gfx1250_gemm::require_k_blocks(g.K(), "gemm_wgc_cluster");
+    gfx1250_gemm::require_k_blocks(g.K(), "09_gemm_wgc_cluster");
 
     hipFuncSetAttribute(reinterpret_cast<const void*>(gemm_wgc_cluster_kernel),
                         hipFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mem_size));
 
-    const dim3 grid = g.grid();
+    const dim3 grid = launch.grid;
 
     /* Refuse rather than launch without a cluster. Cluster barriers require co-scheduled
      * workgroups even though operand fills are per-workgroup on A0. */
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
-        printf("!! gemm_wgc_cluster: a %dx%d cluster needs grid.x and grid.y both divisible "
+        printf("!! 09_gemm_wgc_cluster: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
         return;
     }
 
-    hipLaunchConfig_t cfg = {};
-    cfg.gridDim          = grid;
-    cfg.blockDim         = g.block();
-    cfg.dynamicSmemBytes = mem_size;
-    cfg.stream           = g.stream;
-
-    hipLaunchAttribute attrs[1];
-    attrs[0].id               = hipLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = CLUSTER_DIM;
-    attrs[0].val.clusterDim.y = CLUSTER_DIM;
-    attrs[0].val.clusterDim.z = 1;
-    cfg.attrs    = attrs;
-    cfg.numAttrs = 1;
-
-    const hipError_t e = hipLaunchKernelEx(&cfg, gemm_wgc_cluster_kernel, g, g.M(), g.N(), g.K());
+    hipLaunchKernelGGL(gemm_wgc_cluster_kernel, grid, launch.block, mem_size, launch.stream,
+                       g, g.M(), g.N(), g.K());
+    const hipError_t e = hipGetLastError();
     if (e != hipSuccess)
-        printf("!! gemm_wgc_cluster: cluster launch REJECTED: %s\n", hipGetErrorString(e));
+        printf("!! 09_gemm_wgc_cluster: cluster launch REJECTED: %s\n", hipGetErrorString(e));
 }
 
 #include "harness.h"
