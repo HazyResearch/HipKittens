@@ -20,14 +20,14 @@ import sys
 
 import torch
 
-from utils import RUNGS, SHAPES, compare, gemm_reference, init_c, init_uniform, print_title
+from utils import RUNGS, SHAPES, compare, gemm_reference, init_c, init_operand, print_title
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--rung", action="append",
-                   help="rung to check; repeatable. Default is all twelve.")
+                   help="rung to check; repeatable. Default is every rung in utils.RUNGS.")
     p.add_argument("-s", "--shape", action="append",
                    help='"M N K"; repeatable. Default is the four shapes in utils.SHAPES.')
     p.add_argument("--terse", action="store_true",
@@ -60,8 +60,8 @@ def main():
 
     failures = 0
     for (m, n, k) in shapes:
-        operand_a = init_uniform((m, k))
-        operand_b = init_uniform((n, k))
+        operand_a = init_operand((m, k))
+        operand_b = init_operand((n, k))
         ref = gemm_reference(operand_a, operand_b)
         for r in rungs:
             c = init_c(m, n)

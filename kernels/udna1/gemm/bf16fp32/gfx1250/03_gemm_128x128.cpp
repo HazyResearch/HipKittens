@@ -3,6 +3,7 @@
  * @brief Rung 03 -- 02_gemm_async with the macro tile doubled to 128x128.
  *
  * Kernel Specification
+ *   layout      TN -- a is [M, K], b is [N, K], both K-contiguous; c is [M, N] column-major
  *   tile        128x128 macro, 32x32 per warp, 4x4 warps; BLOCK_K 32 = 1 x K_STEP 32
  *   occupancy   16 warps / 512 threads / 4 waves per SIMD; 2 workgroups per CU, register-bound
  *   registers   94 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 26 SGPR

@@ -3,6 +3,7 @@
  * @brief Rung 06 -- 05_gemm_deepk with the operand rings separated into different LDS segments.
  *
  * Kernel Specification
+ *   layout      TN -- a is [M, K], b is [N, K], both K-contiguous; c is [M, N] column-major
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
  *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
  *   registers   226 VGPR against a 256/lane budget (131072 / 512 threads); 128 are accumulator

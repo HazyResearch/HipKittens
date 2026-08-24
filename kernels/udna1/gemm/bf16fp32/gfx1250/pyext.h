@@ -136,6 +136,15 @@ static gfx1250_gemm::gemm_globals make_globals(const pyb::object& a_obj,
     return gfx1250_gemm::gemm_globals{a_gl, b_gl, c_gl};
 }
 
+static std::string protocol_str()
+{
+    std::ostringstream os;
+    os << HK_WARMUP_ITERS << " warmup; "
+       << (HK_FLUSH_BETWEEN_ITERS ? "cache flush before every launch" : "no cache flush")
+       << "; one event pair per launch";
+    return os.str();
+}
+
 static void check_launch(const char* what)
 {
     const hipError_t e = hipGetLastError();
@@ -174,6 +183,7 @@ static pyb::dict py_bench(const pyb::object& a, const pyb::object& b, const pyb:
     d["warmup"]      = HK_WARMUP_ITERS;
     d["flush_mb"]    = t.flush_mb;
     d["l2_mb"]       = t.l2_mb;
+    d["protocol"]    = protocol_str();
     return d;
 }
 
@@ -213,4 +223,5 @@ HK_PYBIND_MODULE {
     m.attr("WARPS_N")     = WARPS_N;
     m.attr("warmup_iters") = HK_WARMUP_ITERS;
     m.attr("c_layout")    = "column-major";
+    m.attr("benchmark_protocol") = protocol_str();
 }

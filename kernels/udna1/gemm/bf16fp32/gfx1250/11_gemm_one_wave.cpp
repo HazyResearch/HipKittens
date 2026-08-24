@@ -4,6 +4,7 @@
  *        pipelined operand feed on a pinned schedule that the drop requires.
  *
  * Kernel Specification
+ *   layout      TN -- a is [M, K], b is [N, K], both K-contiguous; c is [M, N] column-major
  *   tile        256x256 macro, 128x128 per warp, 2x2 warps; BLOCK_K 128 = 4 x K_STEP 32
  *   occupancy   4 warps / 128 threads / 1 wave per SIMD, one workgroup per CU
  *   cluster     4x4 workgroup cluster (CLUSTER_DIM 4); grid.x and grid.y must both be divisible by 4
