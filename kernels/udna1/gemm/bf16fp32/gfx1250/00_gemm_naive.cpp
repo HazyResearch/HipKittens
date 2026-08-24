@@ -3,6 +3,7 @@
  * @brief Rung 00 -- the naive baseline (no parent).
  *
  * Kernel Specification
+ *   layout      TN -- a is [M, K], b is [N, K], both K-contiguous; c is [M, N] column-major
  *   tile        64x64 macro, 32x32 per warp, 2x2 warps; BLOCK_K 32 = 1 x K_STEP 32
  *   occupancy   4 warps / 128 threads / 1 wave per SIMD; 10 workgroups per CU, register-bound
  *   registers   84 VGPR; 32 are accumulator (WARP_M*WARP_N/32), 40 SGPR

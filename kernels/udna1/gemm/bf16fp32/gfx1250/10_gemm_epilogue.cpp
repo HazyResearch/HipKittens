@@ -4,6 +4,7 @@
  *        its matrix ops back to back.
  *
  * Kernel Specification
+ *   layout      TN -- a is [M, K], b is [N, K], both K-contiguous; c is [M, N] column-major
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
  *   occupancy   16 warps / 512 threads / 4 waves per SIMD, one workgroup per CU
  *   cluster     4x4 workgroup cluster (CLUSTER_DIM 4); grid.x and grid.y must both be divisible by 4
