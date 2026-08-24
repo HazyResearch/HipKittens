@@ -27,7 +27,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--rung", action="append",
-                   help="rung to check; repeatable. Default is all fifteen.")
+                   help="rung to check; repeatable. Default is every rung in utils.RUNGS.")
     p.add_argument("-s", "--shape", action="append",
                    help='"M N K"; repeatable. Default is the four shapes in utils.SHAPES.')
     p.add_argument("--terse", action="store_true",
