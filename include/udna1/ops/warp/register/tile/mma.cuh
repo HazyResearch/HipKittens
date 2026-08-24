@@ -523,32 +523,65 @@ __device__ static inline void mma_ABt(D &d,
             std::is_same_v<typename B::T, fp8e4m3> && std::is_same_v<typename C::T, float>)
     );
 
-    // gfx1250: m-outer, n-inner zigzag with reuse hints derived from
-    // (M, S) -- both compile-time template parameters of the nested lambdas.
-    [&]<std::size_t... Ms>(std::index_sequence<Ms...>) {
-        ([&]<std::size_t M>() {
-            [&]<std::size_t... Ss>(std::index_sequence<Ss...>) {
-                ([&]<std::size_t S>() {
-                    constexpr std::size_t n        = (M & 1) ? (D::height - 1 - S) : S;
-                    constexpr bool        B_reuse  = (S > 0);              // within-column
-                    constexpr bool        A_reuse  = (S == 0) && (M > 0);  // column-switch (zigzag)
-                    // k = 0: pull accumulator from `c`.
-                    mma_ABt_base<A_reuse, B_reuse>(
-                        d.tiles[n][M], a.tiles[n][0], b.tiles[M][0], c.tiles[n][M]);
-                    // k >= 1: chain into `d`. A and B both advance, so no reuse.
-                    if constexpr (A::width > 1) {
-                        [&]<std::size_t... Ks>(std::index_sequence<Ks...>) {
-                            ([&]<std::size_t K>() {
-                                constexpr std::size_t k = K + 1;
-                                mma_ABt_base<false, false>(
-                                    d.tiles[n][M], a.tiles[n][k], b.tiles[M][k], d.tiles[n][M]);
-                            }.template operator()<Ks>(), ...);
-                        }(std::make_index_sequence<A::width - 1>{});
-                    }
-                }.template operator()<Ss>(), ...);
-            }(std::make_index_sequence<D::height>{});
-        }.template operator()<Ms>(), ...);
-    }(std::make_index_sequence<D::width>{});
+    /* Which operand to hold across a run of the zigzag below. Holding A gives a run of `D::width`
+     * and holding B a run of `D::height`, so pick the longer one. On a tie, prefer A: the reuse hint
+     * applies to the instruction's first matrix source, which is A. */
+    constexpr bool hold_a = (D::width >= D::height);
+
+    /* True when the operands are more than one subtile deep, so each accumulator fragment needs a
+     * chain of k-steps. That chain runs between two iterations of the outer walk and overwrites both
+     * operand registers, so no reuse hint is valid across it. Hints are used only when this is
+     * false. */
+    constexpr bool chained = (A::width > 1);
+
+    // k >= 1: chain into `d`. A and B both advance, so no reuse.
+    auto k_chain = [&]<std::size_t N, std::size_t M>() {
+        if constexpr (chained) {
+            [&]<std::size_t... Ks>(std::index_sequence<Ks...>) {
+                ([&]<std::size_t K>() {
+                    constexpr std::size_t k = K + 1;
+                    mma_ABt_base<false, false>(
+                        d.tiles[N][M], a.tiles[N][k], b.tiles[M][k], d.tiles[N][M]);
+                }.template operator()<Ks>(), ...);
+            }(std::make_index_sequence<A::width - 1>{});
+        }
+    };
+
+    if constexpr (hold_a) {
+        /* Hold `a.tiles[N][0]` across a row of the accumulator, reversing direction on odd rows so
+         * each row opens on the B fragment the previous row closed on. */
+        [&]<std::size_t... Ns>(std::index_sequence<Ns...>) {
+            ([&]<std::size_t N>() {
+                [&]<std::size_t... Ts>(std::index_sequence<Ts...>) {
+                    ([&]<std::size_t T>() {
+                        constexpr std::size_t m       = (N & 1) ? (D::width - 1 - T) : T;
+                        constexpr bool        A_reuse = (T > 0) && !chained;
+                        mma_ABt_base<A_reuse, false>(
+                            d.tiles[N][m], a.tiles[N][0], b.tiles[m][0], c.tiles[N][m]);
+                        k_chain.template operator()<N, m>();
+                    }.template operator()<Ts>(), ...);
+                }(std::make_index_sequence<D::width>{});
+            }.template operator()<Ns>(), ...);
+        }(std::make_index_sequence<D::height>{});
+    } else {
+        /* Hold `b.tiles[M][0]` down a column of the accumulator, reversing direction on odd columns.
+         * The reversal leaves A unchanged across a column boundary, so the first op of each column
+         * after the zeroth claims A reuse as well. */
+        [&]<std::size_t... Ms>(std::index_sequence<Ms...>) {
+            ([&]<std::size_t M>() {
+                [&]<std::size_t... Ss>(std::index_sequence<Ss...>) {
+                    ([&]<std::size_t S>() {
+                        constexpr std::size_t n       = (M & 1) ? (D::height - 1 - S) : S;
+                        constexpr bool        B_reuse = (S > 0) && !chained;
+                        constexpr bool        A_reuse = (S == 0) && (M > 0) && !chained;
+                        mma_ABt_base<A_reuse, B_reuse>(
+                            d.tiles[n][M], a.tiles[n][0], b.tiles[M][0], c.tiles[n][M]);
+                        k_chain.template operator()<n, M>();
+                    }.template operator()<Ss>(), ...);
+                }(std::make_index_sequence<D::height>{});
+            }.template operator()<Ms>(), ...);
+        }(std::make_index_sequence<D::width>{});
+    }
 }
 
 /**

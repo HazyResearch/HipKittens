@@ -300,6 +300,9 @@ concept all = std::is_same_v<T, st_16x16> ||
               std::is_same_v<T, st_16x32_padded<>> ||
               std::is_same_v<T, st_16x32_padded<128, 8>> ||
               std::is_same_v<T, st_16x32_padded<256, 8>> ||
+              std::is_same_v<T, st_16x32_padded<512, 8>> ||
+              std::is_same_v<T, st_16x32_padded<1024, 8>> ||
+              std::is_same_v<T, st_16x32_padded<64, 8>> ||
               std::is_same_v<T, st_16x32_padded<64, 4>>;
 
 /* ----------  SHAPE KIND  ----------
