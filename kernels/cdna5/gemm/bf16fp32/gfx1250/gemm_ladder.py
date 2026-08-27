@@ -39,8 +39,11 @@ from utils import compare, gemm_reference, init_c, init_operand
 # delta against that rung's own parent. This is the same list `utils.RUNGS` gates for correctness.
 LADDER = ["00_gemm_naive", "01_gemm_double_buf", "02_gemm_async", "03_gemm_128x128",
           "04_gemm_256x256", "05_gemm_deepk", "06_gemm_segment", "07_gemm_tdm",
-          "08_gemm_split_bar", "09_gemm_wgc_multicast", "10_gemm_epilogue",
-          "11_gemm_one_wave", "12_gemm_two_waves"]
+          "08_gemm_split_bar",
+          "09_gemm_wgc_cluster", "10_gemm_epilogue_nomc", "11_gemm_one_wave_nomc",
+          "12_gemm_two_waves_nomc",
+          "09_gemm_wgc_multicast", "10_gemm_epilogue", "11_gemm_one_wave",
+          "12_gemm_two_waves"]
 
 HERE = Path(__file__).resolve().parent
 
