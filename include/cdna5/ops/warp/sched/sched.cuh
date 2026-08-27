@@ -146,7 +146,7 @@ __device__ __forceinline__ void lock_simd() {
  *       `s_wait_alu depctr_vm_vsrc(0)`.
  */
 __device__ __forceinline__ void wait_alu() {
-#if defined(KITTENS_UDNA1_ENABLE_EXPERT_MODE)
+#if defined(KITTENS_CDNA5_ENABLE_EXPERT_MODE)
     asm volatile("s_wait_alu depctr_va_vdst(0)" ::: "memory");
     asm volatile("s_wait_alu depctr_vm_vsrc(0)" ::: "memory");
 #endif

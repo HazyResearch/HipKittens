@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief Aggregate header for UDNA1 (gfx1250) ThunderKittens core include tree.
+ * @brief Aggregate header for CDNA5 (gfx1250) ThunderKittens core include tree.
  */
 
 #pragma once

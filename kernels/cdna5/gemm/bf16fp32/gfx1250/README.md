@@ -9,7 +9,7 @@ Every rung shares `common.h`, `harness.h`, the TN operand contract (`a` is `[M, 
 `[N, K]`, both K-contiguous, so the kernel computes `C = A . B^T` via `mma_ABt`) and a **column-major
 `c`** -- allocate it as `torch.empty_strided((M, N), (1, M))`, since a row-major `c` is refused
 rather than silently transposed. They are written against
-`include/udna1/ops/warp/{sync,sched,cluster}/` and the gfx1250-only extensions to
+`include/cdna5/ops/warp/{sync,sched,cluster}/` and the gfx1250-only extensions to
 `memory/tile/global_to_shared.cuh`, `memory/tile/shared_to_register.cuh` and `register/tile/mma.cuh`.
 
 ## Tile geometry
@@ -44,7 +44,7 @@ data (LDS)`, `wait for data (TDM)`, `wait for everyone (workgroup)`, and so on. 
 independent -- a barrier orders warps and says nothing about memory, a counter wait orders one
 warp's own transfers and says nothing about other warps -- and the four rules that follow from that,
 including which drains may be partial and why, are in the header of
-`include/udna1/ops/warp/sync/barrier.cuh`.
+`include/cdna5/ops/warp/sync/barrier.cuh`.
 
 Every kernel file opens with a `Kernel Specification` block -- tile geometry, occupancy in waves per
 SIMD, register and spill counts, LDS footprint, the per-K-block sync inventory and arithmetic

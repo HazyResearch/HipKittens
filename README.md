@@ -93,8 +93,8 @@ split by architecture; build and run the one matching your GPU.
 cd HipKittens/tests/unit/cdna4
 make -j64 && ./unit_tests
 
-# UDNA1 (MI400 / MI450, gfx1250)
-cd HipKittens/tests/unit/udna1
+# CDNA5 (MI400 / MI450, gfx1250)
+cd HipKittens/tests/unit/cdna5
 make -j64 && ./unit_tests
 ```
 

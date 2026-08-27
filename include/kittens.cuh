@@ -7,8 +7,8 @@
 
 #if defined(KITTENS_CDNA4)
 #include "cdna4/includes.cuh"
-#elif defined(KITTENS_UDNA1)
-#include "udna1/includes.cuh"
+#elif defined(KITTENS_CDNA5)
+#include "cdna5/includes.cuh"
 #elif defined(KITTENS_CDNA3)
 #include "cdna3/includes.cuh"
 #endif

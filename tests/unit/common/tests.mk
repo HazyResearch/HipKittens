@@ -1,7 +1,7 @@
 # Shared build rules for tests/unit/<arch>.
 #
-# Each arch Makefile (cdna4/, udna1/) sets a few knobs then includes this:
-#   GPU_TARGET    : CDNA4 | UDNA1            (required)
+# Each arch Makefile (cdna4/, cdna5/) sets a few knobs then includes this:
+#   GPU_TARGET    : CDNA4 | CDNA5            (required)
 #   TEST_DEFINES  : -DTEST_... selection      (required)
 #   TEST_INTENSITY: 1..4                      (optional, default 2)
 #   COMP_LEVEL    : safe | debug | profile    (optional, default profile)
@@ -25,7 +25,7 @@ COMP_LEVEL     ?= profile
 TEST_INTENSITY ?= 2
 
 ifndef GPU_TARGET
-$(error GPU_TARGET is not set. Expected CDNA4 or UDNA1)
+$(error GPU_TARGET is not set. Expected CDNA4 or CDNA5)
 endif
 ifndef TEST_DEFINES
 $(error TEST_DEFINES is not set, e.g. -DTEST_WARP_MEMORY_TILE_GLOBAL_TO_REGISTER)
@@ -50,10 +50,10 @@ endif
 
 ifeq ($(GPU_TARGET),CDNA4)
 HIPFLAGS += -DKITTENS_CDNA4 --offload-arch=gfx950 -DHIP_ENABLE_WARP_SYNC_BUILTINS
-else ifeq ($(GPU_TARGET),UDNA1)
-HIPFLAGS += -DKITTENS_UDNA1 --offload-arch=gfx1250
+else ifeq ($(GPU_TARGET),CDNA5)
+HIPFLAGS += -DKITTENS_CDNA5 --offload-arch=gfx1250
 else
-$(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA4, UDNA1)
+$(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA4, CDNA5)
 endif
 
 # Suppress warnings
