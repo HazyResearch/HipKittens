@@ -12,8 +12,8 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda:0"
 
 # Every kernel on disk, worst to best, which is also the chain `gemm_ladder.py` walks.
-# A0-safe apex: 09_gemm_wgc_cluster / 10_gemm_epilogue_nomc / 11_gemm_one_wave_nomc /
-# 12_gemm_two_waves_nomc (non-multicast cluster). Multicast rungs are A1+ only.
+# Multicast-free apex: 09_gemm_wgc_cluster / 10_gemm_epilogue_nomc / 11_gemm_one_wave_nomc /
+# 12_gemm_two_waves_nomc (non-multicast cluster). Multicast rungs use the bare names.
 RUNGS = ["00_gemm_naive", "01_gemm_double_buf", "02_gemm_async", "03_gemm_128x128",
          "04_gemm_256x256", "05_gemm_deepk", "06_gemm_segment", "07_gemm_tdm",
          "08_gemm_split_bar",

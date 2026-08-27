@@ -12,7 +12,7 @@
 #   make test                            # the rungs, then check every one vs torch.matmul
 #   make clean
 #
-# The eight cluster kernels (A0 nomc path and A1+ multicast path) use static `__cluster_dims__`;
+# The eight cluster kernels (multicast-free and multicast paths) use static `__cluster_dims__`;
 # ordinary HIP launches pick up the required 4x4 cluster metadata. ROCm 7.2.4 and earlier lack this
 # support and fail those eight with a cascade that reads as `shared_allocator` errors; ROCm 7.15
 # (clang 23) supports it. The nine non-cluster kernels build on ROCm 7.2+.
@@ -20,7 +20,7 @@
 GPU_TARGET ?= UDNA1
 CUSTOM_RULES := 1
 
-# A0-safe apex at top, then A1+ multicast ladder, then base rungs 00-08. Both paths coexist on disk.
+# Multicast-free apex at top, then multicast ladder, then base rungs 00-08. Both paths coexist on disk.
 LADDER := 12_gemm_two_waves_nomc 11_gemm_one_wave_nomc 10_gemm_epilogue_nomc 09_gemm_wgc_cluster \
           12_gemm_two_waves 11_gemm_one_wave 10_gemm_epilogue 09_gemm_wgc_multicast \
           08_gemm_split_bar 07_gemm_tdm 06_gemm_segment 05_gemm_deepk 04_gemm_256x256 \

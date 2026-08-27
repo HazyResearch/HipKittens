@@ -1,6 +1,6 @@
 /**
  * @file 10_gemm_epilogue_nomc.cpp
- * @brief Rung 10 (A0-safe) -- staging C through LDS as a feature of the kernel rather than of the ops, and a
+ * @brief Rung 10 (multicast-free) -- staging C through LDS as a feature of the kernel rather than of the ops, and a
  *        wave that issues its matrix ops back to back.
  *
  * Kernel Specification
@@ -52,7 +52,7 @@
  * The reasoning is at the call site.
  *
  * Everything else is `gemm_wgc_cluster` at the shape above: a two-stage TDM-filled LDS ring, the
- * split barrier, and a 4x4 cluster with non-multicast operand loads (A0-safe). Uses only:
+ * split barrier, and a 4x4 cluster with non-multicast operand loads. Uses only:
  *   - `kittens::sched::lock_simd` : clear the post-matrix-op arbitration stall for this wave.
  *   - `kittens::tdm::load_async`  : descriptor-driven global -> LDS tile DMA, non-multicast, mask 0).
  *   - `kittens::tdm::wait`        : drain the tile DMA.

@@ -1,6 +1,6 @@
 /**
  * @file 11_gemm_one_wave_nomc.cpp
- * @brief Rung 11 (A0-safe) -- 10_gemm_epilogue_nomc dropped to one wave per SIMD, with the software-
+ * @brief Rung 11 (multicast-free) -- 10_gemm_epilogue_nomc dropped to one wave per SIMD, with the software-
  *        pipelined operand feed on a pinned schedule that the drop requires.
  *
  * Kernel Specification
@@ -245,7 +245,7 @@ void dispatch(gemm_globals g, const launch_config& launch)
 
     const dim3 grid = launch.grid;
 
-    /* Refuse rather than launch without a cluster (A0-safe: per-workgroup TDM fills). */
+    /* Refuse rather than launch without a cluster (multicast-free: per-workgroup TDM fills). */
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
         printf("!! 11_gemm_one_wave_nomc: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);

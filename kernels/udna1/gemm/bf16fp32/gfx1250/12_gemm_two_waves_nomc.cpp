@@ -1,6 +1,6 @@
 /**
  * @file 12_gemm_two_waves_nomc.cpp
- * @brief Rung 12 (A0-safe) -- 11_gemm_one_wave_nomc's schedule at two waves per SIMD, without multicast.
+ * @brief Rung 12 (multicast-free) -- 11_gemm_one_wave_nomc's schedule at two waves per SIMD, without multicast.
  *
  * Kernel Specification
  *   layout      TN -- a is [M, K], b is [N, K], both K-contiguous; c is [M, N] column-major
@@ -17,8 +17,8 @@
  * accumulator and lets two waves share a SIMD. LDS traffic per unit of output goes as
  * `1/WARP_M + 1/WARP_N`, so 64x128 reads 1.5x the bytes 128x128 does; the occupancy is worth more.
  *
- * Operand fills are per-workgroup (TDM mask 0) rather than multicast, because gfx1250 A0 does not
- * support multicast TDM loads. Cluster barriers and `__cluster_dims__` remain.
+ * Operand fills are per-workgroup (TDM mask 0) rather than multicast. Cluster barriers and
+ * `__cluster_dims__` remain.
  *
  * The warp grid is 4x2 rather than 2x4. Both give eight waves and the same accumulator size, but a
  * 64x128 wave gives `mma_ABt` eight B fragments per A fragment instead of four, which doubles the
@@ -148,7 +148,7 @@ void gemm_two_waves_nomc_kernel(const gemm_globals g, int M, int N, int K)
     const int warp_off_a = warp_r * WARP_M * BLOCK_K;
     const int warp_off_b = warp_c * WARP_N * BLOCK_K;
 
-    // Per-workgroup operand fills (mask 0); A0 does not support multicast TDM.
+    // Per-workgroup operand fills (mask 0); multicast-free TDM path.
     auto issue_fill = [&](int slot, int kblock, uint32_t count) {
         if (wid == 0)
             kittens::tdm::load_async(

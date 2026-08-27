@@ -1,6 +1,6 @@
 /**
  * @file 09_gemm_wgc_cluster.cpp
- * @brief Rung 09 (A0-safe) -- 08_gemm_split_bar plus a workgroup cluster without multicast loads.
+ * @brief Rung 09 (multicast-free) -- 08_gemm_split_bar plus a workgroup cluster without multicast loads.
  *
  * Kernel Specification
  *   tile        256x256 macro, 64x64 per warp, 4x4 warps; BLOCK_K 128 = 4 x K_STEP 32
@@ -14,7 +14,7 @@
  *               (3 partial, 1 full), 1 TDM drain
  *   intensity   128 FLOP per byte of global operand traffic, BM*BN/(BM+BN)
  *
- * Sixteen workgroups form a 4x4 cluster for cluster-wide barrier sync, but each workgroup fills its own LDS via non-multicast TDM loads (mask 0) because gfx1250 A0 does not support multicast. Per-workgroup fills match rung 9; cluster barriers replace the workgroup-only prologue rendezvous from rung 9. Uses only:
+ * Sixteen workgroups form a 4x4 cluster for cluster-wide barrier sync, but each workgroup fills its own LDS via non-multicast TDM loads (mask 0). Per-workgroup fills match rung 9; cluster barriers replace the workgroup-only prologue rendezvous from rung 9. Uses only:
  *   - `kittens::tdm::load_async`         : descriptor-driven global -> LDS tile DMA (non-multicast, mask 0).
  *   - `kittens::sync::wait_tdm`   : drain the tile DMA.
  *   - `kittens::sync::arrive/wait`: workgroup barrier (-1), in the split form.
@@ -203,7 +203,7 @@ void dispatch(gemm_globals g, const launch_config& launch)
     const dim3 grid = launch.grid;
 
     /* Refuse rather than launch without a cluster. Cluster barriers require co-scheduled
-     * workgroups even though operand fills are per-workgroup on A0. */
+     * workgroups even though operand fills are per-workgroup (multicast-free). */
     if (grid.x % CLUSTER_DIM != 0 || grid.y % CLUSTER_DIM != 0) {
         printf("!! 09_gemm_wgc_cluster: a %dx%d cluster needs grid.x and grid.y both divisible "
                "by %d; got %ux%u.\n", CLUSTER_DIM, CLUSTER_DIM, CLUSTER_DIM, grid.x, grid.y);
