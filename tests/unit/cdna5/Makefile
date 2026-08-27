@@ -1,7 +1,7 @@
-# udna1 (gfx1250, MI400/MI450) unit tests.
+# cdna5 (gfx1250, MI400/MI450) unit tests.
 # Shared rules live in ../common/tests.mk; this file only sets local knobs.
 
-GPU_TARGET     ?= UDNA1
+GPU_TARGET     ?= CDNA5
 COMP_LEVEL     ?= profile
 TEST_INTENSITY ?= 2
 

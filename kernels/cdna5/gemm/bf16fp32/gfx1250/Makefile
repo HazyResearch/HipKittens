@@ -1,9 +1,9 @@
-# Build system for the gfx1250 (UDNA1) GEMM optimization ladder.
+# Build system for the gfx1250 (CDNA5) GEMM optimization ladder.
 #
 # Every rung builds to one artifact, a pybind11 module named for the rung, which is the only entry
 # point it has: `test.py` checks it against torch.matmul and `gemm_ladder.py` times it. Arch flags
 # and the Python discovery (PY_INCLUDES, PY_LDFLAGS, PY_EXT_SUFFIX) come from the shared
-# kernels/common.mk via GPU_TARGET=UDNA1; the rules are local (CUSTOM_RULES=1) because common.mk
+# kernels/common.mk via GPU_TARGET=CDNA5; the rules are local (CUSTOM_RULES=1) because common.mk
 # builds one TARGET and this directory builds thirteen, each with its own module name.
 #
 # Invocation:
@@ -18,7 +18,7 @@
 # `shared_allocator` errors; ROCm 7.15 (clang 23) supports it. The nine non-cluster
 # kernels build on ROCm 7.2+.
 
-GPU_TARGET ?= UDNA1
+GPU_TARGET ?= CDNA5
 CUSTOM_RULES := 1
 
 # The one-feature-at-a-time ladder, and every kernel on disk; see README.md.

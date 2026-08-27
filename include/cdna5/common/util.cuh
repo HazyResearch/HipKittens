@@ -29,7 +29,7 @@ namespace kittens {
 /**
  * @brief Constant representing number of threads in a warp.
  *
- * gfx1250 (UDNA1) is wave-32.
+ * gfx1250 (CDNA5) is wave-32.
  */
 constexpr int WARP_THREADS{32};
 
