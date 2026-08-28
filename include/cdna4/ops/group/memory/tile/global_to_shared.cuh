@@ -35,10 +35,28 @@ __device__ static inline void load(ST &dst, const GL &src, const COORD &idx, con
     kittens::load<2, false, ST, GL, COORD, GROUP_THREADS>(dst, src, idx, swizzled_offsets);
 }
 template<int axis, bool assume_aligned, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
-__device__ static inline void load(ST &dst, const GL &src, const COORD &idx, const uint32_t *__restrict__ swizzled_offsets, i32x4 srd, const void* base_ptr, uint32_t lds_base) {
+__device__ static inline void load(ST &dst, const GL &src, const COORD &idx, const uint32_t *__restrict__ swizzled_offsets, __amdgpu_buffer_rsrc_t srd, const void* base_ptr, uint32_t lds_base) {
     kittens::load<axis, assume_aligned, ST, GL, COORD, GROUP_THREADS>(dst, src, idx, swizzled_offsets, srd, base_ptr, lds_base);
 }
 template<ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
-__device__ static inline void load(ST &dst, const GL &src, const COORD &idx, const uint32_t *__restrict__ swizzled_offsets, i32x4 srd, const void* base_ptr, uint32_t lds_base) {
+__device__ static inline void load(ST &dst, const GL &src, const COORD &idx, const uint32_t *__restrict__ swizzled_offsets, __amdgpu_buffer_rsrc_t srd, const void* base_ptr, uint32_t lds_base) {
     kittens::load<2, false, ST, GL, COORD, GROUP_THREADS>(dst, src, idx, swizzled_offsets, srd, base_ptr, lds_base);
+}
+// Async load: uses async DMA. Caller must bracket with asyncmark()/wait_asyncmark().
+template<int axis, bool assume_aligned, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, const uint32_t *swizzled_offsets) {
+    kittens::load_async<axis, assume_aligned, ST, GL, COORD, GROUP_THREADS>(dst, src, idx, swizzled_offsets);
+}
+template<ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, const uint32_t *swizzled_offsets) {
+    kittens::load_async<2, false, ST, GL, COORD, GROUP_THREADS>(dst, src, idx, swizzled_offsets);
+}
+// Async load with explicit SRD/base_ptr/lds_base. Caller must bracket with asyncmark()/wait_asyncmark().
+template<int axis, bool assume_aligned, ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, const uint32_t *__restrict__ swizzled_offsets, __amdgpu_buffer_rsrc_t srd, const void* base_ptr, uint32_t lds_base) {
+    kittens::load_async<axis, assume_aligned, ST, GL, COORD, GROUP_THREADS>(dst, src, idx, swizzled_offsets, srd, base_ptr, lds_base);
+}
+template<ducks::st::all ST, ducks::gl::all GL, ducks::coord::tile COORD=coord<ST>>
+__device__ static inline void load_async(ST &dst, const GL &src, const COORD &idx, const uint32_t *__restrict__ swizzled_offsets, __amdgpu_buffer_rsrc_t srd, const void* base_ptr, uint32_t lds_base) {
+    kittens::load_async<2, false, ST, GL, COORD, GROUP_THREADS>(dst, src, idx, swizzled_offsets, srd, base_ptr, lds_base);
 }

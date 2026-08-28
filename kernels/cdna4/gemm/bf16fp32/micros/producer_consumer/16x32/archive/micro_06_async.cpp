@@ -130,7 +130,6 @@ void micro_tk(const micro_globals g) {
         load<2,false>(Bs[1][n][1], g.b, {0, 0, col*2 + 2*n + 1, 1});
         if (warp_leader) atomicAdd((int*)&prod_cntB[1][3], 1);  
     }
-    asm volatile("s_waitcnt vmcnt(0)");
     __syncthreads();
     if (warp_leader && warp_id < 3) {
         while (prod_cntA[0][warp_id] < 1) { __builtin_amdgcn_s_sleep(0); }
@@ -168,7 +167,6 @@ void micro_tk(const micro_globals g) {
             load<2,false>(As[toc][warp_id][1], g.a, {0,0, row*2 + 2*warp_id + 1, tile});
             load<2,false>(Bs[toc][warp_id][0], g.b, {0,0, col*2 + 2*warp_id + 0, tile});
             load<2,false>(Bs[toc][warp_id][1], g.b, {0,0, col*2 + 2*warp_id + 1, tile});
-            asm volatile("s_waitcnt vmcnt(8)");
             if (warp_leader) { __atomic_store_n(&readyA[toc][warp_id], tile, __ATOMIC_RELEASE); }
             if (warp_leader) { __atomic_store_n(&readyB[toc][warp_id], tile, __ATOMIC_RELEASE); }
         }
@@ -182,7 +180,6 @@ void micro_tk(const micro_globals g) {
             while (doneB[toc][warp_id] < needB) { __builtin_amdgcn_s_sleep(sleep_time); }
             load<2,false>(Bs[toc][warp_id][0], g.b, {0,0, col*2 + 2*warp_id + 0, tile});
             load<2,false>(Bs[toc][warp_id][1], g.b, {0,0, col*2 + 2*warp_id + 1, tile});
-            asm volatile("s_waitcnt vmcnt(8)");
             if (warp_leader) { __atomic_store_n(&readyB[toc][warp_id], tile, __ATOMIC_RELEASE); }
         }
     }
@@ -213,7 +210,6 @@ void micro_tk(const micro_globals g) {
             load(a0, st_subtile_a);
             load(b0, st_subtile_b);
             load(b1, st_subtile_b_next);
-            asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_setprio(1);
             mma_ABt(C_accum[0][0], a0, b0, C_accum[0][0]);
             mma_ABt(C_accum[0][1], a0, b1, C_accum[0][1]);
@@ -221,7 +217,6 @@ void micro_tk(const micro_globals g) {
 
             st_subtile_a = subtile_inplace<HALF_BLOCK_SIZE, BLOCK_SIZE>(As[tic][consumer_idx][1], {0,0});
             load(a0, st_subtile_a);
-            asm volatile("s_waitcnt lgkmcnt(0)");
             if (warp_leader) atomicAdd((int*)&doneB[tic][local_warp_id], 1);
             __builtin_amdgcn_s_setprio(1);
             mma_ABt(C_accum[1][0], a0, b0, C_accum[1][0]);

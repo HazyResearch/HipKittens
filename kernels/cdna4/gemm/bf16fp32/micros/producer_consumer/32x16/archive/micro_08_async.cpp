@@ -94,7 +94,6 @@ void micro_tk(const micro_globals g) {
         #pragma unroll
         for (int n=0; n<N_BLOCK; ++n) 
             G::load<2,false>(Bs[tic][n], g.b, {0, 0, col+n, 0}, swizzled_offsets_B);
-        asm volatile("s_waitcnt vmcnt(1)");
         if (warp_leader) atomicAdd((int*)&prod_cnt[0], 1);  
     }
     if (is_consumer) {  zero(C_accum);  }
@@ -133,7 +132,6 @@ void micro_tk(const micro_globals g) {
                 G::load<2,false>(As[toc][m], g.a, {0,0, row+m, tile+1}, swizzled_offsets_A);
             
             if (warp_leader) atomicAdd((int*)&prod_cnt[toc], 1);
-            asm volatile("s_waitcnt vmcnt(1)");
 
             const int target_2 = NUM_PRODUCER_WORKERS*(tile/2 + 1);
             while (prod_cnt[toc] < target_2) { 
@@ -159,14 +157,12 @@ void micro_tk(const micro_globals g) {
 
             load(a0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(As[tic][consumer_idx], {0,0}));
             load(b0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(Bs[tic][local_warp_id], {0,0}));
-            asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_setprio(1);
             mma_ABt(C_accum, a0, b0, C_accum);
             __builtin_amdgcn_s_setprio(0);
 
             load(a0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(As[tic][consumer_idx], {0,1}));
             load(b0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(Bs[tic][local_warp_id], {0,1}));
-            asm volatile("s_waitcnt lgkmcnt(0)");
 
             if (warp_leader) atomicAdd((int*)&done[tic], 1);
 

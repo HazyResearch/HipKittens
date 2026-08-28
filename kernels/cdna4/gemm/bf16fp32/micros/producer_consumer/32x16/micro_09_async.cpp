@@ -107,7 +107,6 @@ void micro_tk(const micro_globals g) {
         for (int n=0; n<N_BLOCK; ++n) 
             G::load<2,false>(Bs[tic][n], g.b, {0, 0, col+n, 0}, swizzled_offsets_B);
         if (warp_leader) atomicAdd((int*)&prod_cnt[0], 1);  
-        asm volatile("s_waitcnt vmcnt(0)");
     }
     if (threadIdx.x == 0) {
         while (prod_cnt[0] < NUM_PRODUCER_WORKERS) { __builtin_amdgcn_s_sleep(0); } 
@@ -122,7 +121,6 @@ void micro_tk(const micro_globals g) {
         for (int m=0; m<M_BLOCK; ++m) 
             G::load<2,false>(As[1][m], g.a, {0,0, row+m, 1}, swizzled_offsets_A);
         if (warp_leader) atomicAdd((int*)&prod_cnt[1], 1);
-        asm volatile("s_waitcnt vmcnt(4)");
     }
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
@@ -162,7 +160,6 @@ void micro_tk(const micro_globals g) {
             for (int m=0; m<M_BLOCK; ++m) 
                 G::load<2,false>(As[toc][m], g.a, {0,0, row+m, tile}, swizzled_offsets_A);
             
-            asm volatile("s_waitcnt vmcnt(4)");
             if (warp_leader) atomicAdd((int*)&prod_cnt[toc], 1);
             while (prod_cnt[toc] < target_2) { __builtin_amdgcn_s_sleep(sleep_time); } 
             if (warp_leader && warp_id == 0) { atomicExch((int*)&ready[toc], tile); }
@@ -190,14 +187,12 @@ void micro_tk(const micro_globals g) {
 
             load(a0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(As[tic][consumer_idx], {0,0}));
             load(b0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(Bs[tic][local_warp_id], {0,0}));
-            asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_setprio(1);
             mma_ABt(C_accum, a0, b0, C_accum);
             __builtin_amdgcn_s_setprio(0);
 
             load(a0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(As[tic][consumer_idx], {0,1}));
             load(b0, subtile_inplace<BLOCK_SIZE, DOT_SLICE>(Bs[tic][local_warp_id], {0,1}));
-            asm volatile("s_waitcnt lgkmcnt(0)");
 
             __builtin_amdgcn_s_setprio(1);
             mma_ABt(C_accum, a0, b0, C_accum);

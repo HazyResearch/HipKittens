@@ -384,21 +384,6 @@ __device__ __forceinline__ void ds_write_b128(const T& value, const uint32_t sme
     : "memory");
 }
 
-template<int GPR_START>
-__device__ __forceinline__ void buffer_load_dword(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
-  if constexpr (GPR_START >= 256) {
-    asm volatile("buffer_load_dword a[%0], %1, %2, %3 offen offset:%4"
-      :
-      : "n"(GPR_START - 256), "v"(v_offset), "s"(*(const i32x4*)&br), "s"(s_offset), "i"(i_offset)
-      : "memory");
-  } else {
-    asm volatile("buffer_load_dword v[%0], %1, %2, %3 offen offset:%4"
-      :
-      : "n"(GPR_START), "v"(v_offset), "s"(*(const i32x4*)&br), "s"(s_offset), "i"(i_offset)
-      : "memory");
-  }
-}
-
 template<typename T = uint32_t>
 __device__ __forceinline__ T buffer_load_dword(
   const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const uint32_t i_offset = 0) {
@@ -412,18 +397,8 @@ __device__ __forceinline__ T buffer_load_dword(
 }
 
 template<int GPR_START>
-__device__ __forceinline__ void buffer_load_dwordx2(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
-  if constexpr (GPR_START >= 256) {
-    asm volatile("buffer_load_dwordx2 a[%0:%1], %2, %3, %4 offen offset:%5"
-      :
-      : "n"(GPR_START - 256), "n"(GPR_START + 1 - 256), "v"(v_offset), "s"(*(const i32x4*)&br), "s"(s_offset), "i"(i_offset)
-      : "memory");
-  } else {
-    asm volatile("buffer_load_dwordx2 v[%0:%1], %2, %3, %4 offen offset:%5"
-      :
-      : "n"(GPR_START), "n"(GPR_START + 1), "v"(v_offset), "s"(*(const i32x4*)&br), "s"(s_offset), "i"(i_offset)
-      : "memory");
-  }
+__device__ __forceinline__ uint32_t buffer_load_dword(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
+  return buffer_load_dword<uint32_t>(br, v_offset, s_offset, i_offset);
 }
 
 template<typename T = u32x2>
@@ -439,18 +414,8 @@ __device__ __forceinline__ T buffer_load_dwordx2(
 }
 
 template<int GPR_START>
-__device__ __forceinline__ void buffer_load_dwordx3(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
-  if constexpr (GPR_START >= 256) {
-    asm volatile("buffer_load_dwordx3 a[%0:%1], %2, %3, %4 offen offset:%5"
-      :
-      : "n"(GPR_START - 256), "n"(GPR_START + 2 - 256), "v"(v_offset), "s"(*(const i32x4*)&br), "s"(s_offset), "i"(i_offset)
-      : "memory");
-  } else {
-    asm volatile("buffer_load_dwordx3 v[%0:%1], %2, %3, %4 offen offset:%5"
-      :
-      : "n"(GPR_START), "n"(GPR_START + 2), "v"(v_offset), "s"(*(const i32x4*)&br), "s"(s_offset), "i"(i_offset)
-      : "memory");
-  }
+__device__ __forceinline__ u32x2 buffer_load_dwordx2(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
+  return buffer_load_dwordx2<u32x2>(br, v_offset, s_offset, i_offset);
 }
 
 // Returns a u32x3 (ext_vector_type(3)). Note sizeof(u32x3) == 16 due to vector
@@ -468,18 +433,8 @@ __device__ __forceinline__ T buffer_load_dwordx3(
 }
 
 template<int GPR_START>
-__device__ __forceinline__ void buffer_load_dwordx4(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
-  if constexpr (GPR_START >= 256) {
-    asm volatile("buffer_load_dwordx4 a[%0:%1], %2, %3, %4 offen offset:%5"
-      :
-      : "n"(GPR_START - 256), "n"(GPR_START + 3 - 256), "v"(v_offset), "s"(*(const i32x4*)&br), "s"(s_offset), "i"(i_offset)
-      : "memory");
-  } else {
-    asm volatile("buffer_load_dwordx4 v[%0:%1], %2, %3, %4 offen offset:%5"
-      :
-      : "n"(GPR_START), "n"(GPR_START + 3), "v"(v_offset), "s"(*(const i32x4*)&br), "s"(s_offset), "i"(i_offset)
-      : "memory");
-  }
+__device__ __forceinline__ u32x3 buffer_load_dwordx3(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
+  return buffer_load_dwordx3<u32x3>(br, v_offset, s_offset, i_offset);
 }
 
 template<typename T = u32x4>
@@ -492,6 +447,11 @@ __device__ __forceinline__ T buffer_load_dwordx4(
     : "v"(v_offset), "s"(*(const i32x4*)&br), "s"(s_offset), "i"(i_offset)
     : "memory");
   return result;
+}
+
+template<int GPR_START>
+__device__ __forceinline__ u32x4 buffer_load_dwordx4(const buffer_resource& br, const uint32_t v_offset, const uint32_t s_offset = 0, const int i_offset = 0) {
+  return buffer_load_dwordx4<u32x4>(br, v_offset, s_offset, i_offset);
 }
 
 template<typename T = uint32_t>
