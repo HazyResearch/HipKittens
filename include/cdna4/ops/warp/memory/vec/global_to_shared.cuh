@@ -34,7 +34,7 @@ __device__ static inline void load(SV &dst, const GL &src, const COORD &idx) {
     const int warpid = kittens::warpid() % num_warps;
 
     U *src_ptr = (U*)&src[(idx.template unit_coord<-1, 3>())];
-    i32x4 srsrc = make_srsrc(src_ptr, SV::length * sizeof(T));
+    auto srsrc = make_srsrc(src_ptr, SV::length * sizeof(T));
 
     const T* lds_base = &dst.data[0] + (warpid * elem_per_warp);
 
@@ -47,9 +47,9 @@ __device__ static inline void load(SV &dst, const GL &src, const COORD &idx) {
             const T* lds_elem_ptr = lds_base + (i * num_warps * elem_per_warp);
 
             uintptr_t lds_addr = reinterpret_cast<uintptr_t>(lds_elem_ptr);
-            as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
+            __attribute__((address_space(3))) void* lds_ptr = (__attribute__((address_space(3))) void*)(lds_addr);
 
-            llvm_amdgcn_raw_buffer_load_lds(
+            __builtin_amdgcn_raw_ptr_buffer_load_lds(
                 srsrc,
                 lds_ptr,
                 bytes_per_thread,
@@ -71,9 +71,9 @@ __device__ static inline void load(SV &dst, const GL &src, const COORD &idx) {
 
             const T* lds_elem_ptr = lds_base + (num_memcpys * num_warps * elem_per_warp);
             uintptr_t lds_addr = reinterpret_cast<uintptr_t>(lds_elem_ptr);
-            as3_uint32_ptr lds_ptr = (as3_uint32_ptr)(lds_addr);
+            __attribute__((address_space(3))) void* lds_ptr = (__attribute__((address_space(3))) void*)(lds_addr);
 
-            llvm_amdgcn_raw_buffer_load_lds(
+            __builtin_amdgcn_raw_ptr_buffer_load_lds(
                 srsrc,
                 lds_ptr,
                 bytes_per_thread,

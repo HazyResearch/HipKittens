@@ -4,8 +4,8 @@ from aiter.tuned_gemm import tgemm
 import random
 from utils import bench_gemm, print_title
 
-BENCHMARK_AITER = True
-BENCHMARK_TORCH = True
+BENCHMARK_AITER = False
+BENCHMARK_TORCH = False
 
 bench_shapes = [
     (8192, 8192, 8192), # (m, n, k)

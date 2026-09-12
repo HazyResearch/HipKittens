@@ -109,7 +109,6 @@ void micro_tk(const micro_globals g) {
             G::load<2,false>(Bs[tic][n][1], g.b, {0, 0, col*2 + 2*n + 1, 0}, swizzled_offsets_B);
         }
         if (warp_leader) atomicAdd((int*)&prod_cnt[0], 1);  
-        asm volatile("s_waitcnt vmcnt(0)");
     }
     if (threadIdx.x == 0) {
         while (prod_cnt[0] < NUM_PRODUCER_WORKERS) { __builtin_amdgcn_s_sleep(0); } 
@@ -128,7 +127,6 @@ void micro_tk(const micro_globals g) {
             G::load<2,false>(As[1][m][1], g.a, {0,0, row*2 + 2*m + 1, 1}, swizzled_offsets_A);
         }
         if (warp_leader) atomicAdd((int*)&prod_cnt[1], 1);
-        asm volatile("s_waitcnt vmcnt(4)");
     }
     if (is_consumer) {  
         zero(C_accum[0][0]); 
@@ -168,7 +166,6 @@ void micro_tk(const micro_globals g) {
                 G::load<2,false>(As[toc][m][0], g.a, {0,0, row*2 + 2*m + 0, tile}, swizzled_offsets_A);
                 G::load<2,false>(As[toc][m][1], g.a, {0,0, row*2 + 2*m + 1, tile}, swizzled_offsets_A);
             }
-            asm volatile("s_waitcnt vmcnt(4)");
 
             if (warp_leader) atomicAdd((int*)&prod_cnt[toc], 1);
             while (prod_cnt[toc] < target_2) { __builtin_amdgcn_s_sleep(sleep_time); } 
@@ -200,14 +197,12 @@ void micro_tk(const micro_globals g) {
             load(a0, st_subtile_a);
             load(b0, st_subtile_b);
             load(b1, st_subtile_b_next);
-            asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_setprio(1);
             mma_ABt(C_accum[0][0], a0, b0, C_accum[0][0]);
             mma_ABt(C_accum[0][1], a0, b1, C_accum[0][1]);
             __builtin_amdgcn_s_setprio(0);
 
             load(a1, st_subtile_a_next);
-            asm volatile("s_waitcnt lgkmcnt(0)");
             __builtin_amdgcn_s_setprio(1);
             mma_ABt(C_accum[1][0], a1, b0, C_accum[1][0]);
             mma_ABt(C_accum[1][1], a1, b1, C_accum[1][1]);
