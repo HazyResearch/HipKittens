@@ -261,4 +261,5 @@ namespace kittens {
     template<int _height, int _width> using st_bf = st<bf16,  _height, _width>;
     template<int _height, int _width> using st_hf = st<half,  _height, _width>;
     template<int _height, int _width> using st_fl = st<float, _height, _width>;
+    template<int _height, int _width> using st_fp8e4m3 = st<fp8e4m3, _height, _width>;
 }
