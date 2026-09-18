@@ -73,22 +73,26 @@ BUILD_DIR ?= build
 
 ifneq ($(CUSTOM_RULES),1)
 ifeq ($(BUILD_MODE),pyext)
+DEPFILE := $(TARGET).d
 all: $(TARGET)
 
+-include $(DEPFILE)
 $(TARGET): $(SRC)
 	$(HIPCXX) $(SRC) $(HIPFLAGS) $(ICXXFLAGS) $(ICPPFLAGS) $(ILDFLAGS) $(ILDLIBS) \
-		-o $(TARGET)$(PY_EXT_SUFFIX)
+		-MMD -MP -MF $(DEPFILE) -o $(TARGET)$(PY_EXT_SUFFIX)
 
 clean:
-	rm -f $(TARGET) $(TARGET).*so
+	rm -f $(TARGET) $(TARGET).*so $(DEPFILE)
 else ifeq ($(BUILD_MODE),standalone)
 OBJ ?= $(BUILD_DIR)/$(notdir $(basename $(SRC))).o
+DEPFILE := $(OBJ:.o=.d)
 
 all: $(TARGET)
 
+-include $(DEPFILE)
 $(TARGET): $(SRC)
 	mkdir -p $(BUILD_DIR)
-	$(HIPCXX) $(HIPFLAGS) $(ICXXFLAGS) $(ICPPFLAGS) -c $(SRC) -o $(OBJ)
+	$(HIPCXX) $(HIPFLAGS) $(ICXXFLAGS) $(ICPPFLAGS) -MMD -MP -MF $(DEPFILE) -c $(SRC) -o $(OBJ)
 	$(HIPCXX) $(HIPFLAGS) $(ILDFLAGS) $(ILDLIBS) $(OBJ) -o $(TARGET)
 
 clean:
