@@ -34,6 +34,41 @@ constexpr int REG_N      = BLOCK_COL / WARPS_COL / 2;
 
 using G = kittens::group<NUM_WARPS>;
 
+using ST_Scale = st<fp8e8m0, 16, 64, st_16x64_s>;
+
+// Reads the pre-packed lane-native scale for group lg on this lane (single LDS load, zero ALU).
+__device__ __forceinline__ fp8e8m0_4 lane_rd(const ST_Scale &s, int lg) {
+    return reinterpret_cast<const uint32_t *>(s.data)[lg * 64 + laneid()];
+}
+
+// Repacks the iteration-major scale buffer into the lane-native layout the kernel reads:
+// one fp8e8m0_4 per (group, lane), computed once via the same pack_scales the loop used to run.
+// One block per 256-row tile; A uses STEP=64,NG=4, B uses STEP=32,NG=8.
+template<int STEP, int NG>
+__global__ void pack_scales_lane_kernel(const uint32_t *__restrict__ packed,
+                                        uint32_t *__restrict__ ln, int num_tiles) {
+    constexpr int TILE_WORDS = 256;
+    constexpr int PAD_WORDS  = (NG - 1) * STEP + 64;  // covers max OOB pack_scales read
+    __shared__ uint32_t tile[PAD_WORDS];
+
+    int t = blockIdx.x;
+    if (t >= num_tiles) return;
+    int lane = threadIdx.x % 64;
+    int grp  = threadIdx.x / 64;
+
+    for (int i = threadIdx.x; i < PAD_WORDS; i += blockDim.x)
+        tile[i] = (i < TILE_WORDS) ? packed[(size_t)t * TILE_WORDS + i] : 0u;
+    __syncthreads();
+
+    fp8e8m0_4 out = pack_scales((const fp8e8m0 *)tile, grp * STEP);
+    ln[((size_t)t * NG + grp) * 64 + lane] = out;
+}
+
+template<int STEP, int NG>
+static void launch_pack_scales_lane(const uint32_t *packed, uint32_t *ln, int num_tiles) {
+    pack_scales_lane_kernel<STEP, NG><<<num_tiles, NG * 64>>>(packed, ln, num_tiles);
+}
+
 template <int M, int N, int K>
 __global__ __launch_bounds__(512, 2)
 void mxfp8_gemm_kernel(
@@ -47,14 +82,14 @@ void mxfp8_gemm_kernel(
 
     using ST_A     = st_fp8e4m3<HALF_ROW, BLOCK_K, st_16x128_s>;
     using ST_B     = st_fp8e4m3<HALF_COL, BLOCK_K, st_16x128_s>;
-    using ST_Scale = st<fp8e8m0, 16, 64, st_16x64_s>;
     using RT_A     = rt_fp8e4m3<REG_M, BLOCK_K>;
     using RT_B     = rt_fp8e4m3<REG_N, BLOCK_K>;
     using RT_C     = rt_fl<REG_M, REG_N, col_l, rt_16x16_s>;
 
     __shared__ ST_A As[2][2];
     __shared__ ST_B Bs[2][2];
-    __shared__ ST_Scale scale_A_smem[2], scale_B_smem[2];
+    // B needs 8 scale groups = 2 tiles: scale_B_lo holds groups 0-3, scale_B_hi groups 4-7.
+    __shared__ ST_Scale scale_A_smem[2], scale_B_lo[2], scale_B_hi[2];
 
     RT_A a;
     RT_B b0, b1;
@@ -105,11 +140,6 @@ void mxfp8_gemm_kernel(
     uint32_t b_lds_10 = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&Bs[1][0].data[0]) + wid * elem_per_warp * sizeof(T)));
     uint32_t b_lds_11 = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&Bs[1][1].data[0]) + wid * elem_per_warp * sizeof(T)));
 
-    int a_row_h0 = warp_m * REG_M;
-    int a_row_h1 = HALF_ROW + warp_m * REG_M;
-    int b_row_h0 = warp_n * REG_N;
-    int b_row_h1 = HALF_COL + warp_n * REG_N;
-
     int tic = 0, toc = 1;
     int tic_scales = 0, toc_scales = 1;
 
@@ -131,8 +161,9 @@ void mxfp8_gemm_kernel(
     asm volatile("s_waitcnt vmcnt(6)");
     __builtin_amdgcn_s_barrier();
 
-    G::load(scale_A_smem[0], scale_A_gl, {0 * tiles_M + block_row, 0, 0, 0});
-    G::load(scale_B_smem[0], scale_B_gl, {0 * tiles_N + block_col, 0, 0, 0});
+    G::load(scale_A_smem[0], scale_A_gl, {block_row, 0, 0, 0});
+    G::load(scale_B_lo[0],   scale_B_gl, {2 * block_col,     0, 0, 0});
+    G::load(scale_B_hi[0],   scale_B_gl, {2 * block_col + 1, 0, 0, 0});
     asm volatile("s_waitcnt vmcnt(0)");
     asm volatile("s_waitcnt lgkmcnt(0)");
     __builtin_amdgcn_s_barrier();
@@ -141,7 +172,8 @@ void mxfp8_gemm_kernel(
     for (int k = 0; k < k_iters - 2; k++, tic ^= 1, toc ^= 1, tic_scales ^= 1, toc_scales ^= 1) {
         if (k + 1 < k_iters) {
             G::load(scale_A_smem[toc_scales], scale_A_gl, {(k + 1) * tiles_M + block_row, 0, 0, 0});
-            G::load(scale_B_smem[toc_scales], scale_B_gl, {(k + 1) * tiles_N + block_col, 0, 0, 0});
+            G::load(scale_B_lo[toc_scales],   scale_B_gl, {2 * ((k + 1) * tiles_N + block_col),     0, 0, 0});
+            G::load(scale_B_hi[toc_scales],   scale_B_gl, {2 * ((k + 1) * tiles_N + block_col) + 1, 0, 0, 0});
         }
         auto bs0 = subtile_inplace<REG_N, BLOCK_K>(Bs[tic][0], {warp_n, 0});
         load(b0, bs0);
@@ -151,10 +183,10 @@ void mxfp8_gemm_kernel(
         asm volatile("s_waitcnt lgkmcnt(8)");
         __builtin_amdgcn_s_barrier();
 
-        fp8e8m0_4 sa_h0 = pack_scales(scale_A_smem[tic_scales].data, a_row_h0);
-        fp8e8m0_4 sb_h0 = pack_scales(scale_B_smem[tic_scales].data, b_row_h0);
-        fp8e8m0_4 sb_h1 = pack_scales(scale_B_smem[tic_scales].data, b_row_h1);
-        fp8e8m0_4 sa_h1 = pack_scales(scale_A_smem[tic_scales].data, a_row_h1);
+        fp8e8m0_4 sa_h0 = lane_rd(scale_A_smem[tic_scales], warp_m);
+        fp8e8m0_4 sb_h0 = lane_rd(scale_B_lo[tic_scales], warp_n);
+        fp8e8m0_4 sb_h1 = lane_rd(scale_B_hi[tic_scales], warp_n);
+        fp8e8m0_4 sa_h1 = lane_rd(scale_A_smem[tic_scales], 2 + warp_m);
         __builtin_amdgcn_s_setprio(2);
         mma_ABt_scaled(cA, a, b0, cA, &sa_h0, &sb_h0);
         __builtin_amdgcn_s_setprio(0);
@@ -198,15 +230,16 @@ void mxfp8_gemm_kernel(
         int k = k_iters - 2;
         if (k + 1 < k_iters) {
             G::load(scale_A_smem[toc_scales], scale_A_gl, {(k + 1) * tiles_M + block_row, 0, 0, 0});
-            G::load(scale_B_smem[toc_scales], scale_B_gl, {(k + 1) * tiles_N + block_col, 0, 0, 0});
+            G::load(scale_B_lo[toc_scales],   scale_B_gl, {2 * ((k + 1) * tiles_N + block_col),     0, 0, 0});
+            G::load(scale_B_hi[toc_scales],   scale_B_gl, {2 * ((k + 1) * tiles_N + block_col) + 1, 0, 0, 0});
         }
         asm volatile("s_waitcnt vmcnt(0)");
         asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
-        fp8e8m0_4 sa_h0 = pack_scales(scale_A_smem[tic_scales].data, a_row_h0);
-        fp8e8m0_4 sa_h1 = pack_scales(scale_A_smem[tic_scales].data, a_row_h1);
-        fp8e8m0_4 sb_h0 = pack_scales(scale_B_smem[tic_scales].data, b_row_h0);
-        fp8e8m0_4 sb_h1 = pack_scales(scale_B_smem[tic_scales].data, b_row_h1);
+        fp8e8m0_4 sa_h0 = lane_rd(scale_A_smem[tic_scales], warp_m);
+        fp8e8m0_4 sa_h1 = lane_rd(scale_A_smem[tic_scales], 2 + warp_m);
+        fp8e8m0_4 sb_h0 = lane_rd(scale_B_lo[tic_scales], warp_n);
+        fp8e8m0_4 sb_h1 = lane_rd(scale_B_hi[tic_scales], warp_n);
 
         auto bs0 = subtile_inplace<REG_N, BLOCK_K>(Bs[tic][0], {warp_n, 0});
         load(b0, bs0);
@@ -262,10 +295,10 @@ void mxfp8_gemm_kernel(
         asm volatile("s_waitcnt vmcnt(0)");
         asm volatile("s_waitcnt lgkmcnt(0)");
         __builtin_amdgcn_s_barrier();
-        fp8e8m0_4 sa_h0 = pack_scales(scale_A_smem[tic_scales].data, a_row_h0);
-        fp8e8m0_4 sa_h1 = pack_scales(scale_A_smem[tic_scales].data, a_row_h1);
-        fp8e8m0_4 sb_h0 = pack_scales(scale_B_smem[tic_scales].data, b_row_h0);
-        fp8e8m0_4 sb_h1 = pack_scales(scale_B_smem[tic_scales].data, b_row_h1);
+        fp8e8m0_4 sa_h0 = lane_rd(scale_A_smem[tic_scales], warp_m);
+        fp8e8m0_4 sa_h1 = lane_rd(scale_A_smem[tic_scales], 2 + warp_m);
+        fp8e8m0_4 sb_h0 = lane_rd(scale_B_lo[tic_scales], warp_n);
+        fp8e8m0_4 sb_h1 = lane_rd(scale_B_hi[tic_scales], warp_n);
 
         auto as0 = subtile_inplace<REG_M, BLOCK_K>(As[tic][0], {warp_m, 0});
         load(a, as0);
@@ -382,32 +415,39 @@ TimingResult run_benchmark(int warmup_iters, int timing_iters) {
     std::vector<uint8_t> sa_raw, sb_raw;
     std::vector<uint32_t> sa_iter, sb_iter;
 
-    fp8e4m3 *d_a, *d_b; float *d_c; uint32_t *d_sa, *d_sb;
+    constexpr int tiles_M = M / BLOCK_ROW;
+    constexpr int tiles_N = N / BLOCK_COL;
+
+    fp8e4m3 *d_a, *d_b; float *d_c; uint32_t *d_sa, *d_sb, *d_sa_ln, *d_sb_ln;
     hipMalloc(&d_a, (size_t)ROTATING_BUFFER_COUNT * M * K);
     hipMalloc(&d_b, (size_t)ROTATING_BUFFER_COUNT * N * K);
     hipMalloc(&d_c, (size_t)M * N * sizeof(float));
-    hipMalloc(&d_sa, (size_t)ROTATING_BUFFER_COUNT * k_iters * M * sizeof(uint32_t));
-    hipMalloc(&d_sb, (size_t)ROTATING_BUFFER_COUNT * k_iters * N * sizeof(uint32_t));
+    hipMalloc(&d_sa, (size_t)k_iters * M * sizeof(uint32_t));  // iteration-major staging
+    hipMalloc(&d_sb, (size_t)k_iters * N * sizeof(uint32_t));
+    // Lane-native buffers (A: 256 words/tile, B: 512 words/tile), one per rotating buffer.
+    hipMalloc(&d_sa_ln, (size_t)ROTATING_BUFFER_COUNT * k_iters * tiles_M * 256 * sizeof(uint32_t));
+    hipMalloc(&d_sb_ln, (size_t)ROTATING_BUFFER_COUNT * k_iters * tiles_N * 512 * sizeof(uint32_t));
     HipCheckError();
 
     for (int buf = 0; buf < ROTATING_BUFFER_COUNT; buf++) {
         random_init_mxfp8<M, N, K>(a_f, b_f, a_q, b_q, sa_raw, sb_raw, sa_iter, sb_iter, 42 + buf);
         hipMemcpy(d_a  + (size_t)buf * M * K, a_q.data(), (size_t)M * K, hipMemcpyHostToDevice);
         hipMemcpy(d_b  + (size_t)buf * N * K, b_q.data(), (size_t)N * K, hipMemcpyHostToDevice);
-        hipMemcpy(d_sa + (size_t)buf * k_iters * M, sa_iter.data(), (size_t)k_iters * M * sizeof(uint32_t), hipMemcpyHostToDevice);
-        hipMemcpy(d_sb + (size_t)buf * k_iters * N, sb_iter.data(), (size_t)k_iters * N * sizeof(uint32_t), hipMemcpyHostToDevice);
+        hipMemcpy(d_sa, sa_iter.data(), (size_t)k_iters * M * sizeof(uint32_t), hipMemcpyHostToDevice);
+        hipMemcpy(d_sb, sb_iter.data(), (size_t)k_iters * N * sizeof(uint32_t), hipMemcpyHostToDevice);
+        launch_pack_scales_lane<64, 4>(d_sa, d_sa_ln + (size_t)buf * k_iters * tiles_M * 256, k_iters * tiles_M);
+        launch_pack_scales_lane<32, 8>(d_sb, d_sb_ln + (size_t)buf * k_iters * tiles_N * 512, k_iters * tiles_N);
     }
+    hipDeviceSynchronize();
     HipCheckError();
 
-    constexpr int tiles_M = M / BLOCK_ROW;
-    constexpr int tiles_N = N / BLOCK_COL;
     for (int i = 0; i < warmup_iters; i++) {
         int buf = i % ROTATING_BUFFER_COUNT;
         gl<fp8e4m3, 1, 1, M, K> A(d_a + (size_t)buf * M * K, nullptr, nullptr, nullptr, nullptr);
         gl<fp8e4m3, 1, 1, N, K> B(d_b + (size_t)buf * N * K, nullptr, nullptr, nullptr, nullptr);
         gl<float,   1, 1, M, N> C(d_c, nullptr, nullptr, nullptr, nullptr);
-        gl<fp8e8m0, -1, 1, 16, 64> SA(reinterpret_cast<fp8e8m0 *>(d_sa + (size_t)buf * k_iters * M), k_iters * tiles_M, nullptr, nullptr, nullptr);
-        gl<fp8e8m0, -1, 1, 16, 64> SB(reinterpret_cast<fp8e8m0 *>(d_sb + (size_t)buf * k_iters * N), k_iters * tiles_N, nullptr, nullptr, nullptr);
+        gl<fp8e8m0, -1, 1, 16, 64> SA(reinterpret_cast<fp8e8m0 *>(d_sa_ln + (size_t)buf * k_iters * tiles_M * 256), k_iters * tiles_M, nullptr, nullptr, nullptr);
+        gl<fp8e8m0, -1, 1, 16, 64> SB(reinterpret_cast<fp8e8m0 *>(d_sb_ln + (size_t)buf * k_iters * tiles_N * 512), 2 * k_iters * tiles_N, nullptr, nullptr, nullptr);
         mxfp8_gemm_kernel<M, N, K><<<grid, 512>>>(A, B, C, SA, SB);
         hipDeviceSynchronize();
     }
@@ -420,8 +460,8 @@ TimingResult run_benchmark(int warmup_iters, int timing_iters) {
         gl<fp8e4m3, 1, 1, M, K> A(d_a + (size_t)buf * M * K, nullptr, nullptr, nullptr, nullptr);
         gl<fp8e4m3, 1, 1, N, K> B(d_b + (size_t)buf * N * K, nullptr, nullptr, nullptr, nullptr);
         gl<float,   1, 1, M, N> C(d_c, nullptr, nullptr, nullptr, nullptr);
-        gl<fp8e8m0, -1, 1, 16, 64> SA(reinterpret_cast<fp8e8m0 *>(d_sa + (size_t)buf * k_iters * M), k_iters * tiles_M, nullptr, nullptr, nullptr);
-        gl<fp8e8m0, -1, 1, 16, 64> SB(reinterpret_cast<fp8e8m0 *>(d_sb + (size_t)buf * k_iters * N), k_iters * tiles_N, nullptr, nullptr, nullptr);
+        gl<fp8e8m0, -1, 1, 16, 64> SA(reinterpret_cast<fp8e8m0 *>(d_sa_ln + (size_t)buf * k_iters * tiles_M * 256), k_iters * tiles_M, nullptr, nullptr, nullptr);
+        gl<fp8e8m0, -1, 1, 16, 64> SB(reinterpret_cast<fp8e8m0 *>(d_sb_ln + (size_t)buf * k_iters * tiles_N * 512), 2 * k_iters * tiles_N, nullptr, nullptr, nullptr);
         hipEventRecord(t0);
         mxfp8_gemm_kernel<M, N, K><<<grid, 512>>>(A, B, C, SA, SB);
         hipEventRecord(t1);
@@ -435,7 +475,7 @@ TimingResult run_benchmark(int warmup_iters, int timing_iters) {
     double ops = 2.0 * M * N * K;
 
     hipEventDestroy(t0); hipEventDestroy(t1);
-    hipFree(d_a); hipFree(d_b); hipFree(d_c); hipFree(d_sa); hipFree(d_sb);
+    hipFree(d_a); hipFree(d_b); hipFree(d_c); hipFree(d_sa); hipFree(d_sb); hipFree(d_sa_ln); hipFree(d_sb_ln);
 
     return { best, avg, ops / (best * 1e-3) / 1e12, ops / (avg * 1e-3) / 1e12, timing_iters };
 }
@@ -471,23 +511,30 @@ bool run_correctness() {
             c_ref[(size_t)i * N + j] = acc;
         }
 
-    fp8e4m3 *d_a, *d_b; float *d_c; uint32_t *d_sa, *d_sb;
+    constexpr int tiles_M = M / BLOCK_ROW;
+    constexpr int tiles_N = N / BLOCK_COL;
+    fp8e4m3 *d_a, *d_b; float *d_c; uint32_t *d_sa, *d_sb, *d_sa_ln, *d_sb_ln;
     hipMalloc(&d_a,  (size_t)M * K);
     hipMalloc(&d_b,  (size_t)N * K);
     hipMalloc(&d_c,  MN * sizeof(float));
     hipMalloc(&d_sa, (size_t)k_iters * M * sizeof(uint32_t));
     hipMalloc(&d_sb, (size_t)k_iters * N * sizeof(uint32_t));
+    hipMalloc(&d_sa_ln, (size_t)k_iters * tiles_M * 256 * sizeof(uint32_t));
+    hipMalloc(&d_sb_ln, (size_t)k_iters * tiles_N * 512 * sizeof(uint32_t));
     hipMemcpy(d_a,  a_q.data(),     (size_t)M * K, hipMemcpyHostToDevice);
     hipMemcpy(d_b,  b_q.data(),     (size_t)N * K, hipMemcpyHostToDevice);
     hipMemcpy(d_sa, sa_iter.data(),  (size_t)k_iters * M * sizeof(uint32_t), hipMemcpyHostToDevice);
     hipMemcpy(d_sb, sb_iter.data(),  (size_t)k_iters * N * sizeof(uint32_t), hipMemcpyHostToDevice);
     hipMemset(d_c, 0, MN * sizeof(float));
+    launch_pack_scales_lane<64, 4>(d_sa, d_sa_ln, k_iters * tiles_M);
+    launch_pack_scales_lane<32, 8>(d_sb, d_sb_ln, k_iters * tiles_N);
+    hipDeviceSynchronize();
 
     gl<fp8e4m3, 1, 1, M, K> A_gl(d_a, nullptr, nullptr, nullptr, nullptr);
     gl<fp8e4m3, 1, 1, N, K> B_gl(d_b, nullptr, nullptr, nullptr, nullptr);
     gl<float,   1, 1, M, N> C_gl(d_c, nullptr, nullptr, nullptr, nullptr);
-    gl<fp8e8m0, -1, 1, 16, 64> SA_gl(reinterpret_cast<fp8e8m0 *>(d_sa), k_iters * (M / BLOCK_ROW), nullptr, nullptr, nullptr);
-    gl<fp8e8m0, -1, 1, 16, 64> SB_gl(reinterpret_cast<fp8e8m0 *>(d_sb), k_iters * (N / BLOCK_COL), nullptr, nullptr, nullptr);
+    gl<fp8e8m0, -1, 1, 16, 64> SA_gl(reinterpret_cast<fp8e8m0 *>(d_sa_ln), k_iters * tiles_M, nullptr, nullptr, nullptr);
+    gl<fp8e8m0, -1, 1, 16, 64> SB_gl(reinterpret_cast<fp8e8m0 *>(d_sb_ln), 2 * k_iters * tiles_N, nullptr, nullptr, nullptr);
     mxfp8_gemm_kernel<M, N, K><<<grid, 512>>>(A_gl, B_gl, C_gl, SA_gl, SB_gl);
     hipDeviceSynchronize();
 
@@ -501,7 +548,7 @@ bool run_correctness() {
     for (size_t i = 0; i < MN; i++)
         if (std::abs(c_gpu[i] - c_ref[i]) > atol) fail_count++;
 
-    hipFree(d_a); hipFree(d_b); hipFree(d_c); hipFree(d_sa); hipFree(d_sb);
+    hipFree(d_a); hipFree(d_b); hipFree(d_c); hipFree(d_sa); hipFree(d_sb); hipFree(d_sa_ln); hipFree(d_sb_ln);
 
     printf("  atol (0.1%%): %.2e -> %d / %zu failures -> %s\n",
            atol, fail_count, MN, fail_count == 0 ? "PASS" : "FAIL");
