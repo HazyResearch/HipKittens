@@ -288,9 +288,8 @@ __device__ __forceinline__ void load(ST& dst, const GL& src, const COORD& idx,
     // reinterpret_cast<uintptr_t>(&dst.data[0]) + wid * elem_per_warp * sizeof(T)
     // ));
 
-    // ---- SGPR cursor we bump each iteration (no new readfirstlane) ----
-    uint32_t lds_cur = lds_base;
-    asm volatile("" : "+s"(lds_cur)); 
+    // ---- SGPR cursor we bump each iteration ----
+    uint32_t lds_cur = to_sgpr_u32(lds_base);
 
     #pragma unroll
     for (int i = 0; i < memcpy_per_tile; ++i) {
