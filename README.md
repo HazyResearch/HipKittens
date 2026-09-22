@@ -25,6 +25,8 @@ We support CDNA3 and CDNA 4.
 - [January 2026] HipKittens is accepted to [MLSys 2026 in Seattle]()!
 - [February 2026] Will presented HipKittens as a GPU Mode lecture, [check it out](https://www.youtube.com/watch?v=jsYyF03Fs3o)!
 - [March 2026] HipKittens is officially an AITER backend! The first [HK kernels have landed in AITER](https://github.com/ROCm/aiter/pull/2039)!
+- [June 2026] HipKittens is officially an AMD Transformer Engine backend! [Check it out](https://github.com/ROCm/TransformerEngine/pull/566)!
+- [Sept 2026] HipKittens now supports MI455 Helios! [Check it out](https://rocm.blogs.amd.com/software-tools-optimization/hipkittens-gemm-ladder/README.html)!
 
 ## Setup
 
