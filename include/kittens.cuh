@@ -11,6 +11,8 @@
 #include "cdna5/includes.cuh"
 #elif defined(KITTENS_CDNA3)
 #include "cdna3/includes.cuh"
+#elif defined(KITTENS_RDNA4)
+#include "rdna4/includes.cuh"
 #endif
 
 #include "pyutils/util.cuh"
