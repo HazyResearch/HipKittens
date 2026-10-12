@@ -60,6 +60,9 @@ _SLOT_NAME = "TRITON_ATTN"
 #: attention of a serving engine should take saying so.
 SLOT = "TRITON_ATTN"
 
+#: The metadata builder class, made once: vLLM asks for it per KV-cache group.
+_BUILDER: list = []
+
 
 def _build():
     """Construct the backend classes against the installed vLLM.
@@ -98,12 +101,26 @@ def _build():
             # The metadata this needs -- block_table, seq_lens, slot_mapping,
             # query_start_loc -- is exactly what the ROCm backend's builder
             # already assembles, and reimplementing it would be copying a file
-            # to change nothing in it.
+            # to change nothing in it. Everything but its CUDA-graph claim.
+            if _BUILDER:
+                return _BUILDER[0]
             from vllm.v1.attention.backends.rocm_attn import (
                 RocmAttentionMetadataBuilder,
             )
 
-            return RocmAttentionMetadataBuilder
+            class HKAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
+                # The ROCm builder claims ALWAYS, which puts `forward` inside
+                # a full graph. There, the split count planned on the host
+                # from `max_seq_len` is frozen at the capture batch's value,
+                # the once-per-layer check syncs mid-capture, and a scratch
+                # buffer regrown after capture leaves the graph writing to
+                # freed memory. NEVER makes vLLM capture the model piecewise,
+                # with attention run eagerly between the pieces.
+                _cudagraph_support = type(
+                    RocmAttentionMetadataBuilder._cudagraph_support).NEVER
+
+            _BUILDER.append(HKAttentionMetadataBuilder)
+            return HKAttentionMetadataBuilder
 
         @staticmethod
         def get_supported_kernel_block_sizes():

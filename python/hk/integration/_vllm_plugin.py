@@ -56,6 +56,15 @@ def register() -> None:
                 slot if slot not in ("1", "on", "yes", "true") else None))
         except BaseException as e:  # noqa: BLE001
             notes.append(f"backend not registered ({type(e).__name__}: {e})")
+    # Linear layers are a third opt-in, for the same reason: every
+    # unquantized GEMM in the model changes kernels.
+    if os.environ.get("HK_VLLM_GEMM", "0") not in ("0", "", "off", "no"):
+        try:
+            from . import vllm_gemm  # noqa: PLC0415
+
+            notes.append(vllm_gemm.apply())
+        except BaseException as e:  # noqa: BLE001
+            notes.append(f"linear not patched ({type(e).__name__}: {e})")
     try:
         from . import vllm as hkv  # noqa: PLC0415
 
