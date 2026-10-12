@@ -57,3 +57,15 @@ differences. See `measurement.md` §1.
 **Infinity Cache will fake a decode benchmark.** Re-using one weight buffer
 measures cache bandwidth and reports figures above the card's memory peak.
 Rotate buffers.
+
+**Rotating a few copies is not enough either; time a pass over distinct
+weights.** Measured 2026-10-12 (HipKittens `tools/hk-bench/vllm_gemm.py`,
+Qwen3-8B shapes): per-call event timing over 3 rotating copies of a 100.7 MB
+matrix (302 MB, 3x the cache) had upstream vLLM's `wvSplitK` reading "at"
+1917 GB/s, 2.2x HBM peak; 6 copies of a 50 MB matrix gave 1639. Over 36
+distinct weights timed as one back-to-back pass -- what a decode step does --
+the same kernel reads at 769 and 766 GB/s, every output checked. hipBLASLt
+(~40% of HBM) measured the same both ways, so a slow baseline will not reveal
+the problem; only a fast candidate does. Achievable streaming read on this
+card: 680-820 GB/s by size (`hbm_probe.hip`, one kernel per read), up to
+835 GB/s for a back-to-back sequence.
