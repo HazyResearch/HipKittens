@@ -866,13 +866,40 @@ it are worth a sentence:
   a step is filled to the token budget, so M is usually the budget exactly.
 
 **What is left is decode, and decode is GEMV.** At batch 1 the 36 layers' four
-GEMVs plus the LM head take 39.8 ms of a 41.5 ms step on hipBLASLt, at 36-48%
-of the card's 864 GB/s for the layers and 75% for the LM head -- against a
-17.5 ms floor for streaming the 15.1 GB of weights once. The engine has no
-GEMV of its own on gfx1100; upstream vLLM has since enabled its skinny GEMM
-on gfx11, but only for one to five tokens. That is the next kernel: a GEMV
-at 80% of the bandwidth would take a decode step from ~41 to ~23 ms, and every
-shape in the left half of this table is nearly all decode.
+GEMVs plus the LM head take 39.7 ms of a 41.5 ms step on hipBLASLt, at 37-46%
+of the card's 864 GB/s for the layers and 75% for the LM head. What a kernel
+can reach is measured, not the datasheet: `tools/hk-bench/hbm_probe.hip`
+streams 680-820 GB/s depending on size, and upstream vLLM's `wvSplitK` --
+which upstream has since enabled on gfx11, for one to five tokens -- reaches
+743-835 GB/s on these exact matrices, built standalone for gfx1100. Per decode
+step, in GEMM milliseconds (`vllm_gemm.py --upstream-skinny`):
+
+```
+tokens     installed vLLM   upstream vLLM   best of everything
+             (hipBLASLt)    (wvSplitK <= 5)   incl. rocBLAS, hk
+  1             39.7            19.1             19.1
+  4             39.7            20.4             20.4
+  8             39.5            39.5             34.8
+ 16             41.4            41.4             36.5
+ 32             41.1            41.1             36.4
+ 64             42.0            42.0             38.2
+128             55.0            55.0             37.5   <- hk GEMM, 1.36x
+```
+
+So the gap has a precise shape. At one to five tokens a near-ceiling GEMV
+exists and the installed engine cannot run it. From six tokens up nobody has
+one: every library lands at 35-42 ms, about half of what `wvSplitK` shows is
+reachable. That band -- the batch sizes a serving engine spends most of its
+decode steps in -- is the next kernel, a thin-M GEMM in the DSL; and at batch
+128 the existing GEMM is already 1.36x, which the routing rule, written for
+prefill, currently leaves on the table.
+
+One measurement lesson cost a run and is worth keeping: timing each call
+separately over three rotating weight copies let the Infinity Cache serve most
+of a 100 MB matrix to `wvSplitK`, which then read "at" 1917 GB/s, 2.2x the HBM
+peak. hipBLASLt, too slow to notice the cache, measured the same either way.
+The harness now times what a decode step does: one pass over 36 distinct
+weights, back to back.
 
 Four facts about vLLM's plugin surface are written down in
 `vllm_backend.py` because each cost a run to find: `AttentionBackendEnum` is

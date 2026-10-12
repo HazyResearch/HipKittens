@@ -15,10 +15,13 @@ numbers: qkv, o, gate_up and down per layer, plus the LM head. `--m` is the
 token count of a step -- the batch size for decode, the summed prompt lengths
 for a prefill step.
 
-Weights rotate through enough copies to overflow the 96 MB Infinity Cache, or a
-decode-shaped GEMV measures cache bandwidth and reports more than the card's
-864 GB/s. Every variant is checked against an fp32 reference before it is
-timed, and variants interleave in one process.
+Each shape is timed the way a decode step reads it: one pass over as many
+distinct weights as the model has layers, back to back, under one pair of
+events. Not per call over a few rotating copies: that let the 96 MB Infinity
+Cache serve most of a 100 MB matrix to upstream's wvSplitK, which then read
+"at" 1917 GB/s, 2.2x the card's HBM peak, while hipBLASLt -- too slow to
+notice -- measured the same either way. Every variant is checked against an
+fp32 reference before it is timed, and variants interleave in one process.
 
     HIP_VISIBLE_DEVICES=0 python3 tools/hk-bench/vllm_gemm.py --model Qwen/Qwen3-8B
 """
@@ -38,7 +41,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 PEAK_TFLOPS = 100.5
 PEAK_GBS = 864.0
 
-#: Bytes of weights each shape rotates through. Three times the Infinity Cache.
+#: The least weight traffic one timed pass may cover, for a model with too
+#: few layers to overflow the Infinity Cache on its own. Three times its size.
 ROTATE_BYTES = 3 * 96 * 2**20
 
 #: vLLM computes logits for the last token of each sequence only, so the LM
@@ -86,7 +90,11 @@ def main() -> int:
     ap.add_argument("--shapes", default="",
                     help="comma-separated subset of qkv,o,gate_up,down,lm_head")
     ap.add_argument("--rounds", type=int, default=6)
-    ap.add_argument("--block", type=int, default=8)
+    ap.add_argument("--upstream-skinny", default="",
+                    help="directory holding a standalone build of upstream "
+                         "vLLM's skinny GEMMs (its build.py registers "
+                         "torch.ops.upstream_skinny); adds its wvSplitK "
+                         "wherever upstream would dispatch it, M <= 5")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -128,10 +136,20 @@ def main() -> int:
     def set_blas(name):
         torch.backends.cuda.preferred_blas_library(name)
 
+    # Upstream vLLM has since enabled its skinny GEMM on gfx11, for one to
+    # five tokens. The installed engine cannot run it, but a newer one would,
+    # so a decode kernel has to be measured against it too.
+    wvsplitk = None
+    if args.upstream_skinny:
+        sys.path.insert(0, args.upstream_skinny)
+        import build  # noqa: F401,PLC0415 -- registers the ops
+
+        wvsplitk = torch.ops.upstream_skinny.wvSplitK
+
     results = []
     for sname, n, k, per_step in shapes:
         w_bytes = n * k * 2
-        copies = max(2, -(-ROTATE_BYTES // w_bytes))
+        copies = max(per_step, -(-ROTATE_BYTES // w_bytes))
         g = torch.Generator(device=dev).manual_seed(0)
         ws = [torch.randn(n, k, device=dev, dtype=torch.bfloat16, generator=g)
               * k ** -0.5 for _ in range(copies)]
@@ -142,11 +160,6 @@ def main() -> int:
             out = torch.empty(m, n, device=dev, dtype=torch.bfloat16)
             ref = (x.float() @ ws[0].float().t())
             scale = ref.abs().max().item()
-            it = [0]
-
-            def nxt():
-                it[0] = (it[0] + 1) % copies
-                return ws[it[0]]
 
             # name -> (setup, call, teardown). setup/teardown run once per
             # block, outside the timed region, so a library switch is not
@@ -160,6 +173,11 @@ def main() -> int:
             op = hk_op(m, n, k)
             if op is not None:
                 variants["hk"] = (None, lambda w: op(x, w, out) or out, None)
+            # Upstream's condition, in its names: tokens 0 < n <= 5 and
+            # out-features m == 1 or m > 8; every shape here has m > 8.
+            if wvsplitk is not None and m <= 5 and k % 8 == 0:
+                variants["wvSplitK"] = (
+                    None, lambda w: wvsplitk(w, x, None, cus), None)
 
             # The gate. A variant that is wrong is dropped, loudly, rather
             # than timed: a fast wrong GEMM is not a data point.
@@ -191,16 +209,15 @@ def main() -> int:
                     setup, call, teardown = ok[name]
                     if setup:
                         setup()
-                    for _ in range(2):                      # settle
-                        call(nxt())
-                    for _ in range(args.block):
-                        w = nxt()
-                        s, e = torch.cuda.Event(True), torch.cuda.Event(True)
-                        s.record()
+                    for w in ws[-2:]:                       # settle
                         call(w)
-                        e.record()
-                        torch.cuda.synchronize()
-                        best[name] = min(best[name], s.elapsed_time(e))
+                    s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+                    s.record()
+                    for w in ws:
+                        call(w)
+                    e.record()
+                    torch.cuda.synchronize()
+                    best[name] = min(best[name], s.elapsed_time(e) / copies)
                     if teardown:
                         teardown()
 
@@ -238,8 +255,10 @@ def main() -> int:
     # not -- which is exactly what a patch that routes by shape would run.
     print(f"\nGEMM ms per forward step ({cfg['num_hidden_layers']} layers; "
           f"lm_head only where M <= {MAX_SEQS}, i.e. decode)")
-    print(f"{'M':>7}{'F.linear':>11}{'rocBLAS':>10}{'best-of':>10}"
-          f"{'route hk':>10}{'saving':>8}")
+    upstream = any(r["variant"] == "wvSplitK" for r in results)
+    print(f"{'M':>7}{'F.linear':>11}{'rocBLAS':>10}"
+          + (f"{'upstream':>10}" if upstream else "")
+          + f"{'best-of':>10}{'route hk':>10}{'saving':>8}")
     for m in ms:
         rows = [r for r in results if r["m"] == m]
         by = {}
@@ -247,11 +266,15 @@ def main() -> int:
             by.setdefault(r["shape"], {})[r["variant"]] = r["ms"] * r["per_step"]
         fl = sum(v["F.linear"] for v in by.values() if "F.linear" in v)
         rb = sum(v.get("rocBLAS", v["F.linear"]) for v in by.values())
+        # What upstream vLLM runs: wvSplitK wherever it dispatches it,
+        # unconditionally, and F.linear elsewhere.
+        up = sum(v.get("wvSplitK", v["F.linear"]) for v in by.values())
         bo = sum(min(v.values()) for v in by.values())
         hk_route = sum(min(v["F.linear"], v.get("hk", float("inf")))
                        for v in by.values())
-        print(f"{m:>7}{fl:11.3f}{rb:10.3f}{bo:10.3f}{hk_route:10.3f}"
-              f"{fl / hk_route:7.2f}x")
+        print(f"{m:>7}{fl:11.3f}{rb:10.3f}"
+              + (f"{up:10.3f}" if upstream else "")
+              + f"{bo:10.3f}{hk_route:10.3f}{fl / hk_route:7.2f}x")
 
     if args.out:
         Path(args.out).write_text(json.dumps(results, indent=2))
