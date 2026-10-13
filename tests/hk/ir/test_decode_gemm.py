@@ -62,6 +62,15 @@ def test_one_warp_has_no_combine_and_so_no_cap():
     assert s["warps"] == 1 and s["resident"] == 0
 
 
+def test_the_activation_and_the_output_are_bounded_and_the_weights_are_not():
+    import re
+
+    src = decode_gemm.decode_gemm_kernel("dg_bounds", warps=4).source()
+    assert re.search(r"kittens::load_bounded\(\w+, g\.x,", src)      # M rows
+    assert re.search(r"kittens::store_bounded\(g\.c,", src)
+    assert re.search(r"kittens::load\(\w+, g\.w,", src)              # always whole
+
+
 def test_the_combine_waits_once_unless_told_otherwise():
     once = decode_gemm.decode_gemm_kernel("dg_once", warps=16).source()
     batched = decode_gemm.decode_gemm_kernel("dg_batched", warps=16,

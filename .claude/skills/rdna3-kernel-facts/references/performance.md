@@ -50,6 +50,29 @@ blamed on (fp32 LDS reads compile to `flat_load`, since `kittens::load(rt,st)`
 only vectorises bf16 `row`) was rebuilt on `ds_read_b128` and was not the
 cause.
 
+**Predicate a ragged tile with the buffer range, not with code.** A raw
+buffer descriptor (config word `0x31014000`) whose range ends at the tensor's
+last row makes loads past it return 0 and stores past it vanish -- no branch,
+no masked lane, same instruction count, so hand-placed `vmcnt` immediates
+stay valid. Three ways to get it wrong, all measured 2026-10-13 (HipKittens
+`include/rdna3/ops/warp/memory/tile/global_to_register.cuh`): (1) any
+predicate threaded through a pointer-based load/store loop, even a
+compile-time-constant one, can make LLVM stop folding addresses into
+base+immediate (36 -> 91 VGPRs on an elementwise op); (2) a descriptor
+computed from a value LLVM thinks is per-lane (anything derived from
+threadIdx, including the warp index) gets every buffer op wrapped in a
+waterfall loop -- `readfirstlane` the descriptor words; (3) keep the moving
+part of the address in `soffset` and the descriptor loop-invariant, or the
+descriptor is rebuilt every iteration (the GEMM's staging got 15 VGPRs
+lighter from this alone).
+
+**gfx11 runs with unaligned global/buffer access enabled.** LLVM merges a
+loop of 16-bit loads at unknown alignment into `global_load_b128`, and a
+`buffer_load_b128` from a tensor 2 bytes off a 16-byte boundary returns the
+right data (HipKittens `tests/hk/gpu/test_bounded.py`). An alignment
+fallback around buffer intrinsics is not free: LLVM cannot merge the
+intrinsics, and reserves the fallback's registers whether it runs or not.
+
 **Decode GEMV: W straight to registers, K split across 16 warps,
 interleaved.** Same file: `W*X^T` with W loaded global->register, one 16-row
 block per workgroup, warp w reading K-chunk `t*16 + w` (2 KB contiguous per

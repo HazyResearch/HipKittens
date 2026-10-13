@@ -432,4 +432,231 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
     store<2, RT, GL, COORD>(dst, src, idx);
 }
 
+/*
+ * Row-predicated load and store.
+ *
+ * Separate functions rather than a flag on load()/store_at(), and on buffer
+ * instructions rather than on those functions' pointers. Both choices were
+ * measured. A predicate threaded through the pointer path -- even one that is
+ * a compile-time constant on the unbounded side -- changed how LLVM addresses
+ * every store (32 base+offset stores became 32 separate address pairs, 36 ->
+ * 91 VGPRs on an elementwise op) and spilled the GEMM. A buffer resource whose
+ * range ends at the tensor's last row needs no predicate in the code at all:
+ * the hardware returns zero for a load past the range and drops a store past
+ * it, with no branch, no masked lane, and the instruction count of a whole
+ * tile. The bytes past the row never move.
+ *
+ * The voffset is 32-bit, so the tile's rows from its first must span less
+ * than 4 GB -- true of any tensor this library is handed.
+ */
+namespace detail {
+
+template<int axis, int ROWS, typename GL, typename COORD>
+__device__ inline i32x4 row_bounded_srsrc(const GL &g, const COORD &unit, const void *base) {
+    const int valid = rows_in_bounds<axis, ROWS>(g, unit);
+    const uint32_t bytes = uint32_t(valid) * uint32_t(g.template stride<axis>()) *
+                           uint32_t(sizeof(typename GL::dtype));
+    return make_srsrc(base, bytes);
+}
+
+template<typename U>
+__device__ inline U buffer_load_elem(i32x4 srsrc, uint32_t off, uint32_t soff) {
+    static_assert(sizeof(U) == 2 || sizeof(U) == 4, "16- or 32-bit elements");
+    U v;
+    if constexpr (sizeof(U) == 2) {
+        const uint16_t raw = llvm_amdgcn_raw_buffer_load_b16(srsrc, off, soff, 0);
+        __builtin_memcpy(&v, &raw, 2);
+    } else {
+        const uint32_t raw = llvm_amdgcn_raw_buffer_load_b32(srsrc, off, soff, 0);
+        __builtin_memcpy(&v, &raw, 4);
+    }
+    return v;
+}
+
+template<typename U>
+__device__ inline void buffer_store_elem(i32x4 srsrc, uint32_t off, U v) {
+    static_assert(sizeof(U) == 2 || sizeof(U) == 4, "16- or 32-bit elements");
+    if constexpr (sizeof(U) == 2) {
+        uint16_t raw; __builtin_memcpy(&raw, &v, 2);
+        llvm_amdgcn_raw_buffer_store_b16(raw, srsrc, off, 0, 0);
+    } else {
+        uint32_t raw; __builtin_memcpy(&raw, &v, 4);
+        llvm_amdgcn_raw_buffer_store_b32(raw, srsrc, off, 0, 0);
+    }
+}
+
+} // namespace detail
+
+/**
+ * @brief load(), predicated on the tensor's rows: rows of the tile past the
+ * last row of `src` read as zero, and their memory is never touched.
+ *
+ * Same lane mapping and the same two 16-byte accesses per base tile as load()
+ * on its vectorised path; everything else goes element by element, including
+ * the widening case load() vectorises.
+ */
+template<int axis, ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
+__device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &idx) {
+    using T  = typename base_types::packing<typename RT::dtype>::unpacked_type;
+    using U  = typename GL::dtype;
+    using L    = typename RT::layout;
+    using base = rt_base<T, L>;
+
+    constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
+    constexpr int  E      = base::elements_per_thread;
+    constexpr bool vectorizable = is_row && base::element_stride == 1
+                                         && std::is_same_v<T, U> && sizeof(U) == 2;
+
+    // The buffer starts at the tile's first row, column 0, and the column
+    // offset rides in soffset. In a K loop that makes the descriptor and every
+    // lane's voffset loop-invariant and the one moving part a scalar: with the
+    // column folded into the base instead, LLVM hoisted eight voffsets out of
+    // the decode GEMM's loop and the kernel lost a step of occupancy.
+    const auto unit = idx.template unit_coord<axis, 3>();
+    auto row0 = unit;
+    row0.c = 0;
+    const U *row_ptr = (const U*)&src[row0];
+    // An SGPR operand, and uniform by the same argument as the descriptor.
+    const uint32_t col0 = __builtin_amdgcn_readfirstlane(uint32_t(unit.c) * sizeof(U));
+    const int row_stride = src.template stride<axis>();
+    const i32x4 srsrc = detail::row_bounded_srsrc<axis, RT::rows>(src, unit, row_ptr);
+    const int lane = laneid();
+    const int l16  = lane & 15;
+
+    auto elementwise = [&](int i, int j, int row_base, int col_base) {
+        #pragma unroll
+        for(int e = 0; e < E; e++) {
+            const int2 c = rt_base_coord<T, L>(e, lane);
+            const uint32_t off = ((row_base + c.x)*row_stride + col_base + c.y) * sizeof(U);
+            const T val = base_types::convertor<T, U>::convert(
+                detail::buffer_load_elem<U>(srsrc, off, col0));
+            if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
+            else       dst.tiles[i][j].data[e>>1].x = val;
+        }
+    };
+
+    #pragma unroll
+    for(int i = 0; i < dst.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < dst.width; j++) {
+            const int row_base = i*dst.tile_size_row;
+            const int col_base = j*dst.tile_size_col;
+            if constexpr (vectorizable) {
+                // No alignment branch, unlike load(): gfx11 runs with
+                // unaligned access enabled -- LLVM merges load()'s own
+                // elementwise fallback into the same 16-byte loads -- and a
+                // fallback here is 16 separate buffer loads per base tile that
+                // LLVM cannot merge, whose registers the allocator reserves
+                // whether the branch runs or not (+10 VGPRs on the decode GEMM).
+                const uint32_t off = ((row_base + l16)*row_stride + col_base) * sizeof(U);
+                #pragma unroll
+                for(int h = 0; h < 2; h++) {
+                    const __uint128_t raw =
+                        llvm_amdgcn_raw_buffer_load_b128(srsrc, off + 16*h, col0, 0);
+                    __builtin_memcpy((void*)&dst.tiles[i][j].data[4*h], &raw, sizeof(raw));
+                }
+            }
+            else elementwise(i, j, row_base, col_base);
+        }
+    }
+}
+template<ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
+__device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &idx) {
+    load_bounded<2, RT, GL, COORD>(dst, src, idx);
+}
+
+/**
+ * @brief store(), predicated on the tensor's rows: rows of the tile past the
+ * last row of `dst` are not written.
+ *
+ * The vectorised and the packed (fp32 accumulator narrowed to 16 bits) paths
+ * are store_at()'s, writing through the buffer; the rest go element by element.
+ */
+template<int axis, ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
+__device__ inline static void store_bounded(const GL &dst, const RT &src, const COORD &idx) {
+    using T  = typename base_types::packing<typename RT::dtype>::unpacked_type;
+    using U  = typename GL::dtype;
+    using L    = typename RT::layout;
+    using base = rt_base<T, L>;
+
+    constexpr bool is_row = std::is_same_v<L, ducks::rt_layout::row>;
+    constexpr int  E      = base::elements_per_thread;
+    constexpr bool vectorizable = is_row && base::element_stride == 1
+                                         && std::is_same_v<T, U> && sizeof(U) == 2;
+    constexpr bool packable = is_row && !vectorizable
+                                     && base::element_stride == 2
+                                     && base::halves_interleave
+                                     && sizeof(U) < sizeof(T)
+                                     && (2*E*sizeof(U)) % 16 == 0;
+
+    const auto unit = idx.template unit_coord<axis, 3>();
+    U *dst_ptr = (U*)&dst[unit];
+    const int row_stride = dst.template stride<axis>();
+    const i32x4 srsrc = detail::row_bounded_srsrc<axis, RT::rows>(dst, unit, dst_ptr);
+    const int lane = laneid();
+    const int l16  = lane & 15;
+    const int half = lane >> 4;
+    const bool aligned =
+        ((reinterpret_cast<uintptr_t>(dst_ptr) | (row_stride * sizeof(U))) & 15) == 0;
+
+    auto elementwise = [&](int i, int j, int row_base, int col_base) {
+        #pragma unroll
+        for(int e = 0; e < E; e++) {
+            const int2 c = rt_base_coord<T, L>(e, lane);
+            const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
+                                : src.tiles[i][j].data[e>>1].x;
+            detail::buffer_store_elem<U>(
+                srsrc, ((row_base + c.x)*row_stride + col_base + c.y) * sizeof(U),
+                base_types::convertor<U, T>::convert(v));
+        }
+    };
+
+    #pragma unroll
+    for(int i = 0; i < src.height; i++) {
+        #pragma unroll
+        for(int j = 0; j < src.width; j++) {
+            const int row_base = i*src.tile_size_row;
+            const int col_base = j*src.tile_size_col;
+            const uint32_t run = ((row_base + l16)*row_stride + col_base) * sizeof(U);
+            if constexpr (vectorizable) {
+                if (aligned) {
+                    #pragma unroll
+                    for(int h = 0; h < 2; h++) {
+                        __uint128_t raw;
+                        __builtin_memcpy(&raw, (const void*)&src.tiles[i][j].data[4*h], sizeof(raw));
+                        llvm_amdgcn_raw_buffer_store_b128(raw, srsrc, run + 16*h, 0, 0);
+                    }
+                }
+                else elementwise(i, j, row_base, col_base);
+            }
+            else if constexpr (packable) {
+                if (aligned) {
+                    U val[E];
+                    #pragma unroll
+                    for(int e = 0; e < E; e++) {
+                        const T v = (e & 1) ? src.tiles[i][j].data[e>>1].y
+                                            : src.tiles[i][j].data[e>>1].x;
+                        val[e] = base_types::convertor<U, T>::convert(v);
+                    }
+                    constexpr int NW = 2*E*sizeof(U)/4;
+                    unsigned int w[NW];
+                    detail::pack_interleaved_run<U, E>(val, half, w);
+                    #pragma unroll
+                    for(int k = 0; k < NW/4; k++) {
+                        __uint128_t raw;
+                        __builtin_memcpy(&raw, &w[4*k], sizeof(raw));
+                        llvm_amdgcn_raw_buffer_store_b128(raw, srsrc, run + 16*k, 0, 0);
+                    }
+                }
+                else elementwise(i, j, row_base, col_base);
+            }
+            else elementwise(i, j, row_base, col_base);
+        }
+    }
+}
+template<ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
+__device__ inline static void store_bounded(const GL &dst, const RT &src, const COORD &idx) {
+    store_bounded<2, RT, GL, COORD>(dst, src, idx);
+}
+
 }

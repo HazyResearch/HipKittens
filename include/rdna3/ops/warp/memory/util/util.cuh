@@ -65,6 +65,36 @@ __device__ inline float4 load_global_vec4(const float4* gptr) {
     return v;   
 }
 
+#ifndef KITTENS_ROW_BOUNDS
+#define KITTENS_ROW_BOUNDS 1
+#endif
+
+/**
+ * @brief How many of a tile's TILE_ROWS rows, starting at element coordinate
+ *        `uc`, lie inside `g` along `axis` -- clamped to [0, TILE_ROWS].
+ *
+ * The row predicate every global load and store below applies: past it a load
+ * reads zero and a store writes nothing, so a tile hanging off the end of a
+ * tensor is legal instead of a read past the allocation. It is one scalar
+ * compare, and for a whole tile every caller takes its unpredicated path.
+ * Where the loads are buffer ops the predicate is the buffer's range and the
+ * instruction count does not change, which is what keeps a hand-placed vmcnt
+ * a compile-time immediate.
+ *
+ * KITTENS_ROW_BOUNDS=0 treats every tile as whole -- the behaviour before the
+ * predicate existed, kept so the two can be timed against each other.
+ */
+template<int axis, int TILE_ROWS, typename GL, typename COORD>
+__device__ inline int rows_in_bounds(const GL &g, const COORD &uc) {
+#if KITTENS_ROW_BOUNDS
+    const int start = axis == 0 ? uc.b : axis == 1 ? uc.d : uc.r;
+    const int left = int(g.template shape<axis>()) - start;
+    return left <= 0 ? 0 : (left < TILE_ROWS ? left : TILE_ROWS);
+#else
+    return TILE_ROWS;
+#endif
+}
+
 using i32x4 = int32_t __attribute__((ext_vector_type(4)));
 struct buffer_resource {
     uint64_t ptr;
@@ -110,8 +140,24 @@ __device__ inline i32x4 make_srsrc(const void* ptr, uint32_t range_bytes) {
     std::uintptr_t as_int = reinterpret_cast<std::uintptr_t>(ptr);   // width = sizeof(void*)
     std::uint64_t  as_u64 = static_cast<std::uint64_t>(as_int);    // widen if host is 32-bit
     buffer_resource rsrc = make_buffer_resource(as_u64, range_bytes, GFX11_BUFFER_CONFIG);
-    return *reinterpret_cast<const i32x4*>(&rsrc);
+    i32x4 r = *reinterpret_cast<const i32x4*>(&rsrc);
+    // A buffer instruction takes its descriptor in SGPRs. Every caller builds
+    // it from a tile coordinate, which is uniform across the wave, but LLVM
+    // cannot always see that -- a coordinate derived from the warp index looks
+    // per-lane -- and then wraps each buffer op in a waterfall loop. On the
+    // GEMM's bounded epilogue that was 64 loops and 8% of the kernel.
+    r.x = __builtin_amdgcn_readfirstlane(r.x);
+    r.y = __builtin_amdgcn_readfirstlane(r.y);
+    r.z = __builtin_amdgcn_readfirstlane(r.z);
+    r.w = __builtin_amdgcn_readfirstlane(r.w);
+    return r;
 }
+
+__device__ uint16_t llvm_amdgcn_raw_buffer_load_b16(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+    __asm("llvm.amdgcn.raw.buffer.load.i16");
+
+__device__ uint32_t llvm_amdgcn_raw_buffer_load_b32(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
+    __asm("llvm.amdgcn.raw.buffer.load.i32");
 
 __device__ uint64_t llvm_amdgcn_raw_buffer_load_b64(i32x4 srsrc, uint32_t voffset, uint32_t soffset, uint32_t coherency)
     __asm("llvm.amdgcn.raw.buffer.load.i64");

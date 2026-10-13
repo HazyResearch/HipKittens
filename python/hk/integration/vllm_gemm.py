@@ -16,10 +16,10 @@ checked against fp32 before it is timed):
     anything else                     vLLM's own path
 
 The gap between the first two rows is a comb, not a curve. The last M block
-backs up to end at M and recomputes a full 128 rows, so between multiples of
-128 the kernel does extra work, and at small grids two workgroups then share a
-WGP: M=192 measured 0.71-0.95x. Above 1024 the wasted rows are at most an
-eighth of the work, which the kernel's lead covers.
+computes a full 128 rows of which only the remainder is kept, so between
+multiples of 128 the kernel does extra work, and at small grids two workgroups
+then share a WGP: M=192 measured 0.71-0.95x. Above 1024 the wasted rows are at
+most an eighth of the work, which the kernel's lead covers.
 
 Decode is the third row, and a different problem: M is the batch, the math is
 free, and the whole cost is streaming the weights once. `ops.decode_gemm` is
@@ -167,16 +167,13 @@ def linear(x, weight, bias=None):
         from ..ops import decode_gemm  # noqa: PLC0415
 
         s = decode_gemm.schedule_for(m, k)
-        rows = 16 * s["tokens"]
         x2 = x.reshape(m, k)
-        if m < rows:
-            x2 = torch.nn.functional.pad(x2, (0, 0, 0, rows - m))
-        elif not x2.is_contiguous():
+        if not x2.is_contiguous():
             x2 = x2.contiguous()
-        out = torch.empty((rows, n), device=x.device, dtype=x.dtype)
+        out = torch.empty((m, n), device=x.device, dtype=x.dtype)
         _decode_op(s)(x2, weight, out)
         STATS["hk_decode"] += 1
-        return out[:m].view(*x.shape[:-1], n)
+        return out.view(*x.shape[:-1], n)
     STATS["fallback"] += 1
     return _fallback(x, weight, bias)
 

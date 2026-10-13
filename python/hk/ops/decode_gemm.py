@@ -54,8 +54,8 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
     concurrent streams read faster here: at 16 warps, 2 per WGP beat 4 by 11%
     on a 12288-deep layer and 7% on a 4096-wide one, for the same code.
 
-    X and C must have exactly 16*tokens rows allocated: the loads and the
-    store are whole tiles, unpredicated. K must be a multiple of
+    X and C have the batch's M rows, any M up to 16*tokens: the X loads and
+    the store are predicated on rows. K must be a multiple of
     16*slices*warps.
     """
     m_rows = 16 * tokens
@@ -88,7 +88,9 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
         for t in _ops.range(rounds):
             k = (t * warps + wid) * kc
             w_t = _ops.load(w, _ops.elem_coord(0, 0, n0, k), ty_w)
-            x_t = _ops.load(x, _ops.elem_coord(0, 0, 0, k), ty_x)
+            # Bounded: X has the batch's M rows, not a padded 16*tokens, and
+            # the rows past M read as zero instead of past its allocation.
+            x_t = _ops.load(x, _ops.elem_coord(0, 0, 0, k), ty_x, bounded=True)
             _ops.mma_ABt(w_t, x_t, acc, out=acc)
 
         out = _ops.transpose(acc)
@@ -102,9 +104,9 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
                         _ops.sched_barrier()
                     other = _ops.load_shared(_ops.shared_at(parts, i), ty_out)
                     _ops.add(out, other, out=out)
-                _ops.store(c, out, _ops.elem_coord(0, 0, 0, n0))
+                _ops.store(c, out, _ops.elem_coord(0, 0, 0, n0), bounded=True)
         else:
-            _ops.store(c, out, _ops.elem_coord(0, 0, 0, n0))
+            _ops.store(c, out, _ops.elem_coord(0, 0, 0, n0), bounded=True)
 
     body.__name__ = name
     body.__annotations__ = {"x": GL[bf16], "w": GL[bf16], "c": GL[bf16]}
@@ -187,10 +189,8 @@ def fits(m: int, n: int, k: int) -> bool:
 def matmul(x, w, **override):
     """x @ w.T for a decode batch. `w` is (N, K), as in `gemm.matmul`.
 
-    Returns the first M rows of a buffer padded to whole token tiles; the
-    padding is the kernel's, not the caller's. `override` replaces fields of
-    the schedule (slices, warps, combine_depth, resident) -- for measuring,
-    not for use.
+    `override` replaces fields of the schedule (slices, warps, combine_depth,
+    resident) -- for measuring, not for use.
     """
     import torch  # noqa: PLC0415 -- hk traces and compiles without torch
 
@@ -209,14 +209,11 @@ def matmul(x, w, **override):
             f"decode matmul: M={m} must be in [1, {16 * MAX_TOKENS}], N={n} a "
             f"multiple of 16, and K={k} a multiple of 16 x slices x warps "
             f"(every warp takes whole rounds)")
-    rows = 16 * s["tokens"]
-    if m < rows:
-        x = torch.nn.functional.pad(x, (0, 0, 0, rows - m))
-    elif not x.is_contiguous():
+    if not x.is_contiguous():
         x = x.contiguous()
-    out = torch.empty((rows, n), device=x.device, dtype=torch.bfloat16)
+    out = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
     kernel_for(**s)(x, w.contiguous(), out)
-    return out[:m]
+    return out
 
 
 __all__ = ["MAX_TOKENS", "SCHEDULES", "decode_gemm_kernel", "fits",

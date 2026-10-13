@@ -11,9 +11,9 @@ can be wrong in a way no single shape exposes:
 
   * the L2 swizzle (WGM) only does anything once there is more than one
     block-row, so M has to exceed 128 and the shapes have to be non-square;
-  * the backing-up M remainder only runs when M is not a multiple of 128, and
-    when it does it makes two workgroups recompute an overlapping strip --
-    which is only safe if they write identical bytes;
+  * the predicated M remainder only runs when M is not a multiple of 128,
+    and when it does the last block's loads past M must read zero and its
+    stores past M must not happen;
   * the K loop's prologue and epilogue are separate code from its body, so a
     shape with a single K-tile exercises neither rotation nor staging.
 """
@@ -69,31 +69,35 @@ def test_shapes_that_tile(m, n, k):
 
 
 @pytest.mark.parametrize("m", [129, 200, 255, 384 + 17])
-def test_ragged_m_backs_up(m):
+def test_ragged_m_is_predicated(m):
     """M need not be a multiple of 128.
 
-    The last block starts at M-128 instead of being predicated, so it overlaps
-    the one before it. Both workgroups compute those rows from the same A rows
-    and the same full K, so they write identical bytes -- but only if the
-    epilogue's row coordinate is in elements rather than tiles, which is
-    exactly the kind of thing that is right in the prologue and wrong here.
+    The last block runs past M: its A rows past M are staged as zeros by the
+    buffer range and its bounded store writes only rows below M. The epilogue's
+    row coordinate has to be in elements for that bound to land on the right
+    row, which is the kind of thing that is right in the prologue and wrong
+    here.
     """
     _run(m, 256, 128)
 
 
-def test_the_overlap_is_not_a_race():
-    """Same ragged shape, many times, same answer.
+@pytest.mark.parametrize("m", [1, 5, 16, 17, 64, 127])
+def test_m_below_one_block(m):
+    """Below 128 rows there is one partial block -- or, at 16 and under, the
+    thin tiling's one block -- and every row past M is predicated off."""
+    _run(m, 256, 192)
 
-    Two workgroups writing the same strip is safe only if they agree
-    bit-for-bit. If they do not, which one lands is scheduling, so a single
-    comparison against torch can pass by luck.
-    """
+
+def test_nothing_is_written_past_m():
+    """The rows after the output's last are someone else's memory. Carve the
+    output out of a larger buffer and check the rows after it are untouched."""
     torch.manual_seed(7)
-    a = torch.randn(300, 128, device="cuda", dtype=torch.bfloat16)
+    a = torch.randn(200, 128, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
-    first = hk.ops.matmul(a, b).clone()
-    for _ in range(20):
-        assert torch.equal(hk.ops.matmul(a, b), first)
+    room = torch.full((256, 256), 7.0, device="cuda", dtype=torch.bfloat16)
+    hk.ops.matmul(a, b, out=room[:200])
+    torch.testing.assert_close(room[:200].float(), _ref(a, b), rtol=RTOL, atol=ATOL)
+    assert torch.equal(room[200:], torch.full_like(room[200:], 7.0))
 
 
 def test_k_is_not_summed_twice():
@@ -127,7 +131,6 @@ def test_it_is_a_times_b_transposed():
 @pytest.mark.parametrize("m,n,k,match", [
     (128, 128, 96, "multiple of 64"),     # K does not tile
     (128, 192, 128, "multiple of 128"),   # N does not tile
-    (64, 128, 128, "below one block"),    # M too short to back up into
 ])
 def test_untileable_shapes_are_refused(m, n, k, match):
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)

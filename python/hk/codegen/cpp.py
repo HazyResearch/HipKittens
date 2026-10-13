@@ -314,16 +314,18 @@ class Emitter:
 
     def _op_load_global(self, op: Op) -> None:
         dst, (src, idx) = self._dest(op)
+        fn = "load_bounded" if op.attrs.get("bounded") else "load"
         self.w(
-            f"kittens::load({self.name(dst)}, {self.name(src)}, "
+            f"kittens::{fn}({self.name(dst)}, {self.name(src)}, "
             f"{self._coord_arg(idx, self.cpp(dst.type))});"
         )
 
     def _op_store_global(self, op: Op) -> None:
         dst, val, idx = op.operands
         ty = val.type
+        fn = "store_bounded" if op.attrs.get("bounded") else "store"
         self.w(
-            f"kittens::store({self.name(dst)}, {self.name(val)}, "
+            f"kittens::{fn}({self.name(dst)}, {self.name(val)}, "
             f"{self._coord_arg(idx, self.cpp(ty))});"
         )
 

@@ -127,12 +127,12 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
         row = first_m + ((wgid % per_group) % group_m)
         col = (wgid % per_group) // group_m
 
-        # M remainder by backing the last block up, not by predicating it: the
-        # staging path has no bounds check, and predicating the issue would
-        # make the right vmcnt a runtime value, which no instruction accepts.
-        # The overlap recomputes rows from the same A and the same full K, so
-        # both workgroups write identical bytes.
-        m_base = _ops.s_max(_ops.s_min(row * block_m, M - block_m), 0)
+        # The M remainder is predicated, not backed up. Staging is a buffer
+        # load whose range ends at A's last row, so rows past M read zero with
+        # exactly the loads a whole tile issues -- vmcnt stays the immediate it
+        # was -- and the bounded store writes only rows below M. That is also
+        # what lets M be smaller than one block.
+        m_base = row * block_m
 
         wid = _ops.warp_id()
         warp_row = wid // warp_cols
@@ -255,13 +255,13 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
         # caller has to remember to pass.
         dot_tile((n_tiles - 1) % 2)
 
-        # Columns are in units of the chunk width; rows in elements, because
-        # m_base need not be a multiple of BLOCK_M.
+        # Columns are in units of the chunk width; rows in elements.
         m_row = m_base + warp_row * reg_m
         col_tile = (col * warp_cols + warp_col) * n_split
         for s in range(n_split):
             _ops.store(c, C_acc[s],
-                       _ops.elem_coord(0, 0, m_row, (col_tile + s) * split_n))
+                       _ops.elem_coord(0, 0, m_row, (col_tile + s) * split_n),
+                       bounded=True)
 
     body.__name__ = name
     body.__annotations__ = {"a": GL[bf16], "b": GL[bf16], "c": GL[bf16]}
@@ -355,10 +355,16 @@ TUNER = _autotune.Tuner("gemm_bf16", _make, SPACE, DEFAULT,
 #: through the tuner -- cache warming, resource checks, the tests.
 KERNELS = {"gemm_bf16_128x128": TUNER._kernel_for(DEFAULT)}
 
-#: What the default tiling requires of a shape. K and N have to tile exactly --
-#: the staging path has no bounds check and predicating it would make vmcnt a
-#: runtime value. M does not, because the last block backs up instead.
+#: What the default tiling requires of a shape. K and N have to tile exactly;
+#: M does not, because the last block row is predicated (see gemm_kernel).
 BLOCK_M, BLOCK_N, K_STEP = DEFAULT["block_m"], DEFAULT["block_n"], DEFAULT["k_step"]
+
+#: For a batch of at most 16 rows: one 16-row block, so a decode-sized M does
+#: not compute 128 rows to keep one. 1.19-1.62x over hipBLASLt on Qwen3-8B's
+#: decode shapes at M=16 (python/README.md), though hk.ops.decode_gemm, laid
+#: out for the weight stream, is faster still.
+THIN = dict(block_m=16, block_n=128, k_step=64, dot_slice=16, warps=4,
+            warp_rows=1, n_split=2, wgm=8, write_pos=2)
 
 
 def _bucket(m: int) -> int:
@@ -366,7 +372,7 @@ def _bucket(m: int) -> int:
 
     A record per exact M would be a record per batch size, which is a cache
     that never hits. The schedule's sensitivity to M is through how many
-    block-rows there are and whether the last one backs up, and that moves on a
+    block-rows there are and how full the last one is, and that moves on a
     log scale.
     """
     b = 1
@@ -385,7 +391,10 @@ def schedule_for(m: int, n: int, k: int) -> Dict[str, Any]:
     cannot tile the shape in front of it loses to the one that can.
     """
     s = TUNER.schedule_for(f"{_bucket(m)}x{n}x{k}")
-    if k % s["k_step"] or n % s["block_n"] or m < s["block_m"]:
+    if s == DEFAULT and m <= THIN["block_m"] and not (k % THIN["k_step"] or
+                                                     n % THIN["block_n"]):
+        return dict(THIN)
+    if k % s["k_step"] or n % s["block_n"]:
         return dict(DEFAULT)
     return s
 
@@ -415,16 +424,11 @@ def matmul(a, b, out=None):
     if k % k_step or n % block_n:
         raise ValueError(
             f"matmul: K={k} must be a multiple of {k_step} and N={n} a multiple "
-            f"of {block_n}. Only M may be ragged -- the last block backs up to "
-            f"end at M and recomputes the overlap, which it can do because the "
-            f"rows it repeats are a function of A and the full K alone."
+            f"of {block_n}. Only M may be ragged: rows of the last block past M "
+            f"are loaded as zeros and not stored."
         )
-    if m < block_m:
-        raise ValueError(
-            f"matmul: M={m} is below one block ({block_m}). Backing up needs a "
-            f"whole block of rows to back into; a short-M shape wants the thin "
-            f"tiling, which is not ported yet."
-        )
+    if m < 1:
+        raise ValueError(f"matmul: M={m}; there is nothing to multiply")
     if out is None:
         out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
     elif out.shape != (m, n) or out.dtype != torch.bfloat16:

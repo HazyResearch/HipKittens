@@ -210,7 +210,8 @@ del _n
 # ---------------------------------------------------------------- memory
 
 
-def load(src: Value, idx: Value, tile, *, out: Optional[Value] = None) -> Value:
+def load(src: Value, idx: Value, tile, *, out: Optional[Value] = None,
+         bounded: bool = False) -> Value:
     """Global -> register tile, or global -> register vector.
 
     One function for both because `kittens::load` is one overload set, and
@@ -221,25 +222,41 @@ def load(src: Value, idx: Value, tile, *, out: Optional[Value] = None) -> Value:
     The element type converts on the way in, for free -- a bf16 tensor loaded
     into an fp32 tile costs exactly what a bf16 tile would. That is the
     sanctioned way to get fp32 accumulation.
+
+    `bounded=True` predicates the tile on `src`'s rows: rows past the last one
+    read as zero and their memory is never touched, so a tile may hang off the
+    end of the tensor -- the last 16 rows of a 5-row batch, say. It is opt-in
+    because it is not free in registers: always on, it cost the paged decode
+    kernel 66 VGPRs of spill for tiles that are never ragged.
     """
     _expect(src, GlobalType, "load source")
     _expect(idx, CoordType, "load index")
     if not isinstance(tile, _ELEMENTWISE):
         raise TypeError(f"load destination type is {tile!r}, expected a tile or a vector")
+    if bounded and not isinstance(tile, RegTileType):
+        raise TypeError(f"load(bounded=True) predicates tile rows; {tile!r} is not a tile")
     # `out=` matters here for the same reason it does on load_shared: a global
     # read issued in one loop iteration and consumed in the next has to land in
     # a register that exists outside the loop. Without it the prefetch is
     # unwriteable -- the value traced inside the body is a different value every
     # iteration, and the IR rejects one escaping.
-    return _emit("load_global", [src, idx], tile, out=out, name="ld")
+    return _emit("load_global", [src, idx], tile, out=out, name="ld",
+                 bounded=bool(bounded))
 
 
-def store(dst: Value, val: Value, idx: Value) -> None:
-    """Register tile or vector -> global."""
+def store(dst: Value, val: Value, idx: Value, *, bounded: bool = False) -> None:
+    """Register tile or vector -> global.
+
+    `bounded=True` writes only the tile's rows that lie inside `dst`; see
+    `load`. This is what lets a GEMM's last M block run past M instead of
+    backing up over its neighbour.
+    """
     _expect(dst, GlobalType, "store destination")
     _expect(idx, CoordType, "store index")
     _expect(val, _ELEMENTWISE, "store value")
-    _b().emit("store_global", [dst, val, idx])
+    if bounded and not isinstance(val.type, RegTileType):
+        raise TypeError(f"store(bounded=True) predicates tile rows; {val.type!r} is not a tile")
+    _b().emit("store_global", [dst, val, idx], bounded=bool(bounded))
 
 
 def store_scalar(dst: Value, val: Value, idx: Value) -> None:

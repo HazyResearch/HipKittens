@@ -40,6 +40,9 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx)
 
     coord<> unit_coord = idx.template unit_coord<axis, 3>();
     typename GL::dtype *src_ptr = (typename GL::dtype*)&src[unit_coord];
+    // Rows past the tensor's end are written to LDS as zeros, not skipped: the
+    // tile's previous contents would otherwise be read as data.
+    const int valid_rows = rows_in_bounds<axis, ST::rows>(src, unit_coord);
 
     uint32_t dst_ptr = reinterpret_cast<uintptr_t>(&dst.data[0]);
     const int laneid = threadIdx.x % N_THREADS;
@@ -62,9 +65,10 @@ __device__ inline void load(ST& dst, const GL& src, const COORD& idx)
             int row = load_idx / memcpy_per_row;
             int col = (load_idx % memcpy_per_row) * elem_per_memcpy;
 
-            if (row < dst.rows) {
+            if (row < valid_rows) {
                 buf[j] = load_global_vec4_async((float4*) (src_ptr + (row * row_stride + col))); // thread loads 128-bits, 16-bytes
             }
+            else buf[j] = float4{0.f, 0.f, 0.f, 0.f};
         }
 
         #ifdef BUILTINS_ONLY
@@ -129,15 +133,25 @@ __device__ inline void load_global_to_register_buffer(float4* reg_buffer, const 
 
     const int row_stride = src.template stride<axis>();
     coord<> unit_coord = idx.template unit_coord<axis, 3>();
-    T* base_ptr = (T*)&src[unit_coord];  // global memory pointer
+    // The buffer starts at the tile's first row, column 0; the tile's column
+    // offset is the instruction's soffset. In a K loop the descriptor is then
+    // loop-invariant and the one moving part is a scalar, where building it
+    // at the tile's own column rebuilt base and descriptor every K-tile.
+    coord<> row0 = unit_coord;
+    row0.c = 0;
+    T* row_ptr = (T*)&src[row0];
+    const uint32_t col0 = uint32_t(unit_coord.c) * sizeof(T);
     const int laneid = threadIdx.x % N_THREADS;
 
-    // buffer resource: a plain raw buffer spanning this tile's rows, so reads
-    // past the last row clamp to zero instead of walking off the allocation.
-    // The config word is the gfx11 one -- see make_srsrc; the gfx9 word the CDNA
-    // tree uses silently reads back zeros here.
-    const int total_bytes = row_stride * ST::rows * sizeof(T);
-    i32x4 srsrc = make_srsrc(base_ptr, total_bytes);
+    // buffer resource: a plain raw buffer spanning the tile's rows that are
+    // inside the tensor, so reads past the tensor's last row clamp to zero
+    // instead of walking off the allocation -- with exactly the loads a whole
+    // tile issues, so the caller's vmcnt is unchanged. The config word is the
+    // gfx11 one -- see make_srsrc; the gfx9 word the CDNA tree uses silently
+    // reads back zeros here.
+    const int valid_rows = rows_in_bounds<axis, ST::rows>(src, unit_coord);
+    const int total_bytes = row_stride * valid_rows * sizeof(T);
+    i32x4 srsrc = make_srsrc(row_ptr, total_bytes);
 
     // Buffer slot c holds chunk c*N_THREADS + laneid. store_register_buffer_to_shared
     // below walks the identical indexing, which is what keeps the two halves of
@@ -149,7 +163,7 @@ __device__ inline void load_global_to_register_buffer(float4* reg_buffer, const 
             int row = chunk_idx / memcpy_per_row;
             int col = (chunk_idx % memcpy_per_row) * elem_per_memcpy;
             int byte_offset = (row * row_stride + col) * sizeof(T);
-            __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(srsrc, byte_offset, 0, 0);
+            __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(srsrc, byte_offset, col0, 0);
             reg_buffer[c] = *reinterpret_cast<float4*>(&raw);
         }
     }
@@ -229,6 +243,7 @@ __device__ static inline void store(const GL &dst, const ST &src, const COORD &i
 
     coord<> unit_coord = idx.template unit_coord<axis, 3>();
     typename GL::dtype *dst_ptr = (typename GL::dtype*)&dst[unit_coord];
+    const int valid_rows = rows_in_bounds<axis, ST::rows>(dst, unit_coord);
 
     uint32_t src_ptr = reinterpret_cast<uintptr_t>(&src.data[0]);
     int laneid = threadIdx.x % N_THREADS;
@@ -240,7 +255,7 @@ __device__ static inline void store(const GL &dst, const ST &src, const COORD &i
         int row = load_idx / memcpy_per_row;
         int col = (load_idx*elem_per_memcpy) % src.cols;
 
-        if (row < src.rows) {
+        if (row < valid_rows) {
             *(float*) &dst_ptr[row * row_stride + col] = *(float*)(&src[{row, col}]);
             *(float*) &dst_ptr[row * row_stride + col + elem_per_float] = *(float*)(&src[{row, col + elem_per_float}]);
             *(float*) &dst_ptr[row * row_stride + col + elem_per_float * 2] = *(float*)(&src[{row, col + elem_per_float * 2}]);
