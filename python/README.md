@@ -857,14 +857,47 @@ it are worth a sentence:
   batch 1. A decode step on this card is not launch-bound, it is GEMV-bound --
   which is the next paragraph -- so the eager numbers above were not flattering
   the patches by more than a percent or two.
-* **Steps that admit a prompt cost the GEMM patch more than the GEMMs
-  explain.** Such a step is M = 4096 + r. Run as 36 distinct layers in
-  sequence, the way the engine reads them, hk costs 25-28 ms more per step at
-  M=4097..4111 than at 4096 and still beats hipBLASLt by 1.11x. End to end
-  those steps cost ~51 ms more, so ~25 ms a step is unaccounted for -- about
-  0.4 s of the 26.4 s request at 4096 x 16, in stock's favour. Not chased.
-  With chunked prefill, which this run turns off for the attention backend,
-  a step is filled to the token budget, so M is usually the budget exactly.
+* **Steps that admit a prompt: the ~51 ms they seemed to cost was the
+  comparison, not the patch.** A first version of this bullet reported that
+  such a step (one new prompt plus the running requests' decode tokens,
+  M = 4096 + r) cost the patch ~51 ms more end to end than the GEMMs explained,
+  inferred by subtracting runs of different lengths. Timed directly instead
+  (`tools/hk-bench/vllm_steps.py`, 4096 x 16, the same 87 steps in both arms,
+  two rounds), the patch makes every step faster:
+
+  ```
+  step                                     stock ms    gemm ms    saved
+  first: two prompts, 8192 tokens            2937.8     2728.4    209.4
+  admit one prompt + decode (x14, avg)       1467.8     1411.8     56.0
+  decode at batch 16 (x57, avg)                57.6       37.3     20.3
+  ```
+
+  The decode saving is exactly what the GEMMs predict (19.9 ms of layers plus
+  0.4 of LM head). The ~51 ms was a mixed step measured against *half the
+  first step*: there the patch's mixed step costs 48.7 ms more and stock's
+  1 ms less. The GEMMs, timed in place with a synchronize around each call,
+  account for 45 of those 48.7 ms. The patched GEMM's mixed step costs 29 ms
+  more than half its M = 8192 step, because the last M block backs up and
+  recomputes 128 rows. hipBLASLt's costs 16 ms *less* than half of its own.
+
+  What is **not** explained: hipBLASLt is faster inside vLLM than in any
+  standalone run of the same 36 layers -- 837 ms of GEMM per mixed step,
+  against 849-870 -- so the patch's lead there is 51 ms where the benchmarks
+  say 76-88. The patched GEMM times the same everywhere (785-786 ms, shape by
+  shape). Ruled out: the timing method (per call with a synchronize vs back to
+  back), the operands (Qwen3-8B's own weights with RMSNorm- and SiLU-shaped
+  activations time like random ones), and vLLM's GEMM path (on gfx1100 it ends
+  in the same `F.linear`). And it moves: in one process alternating the two
+  GEMMs step by step, hipBLASLt's mixed step took 859 ms, its qkv layers 21%
+  slower than in a process of its own. So the variation is real and depends
+  on context; which part of the context, these runs do not say.
+
+  One tool lesson came out of it: on this ROCm build the torch profiler's
+  kernel durations include time queued behind earlier launches -- in an eager
+  step they summed to 4.4x the step's wall time. `vllm_profile.py` ran eager,
+  so the shares it printed at the top of this section are queue-weighted. The
+  ordering they gave (GEMM, then prefill attention, then the rest) has since
+  been borne out end to end; the percentages should not be quoted.
 
 **What is left is decode, and decode is GEMV.** At batch 1 the 36 layers' four
 GEMVs plus the LM head take 39.7 ms of a 41.5 ms step on hipBLASLt, at 37-46%

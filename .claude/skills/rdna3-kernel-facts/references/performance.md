@@ -77,6 +77,21 @@ default is not the vendor's best and beating it proves nothing.
 **Cross-process A/B is invalid on `wx-ms-w7900d-0043`** — it manufactures 13–16%
 differences. See `measurement.md` §1.
 
+**The torch profiler's kernel durations include queue time.** On this ROCm
+build, in an eager vLLM step whose launches run ahead of the GPU, the chrome
+trace's kernel durations summed to 4.4x the step's wall time (a 3-call H2D
+memcpy "took" 618 ms). They measure from enqueue, not from start. Time steps
+or calls with a synchronize on each side instead (HipKittens
+`tools/hk-bench/vllm_steps.py --time-linear`).
+
+**A library GEMM's speed can depend on the process it runs in.** Measured
+2026-10-13: hipBLASLt ran the same 36 Qwen3-8B layers at M=4101 in 837 ms
+inside vLLM, 849-870 standalone, and 859 inside vLLM when alternating step by
+step with another GEMM (qkv alone +21%). Data, timing method and call path
+were ruled out. The HK GEMM beside it timed identically everywhere. A
+baseline measured in a microbenchmark is a range, not a number; compare
+against the engine in place.
+
 **Infinity Cache will fake a decode benchmark.** Re-using one weight buffer
 measures cache bandwidth and reports figures above the card's memory peak.
 Rotate buffers.
