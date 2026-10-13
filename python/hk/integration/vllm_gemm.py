@@ -10,16 +10,24 @@ The routing rule is measured on the model's own shapes against exactly that
 call (tools/hk-bench/vllm_gemm.py; one process, interleaved, every variant
 checked against fp32 before it is timed):
 
-    M >= 1024                         hk on every shape, 1.05-1.23x
-    384 <= M < 1024, M % 128 == 0     hk, 1.09-1.43x
+    M >= 1024                         hk GEMM on every shape, 1.05-1.23x
+    384 <= M < 1024, M % 128 == 0     hk GEMM, 1.09-1.43x
+    1 <= M <= 64                      hk decode GEMM, 1.47-2.04x per step
     anything else                     vLLM's own path
 
-The gap between those two rows is a comb, not a curve. The last M block backs
-up to end at M and recomputes a full 128 rows, so between multiples of 128 the
-kernel does extra work, and at small grids two workgroups then share a WGP:
-M=192 measured 0.71-0.95x. Above 1024 the wasted rows are at most an eighth
-of the work, which the kernel's lead covers. Below 128 there is no thin tiling
-in the DSL, so decode stays on vLLM's path entirely.
+The gap between the first two rows is a comb, not a curve. The last M block
+backs up to end at M and recomputes a full 128 rows, so between multiples of
+128 the kernel does extra work, and at small grids two workgroups then share a
+WGP: M=192 measured 0.71-0.95x. Above 1024 the wasted rows are at most an
+eighth of the work, which the kernel's lead covers.
+
+Decode is the third row, and a different problem: M is the batch, the math is
+free, and the whole cost is streaming the weights once. `ops.decode_gemm` is
+the kernel for that; timed the way a step reads the weights -- 36 distinct
+layers back to back -- it streams 663-802 GB/s at M <= 16 against hipBLASLt's
+317-638. A batch is padded to whole 16-row token tiles: the kernel stores
+whole tiles and loads them without a predicate, so a shorter activation would
+be read past its end.
 
 How it gets in. `UnquantizedLinearMethod.apply` calls
 `dispatch_unquantized_gemm()` on every forward, as does the LM head, so
@@ -37,7 +45,7 @@ launches on torch's stream, so CUDA-graph capture sees it.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from . import _common
 
@@ -53,7 +61,7 @@ ARCH = "gfx1100"
 
 #: Which way each call went. Python counters, so a CUDA-graph replay -- which
 #: runs no Python -- is not counted; they describe eager and capture.
-STATS: Dict[str, int] = {"hk": 0, "fallback": 0}
+STATS: Dict[str, int] = {"hk": 0, "hk_decode": 0, "fallback": 0}
 
 _ORIG_DISPATCH: Optional[Callable] = None
 _FALLBACK: Optional[Callable] = None
@@ -80,6 +88,16 @@ def route(m: int, n: int, k: int, *, bf16: bool = True, bias: bool = False,
     return m >= M_ALIGNED and m % hk_gemm.BLOCK_M == 0
 
 
+def route_decode(m: int, n: int, k: int, *, bf16: bool = True,
+                 bias: bool = False, contiguous_weight: bool = True) -> bool:
+    """Whether a decode-sized GEMM goes to `ops.decode_gemm`. Pure, like `route`."""
+    from ..ops import decode_gemm  # noqa: PLC0415
+
+    if not bf16 or bias or not contiguous_weight:
+        return False
+    return decode_gemm.fits(m, n, k)
+
+
 def _arch_ok(device) -> bool:
     idx = device.index if device.index is not None else 0
     ok = _ARCH_OK.get(idx)
@@ -104,6 +122,17 @@ def _op_for(m: int, n: int, k: int) -> Callable:
     return op
 
 
+def _decode_op(s: Dict[str, Any]) -> Callable:
+    from ..ops import decode_gemm  # noqa: PLC0415
+    from ..runtime.torch_ext import torch_op  # noqa: PLC0415
+
+    key = "decode_" + "_".join(f"{k}{v}" for k, v in sorted(s.items()))
+    op = _OPS.get(key)
+    if op is None:
+        op = _OPS[key] = torch_op(decode_gemm.kernel_for(**s))
+    return op
+
+
 def _fallback(x, weight, bias):
     """What vLLM would have run: its own op where it has one, else F.linear."""
     global _FALLBACK
@@ -124,10 +153,9 @@ def linear(x, weight, bias=None):
     k = x.shape[-1]
     m = x.numel() // k if k else 0
     n = weight.shape[0]
-    if route(m, n, k,
-             bf16=x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16,
-             bias=bias is not None,
-             contiguous_weight=weight.is_contiguous()) and _arch_ok(x.device):
+    how = dict(bf16=x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16,
+               bias=bias is not None, contiguous_weight=weight.is_contiguous())
+    if route(m, n, k, **how) and _arch_ok(x.device):
         x2 = x.reshape(m, k)
         if not x2.is_contiguous():
             x2 = x2.contiguous()
@@ -135,6 +163,20 @@ def linear(x, weight, bias=None):
         _op_for(m, n, k)(x2, weight, out)
         STATS["hk"] += 1
         return out.view(*x.shape[:-1], n)
+    if route_decode(m, n, k, **how) and _arch_ok(x.device):
+        from ..ops import decode_gemm  # noqa: PLC0415
+
+        s = decode_gemm.schedule_for(m, k)
+        rows = 16 * s["tokens"]
+        x2 = x.reshape(m, k)
+        if m < rows:
+            x2 = torch.nn.functional.pad(x2, (0, 0, 0, rows - m))
+        elif not x2.is_contiguous():
+            x2 = x2.contiguous()
+        out = torch.empty((rows, n), device=x.device, dtype=x.dtype)
+        _decode_op(s)(x2, weight, out)
+        STATS["hk_decode"] += 1
+        return out[:m].view(*x.shape[:-1], n)
     STATS["fallback"] += 1
     return _fallback(x, weight, bias)
 
@@ -187,8 +229,11 @@ def apply() -> str:
     register_op()
     _ORIG_DISPATCH = vu.dispatch_unquantized_gemm
     names = _common.rebind(PREFIXES, _ORIG_DISPATCH, dispatch_unquantized_gemm)
+    from ..ops import decode_gemm  # noqa: PLC0415
+
     return (f"linear -> hk where M >= {M_ANY}, or M >= {M_ALIGNED} in whole "
-            f"128-row blocks ({len(names)} binding"
+            f"128-row blocks, or M <= {16 * decode_gemm.MAX_TOKENS} on the "
+            f"decode kernel ({len(names)} binding"
             f"{'' if len(names) == 1 else 's'} rebound)")
 
 

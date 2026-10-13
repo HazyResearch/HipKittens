@@ -44,6 +44,31 @@ def test_bias_dtype_and_layout_fall_back():
     assert not vllm_gemm.route(4096, *QKV, contiguous_weight=False)
 
 
+@pytest.mark.parametrize("m", [1, 2, 5, 8, 15, 16, 17, 24, 32, 33, 48, 64])
+def test_decode_batches_take_the_decode_kernel(m):
+    assert vllm_gemm.route_decode(m, *QKV)
+    assert vllm_gemm.route_decode(m, *DOWN)
+    assert vllm_gemm.route_decode(m, 151936, 4096)        # the LM head
+
+
+@pytest.mark.parametrize("m", [0, 65, 128])
+def test_the_decode_kernel_stops_at_four_token_tiles(m):
+    assert not vllm_gemm.route_decode(m, *QKV)
+
+
+def test_the_decode_kernel_refuses_what_it_cannot_take():
+    assert not vllm_gemm.route_decode(4, 6100, 4096)      # N not whole blocks
+    assert not vllm_gemm.route_decode(4, 6144, 4000)      # K not whole slices
+    assert not vllm_gemm.route_decode(4, *QKV, bias=True)
+    assert not vllm_gemm.route_decode(4, *QKV, bf16=False)
+    assert not vllm_gemm.route_decode(4, *QKV, contiguous_weight=False)
+
+
+def test_the_two_routes_never_overlap():
+    for m in range(0, 2049):
+        assert not (vllm_gemm.route(m, *QKV) and vllm_gemm.route_decode(m, *QKV))
+
+
 def test_the_patched_dispatcher_ignores_its_arguments():
     # Newer vLLM passes a linear-backend name; it selects among CUDA backends
     # and has no meaning on ROCm, so whatever is passed the answer is ours.

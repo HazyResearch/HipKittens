@@ -48,18 +48,26 @@ def _took(fn):
     return out, {k: vllm_gemm.STATS[k] - before[k] for k in before}
 
 
-@pytest.mark.parametrize("m,routed", [
-    (1, False), (16, False), (192, False),
-    (384, True), (1000, False), (1024, True), (1025, True), (4000, True),
+@pytest.mark.parametrize("m,path", [
+    (1, "hk_decode"), (4, "hk_decode"), (16, "hk_decode"), (17, "hk_decode"),
+    (40, "hk_decode"), (64, "hk_decode"), (65, "fallback"), (192, "fallback"),
+    (384, "hk"), (1000, "fallback"), (1024, "hk"), (1025, "hk"), (4000, "hk"),
 ])
 @pytest.mark.parametrize("n,k", [(6144, 4096), (4096, 12288)])
-def test_both_branches_compute_x_wt(op, m, routed, n, k):
+def test_every_branch_computes_x_wt(op, m, path, n, k):
     x, w = _wx(m, n, k)
     y, took = _took(lambda: op(x, w, None))
     assert y.shape == (m, n) and y.dtype == torch.bfloat16
-    assert took == ({"hk": 1, "fallback": 0} if routed
-                    else {"hk": 0, "fallback": 1})
+    assert took == {p: int(p == path) for p in took}
     torch.testing.assert_close(y.float(), _ref(x, w), rtol=RTOL, atol=ATOL)
+
+
+def test_a_decode_batch_with_a_leading_axis_is_padded_and_sliced(op):
+    x, w = _wx(6, 4096, 4096)
+    y, took = _took(lambda: op(x.view(2, 3, 4096), w, None))
+    assert y.shape == (2, 3, 4096) and took["hk_decode"] == 1
+    torch.testing.assert_close(y.reshape(6, 4096).float(), _ref(x, w),
+                               rtol=RTOL, atol=ATOL)
 
 
 def test_a_leading_batch_axis_is_flattened_into_m(op):
@@ -110,14 +118,16 @@ def test_it_compiles_fullgraph(op):
                                rtol=RTOL, atol=2 * ATOL)
 
 
-def test_it_replays_from_a_cuda_graph(op):
-    x, w = _wx(1024, 4096, 4096)
+@pytest.mark.parametrize("m", [1024, 4])
+def test_it_replays_from_a_cuda_graph(op, m):
+    # 4 is the thin path, which pads inside the captured region.
+    x, w = _wx(m, 4096, 4096)
     y = op(x, w, None)                            # build before capture
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         y = op(x, w, None)
-    x2, _ = _wx(1024, 4096, 4096, seed=1)
+    x2, _ = _wx(m, 4096, 4096, seed=1)
     x.copy_(x2)
     graph.replay()
     torch.cuda.synchronize()

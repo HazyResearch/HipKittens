@@ -33,6 +33,29 @@ confidently report a wrong layout.
 be re-derived, not ported — this is usually the constraint that forces a
 different algorithm shape rather than a different constant.
 
+**The LDS pool is 128 KB per WGP, not 64.** One workgroup may take 64 KB, but
+the WGP (2 CUs, 4 SIMD32) shares 128. Measured 2026-10-13 on
+`hk/ops/decode_gemm.py` with 16-wave workgroups at register occupancy 16:
+reserving 32 KB per workgroup left the 4-per-WGP timing, 48 KB and 64 KB both
+gave the 2-per-WGP timing and matched each other -- only a 128 KB pool fits.
+Any occupancy estimate or residency cap derived from 64 KB is off by 2x;
+`hk/target/gfx1100.py` had it wrong until then.
+
+**A streaming kernel can want *fewer* resident workgroups.** Same kernel: two
+16-wave workgroups per WGP read the weights 7-11% faster than four, same
+code, set by an LDS reservation. Higher occupancy is not automatically better
+when every wave is a separate DRAM stream. A slowdown that coincides with an
+occupancy change is a residency question first: the epilogue it was first
+blamed on (fp32 LDS reads compile to `flat_load`, since `kittens::load(rt,st)`
+only vectorises bf16 `row`) was rebuilt on `ds_read_b128` and was not the
+cause.
+
+**Decode GEMV: W straight to registers, K split across 16 warps,
+interleaved.** Same file: `W*X^T` with W loaded global->register, one 16-row
+block per workgroup, warp w reading K-chunk `t*16 + w` (2 KB contiguous per
+row per round), two workgroups per WGP, streams 663-802 GB/s on Qwen3-8B's
+layers. The LDS-staged GEMM template at a 16-row tiling: 418-755.
+
 **Hardware counters are dead.** Under `rocprofv3` on gfx1100 every `SQ` counter
 except `SQ_WAVES` reads 0 — `SQ_INSTS_VALU`, `SQ_INSTS_LDS`, `LDSBankConflict`,
 `ALUStalledByLDS` included. Attribution must come from ablation switches
