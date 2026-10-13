@@ -42,10 +42,10 @@ def _members(ir: KernelIR) -> str:
     return ", ".join(f"&globals::{p.name}" for p in ir.tensors())
 
 
-def pybind_module(ir: KernelIR) -> str:
+def pybind_module(ir: KernelIR, emit=None) -> str:
     """A self-contained pybind11 extension exporting one function, `ir.name`,
     that takes the tensor parameters positionally in declaration order."""
-    src = cpp.emit(ir, includes=('"kittens.cuh"', '"pyutils/hk_bind.cuh"'))
+    src = (emit or cpp.emit)(ir, includes=('"kittens.cuh"', '"pyutils/hk_bind.cuh"'))
     lines = [
         src,
         f"#ifndef {MODULE_NAME_MACRO}",
@@ -69,10 +69,10 @@ def pybind_module(ir: KernelIR) -> str:
     return "\n".join(lines) + "\n"
 
 
-def bare(ir: KernelIR) -> str:
+def bare(ir: KernelIR, emit=None) -> str:
     """Kernel and `launch`, no module boundary. For AOT objects and for reading
     the generated code when debugging a schedule."""
-    return cpp.emit(ir)
+    return (emit or cpp.emit)(ir, includes=('"kittens.cuh"',))
 
 
 def written_tensors(ir: KernelIR) -> List[str]:
@@ -115,7 +115,8 @@ def torch_schema(ir: KernelIR, op_name: str = "") -> str:
     return f"{name}({', '.join(args)}) -> ()"
 
 
-def torch_library(ir: KernelIR, ns: str = "hk", op_name: str = "") -> str:
+def torch_library(ir: KernelIR, ns: str = "hk", op_name: str = "",
+                  emit=None) -> str:
     """A shared object registering one `torch.ops.<ns>.<op>`.
 
     Out-parameter form on purpose. The IR cannot say which shape an output
@@ -178,7 +179,7 @@ def torch_library(ir: KernelIR, ns: str = "hk", op_name: str = "") -> str:
         for p in tensors
     )
 
-    src = cpp.emit(ir, includes=('"kittens.cuh"',))
+    src = (emit or cpp.emit)(ir, includes=('"kittens.cuh"',))
     return "\n".join([
         src,
         "#include <torch/library.h>",
@@ -263,11 +264,13 @@ def torch_library(ir: KernelIR, ns: str = "hk", op_name: str = "") -> str:
 SCAFFOLDS = {"pybind": pybind_module, "bare": bare, "torch": torch_library}
 
 
-def render(ir: KernelIR, scaffold: str = "pybind") -> str:
+def render(ir: KernelIR, scaffold: str = "pybind", emit=None) -> str:
+    """The whole translation unit. `emit(ir, includes)` writes the kernel
+    itself; by default the Python emitter, codegen.cpp."""
     try:
         fn = SCAFFOLDS[scaffold]
     except KeyError:
         raise ValueError(
             f"unknown scaffold {scaffold!r}; have {sorted(SCAFFOLDS)}"
         ) from None
-    return fn(ir)
+    return fn(ir, emit=emit)

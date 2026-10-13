@@ -7,6 +7,7 @@ anything, and both have to happen before codegen can name an offset.
 
 from __future__ import annotations
 
+import os
 from typing import List
 
 from .. import verify as _verify
@@ -23,6 +24,23 @@ PIPELINE = [lds_alloc, lds_pipeline]
 def run_all(ir: KernelIR) -> List["_verify.Warning_"]:
     """Lower and verify. Raises VerifyError if the kernel is wrong; returns
     warnings about kernels that are merely slow."""
+    gate = os.environ.get("HK_GATE_A", "0") not in ("0", "")
+    try:
+        warns = _run_all(ir)
+    except _verify.VerifyError as e:
+        if gate:
+            from ...compiler import gate_a  # noqa: PLC0415
+
+            gate_a.check(ir, python_error=str(e))
+        raise
+    if gate:
+        from ...compiler import gate_a  # noqa: PLC0415
+
+        gate_a.check(ir, python_warnings=warns)
+    return warns
+
+
+def _run_all(ir: KernelIR) -> List["_verify.Warning_"]:
     _verify.check_structure(ir)
     # Before the passes, so the error points at the op the body wrote rather
     # than at whatever lowering turned it into. The rule is about the traced
