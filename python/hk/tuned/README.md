@@ -52,3 +52,13 @@ So this directory being nearly empty is the finding, not a gap. A schedule
 space whose winners are inside the noise is a space whose default was already
 right, and the useful output of the tuner in that case is the evidence that
 nothing needed changing.
+
+## Routing tables
+
+`routes_<kind>_<arch>.json` is a different kind of record: not which
+schedule a kernel should use, but which kernel -- or the engine's own -- a
+call of a given shape should go to. `tools/hk-bench/route_tune.py` writes
+them, and `hk.integration.engine.RouteTable` reads them. Each keeps the raw
+timings it decided from, the toolchain fingerprint and the margin (a kernel
+takes an M only where it beat the engine by `min_gain`). A table is per arch
+and per model: a shape it never measured takes the engine's path.

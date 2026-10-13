@@ -1,4 +1,4 @@
-"""vLLM's unquantized linear layers on the generated GEMM, where it is faster.
+"""vLLM's unquantized linear layers on the generated GEMMs, where they are faster.
 
 GEMM is 57.6% of Qwen3-8B's device time at batch 16 / context 4096
 (tools/hk-bench/vllm_profile.py), and on gfx1100 every one of those GEMMs ends
@@ -6,28 +6,25 @@ in `torch.nn.functional.linear` -- hipBLASLt. The installed vLLM's skinny-GEMM
 path is gated on gfx9, and correctly: its `wvSplitK` is compiled for gfx9 only
 and fails a device-side assert on gfx1100.
 
-The routing rule is measured on the model's own shapes against exactly that
-call (tools/hk-bench/vllm_gemm.py; one process, interleaved, every variant
-checked against fp32 before it is timed):
+Where each call goes is a measured table, not a rule:
+`hk/tuned/routes_vllm_linear_<arch>.json`, written by
+tools/hk-bench/route_tune.py, which times the engine's path, the prefill GEMM
+and the decode GEMV on each (N, K) of the model at every M up to 64, every 16
+rows to 1024 and coarser above -- each gated against fp32 first -- and routes
+an M to a kernel only where it won by 3%. `$HK_VLLM_ROUTES` names another
+table. A shape the table has never seen takes vLLM's path, as does every
+shape on an arch with no table. See `engine.RouteTable` for how an M between
+two measured ones is answered.
 
-    M >= 1024                         hk GEMM on every shape, 1.05-1.23x
-    384 <= M < 1024, M % 128 == 0     hk GEMM, 1.09-1.43x
-    1 <= M <= 64                      hk decode GEMM, 1.47-2.04x per step
-    anything else                     vLLM's own path
+The table replaces four hand-written lines because the GEMM's time is a comb
+in M, not a curve: the last 128-row block is computed whole however little of
+it is kept, so between multiples of 128 the kernel does extra work, and at
+small grids two workgroups share a WGP. Thresholds either route the teeth or
+give up the gaps.
 
-The gap between the first two rows is a comb, not a curve. The last M block
-computes a full 128 rows of which only the remainder is kept, so between
-multiples of 128 the kernel does extra work, and at small grids two workgroups
-then share a WGP: M=192 measured 0.71-0.95x. Above 1024 the wasted rows are at
-most an eighth of the work, which the kernel's lead covers.
-
-Decode is the third row, and a different problem: M is the batch, the math is
-free, and the whole cost is streaming the weights once. `ops.decode_gemm` is
-the kernel for that; timed the way a step reads the weights -- 36 distinct
-layers back to back -- it streams 663-802 GB/s at M <= 16 against hipBLASLt's
-317-638. A batch is padded to whole 16-row token tiles: the kernel stores
-whole tiles and loads them without a predicate, so a shorter activation would
-be read past its end.
+Decode is a different problem: M is the batch, the math is free, and the
+whole cost is streaming the weights once. `ops.decode_gemm` is the kernel for
+that, at 1.93-2.03x hipBLASLt per step at M <= 32.
 
 How it gets in. `UnquantizedLinearMethod.apply` calls
 `dispatch_unquantized_gemm()` on every forward, as does the LM head, so
@@ -38,7 +35,9 @@ Why a custom op rather than a Python function. Under vLLM's torch.compile the
 token count is a symbolic shape, so branching on it in traced code is a guard
 and a recompile. An opaque op with a fake implementation keeps the branch out
 of the graph; it is what vLLM does for its own `rocm_unquantized_gemm`, and it
-launches on torch's stream, so CUDA-graph capture sees it.
+launches on torch's stream, so CUDA-graph capture sees it. Its route depends
+on shapes alone, which a graph captured per batch size fixes, so it declares
+itself graph-safe -- and `engine` holds it to that under capture.
 
     HK_PATCH_VLLM=1 HK_VLLM_GEMM=1 vllm serve Qwen/Qwen3-8B
 """
@@ -47,65 +46,97 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional
 
-from . import _common
+from . import _common, engine
 
 PREFIXES = ("vllm",)
 
-#: The smallest M routed whatever its alignment, and the smallest routed when
-#: it is a whole number of 128-row blocks.
-M_ANY = 1024
-M_ALIGNED = 384
-
-#: What the GEMM is compiled for. On anything else the op routes nothing.
-ARCH = "gfx1100"
-
-#: Which way each call went. Python counters, so a CUDA-graph replay -- which
-#: runs no Python -- is not counted; they describe eager and capture.
-STATS: Dict[str, int] = {"hk": 0, "hk_decode": 0, "fallback": 0}
+#: Where a routing table override comes from.
+ROUTES_ENV = "HK_VLLM_ROUTES"
 
 _ORIG_DISPATCH: Optional[Callable] = None
 _FALLBACK: Optional[Callable] = None
-_LIB = None
 _OPS: Dict[str, Callable] = {}
 _ARCH_OK: Dict[int, bool] = {}
+_TABLE: list = []
 
 
-def route(m: int, n: int, k: int, *, bf16: bool = True, bias: bool = False,
-          contiguous_weight: bool = True) -> bool:
-    """Whether y = x @ W.T with x (m, k) and W (n, k) goes to the generated GEMM.
+def _linear_fake(x, weight, bias=None):
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
-    Pure, so the rule is tested without a GPU. A bias falls back rather than
-    paying a second pass over the output; no Qwen3 linear has one.
+
+PATCH = engine.Op("hk_vllm::linear",
+                  "linear(Tensor x, Tensor weight, Tensor? bias=None) -> Tensor",
+                  _linear_fake, paths=("hk", "hk_decode", "fallback"), graph="safe")
+
+#: Which way each call went; see `engine.Patch` for what a replay counts as.
+STATS = PATCH.stats
+
+
+def routes() -> Optional[engine.RouteTable]:
+    """The routing table for this process's arch, or None. Loaded once."""
+    if not _TABLE:
+        from ..target import current_arch  # noqa: PLC0415
+
+        _TABLE.append(engine.shipped_table("vllm_linear", current_arch(), ROUTES_ENV))
+    return _TABLE[0]
+
+
+def set_routes(table: Optional[engine.RouteTable]) -> None:
+    """Route by `table` from now on; None for the shipped one."""
+    if any(PATCH.captured.values()):
+        import warnings  # noqa: PLC0415
+
+        warnings.warn("hk_vllm::linear: routes changed after a CUDA graph was "
+                      "captured; graphs captured before keep replaying the old "
+                      "routes", stacklevel=2)
+    _TABLE.clear()
+    if table is not None:
+        _TABLE.append(table)
+
+
+def route_for(m: int, n: int, k: int, *, bf16: bool = True, bias: bool = False,
+              contiguous_weight: bool = True) -> str:
+    """"hk", "hk_decode" or "fallback" for y = x @ W.T, x (m, k), W (n, k).
+
+    The table says which kernel measured fastest; this also asks whether that
+    kernel takes the call at all. A bias falls back rather than paying a
+    second pass over the output; no Qwen3 linear has one.
     """
+    from ..ops import decode_gemm  # noqa: PLC0415
     from ..ops import gemm as hk_gemm  # noqa: PLC0415
 
-    if not bf16 or bias or not contiguous_weight:
-        return False
-    if n % hk_gemm.BLOCK_N or k % hk_gemm.K_STEP:
-        return False
-    if m >= M_ANY:
-        return True
-    return m >= M_ALIGNED and m % hk_gemm.BLOCK_M == 0
+    if m < 1 or not bf16 or bias or not contiguous_weight:
+        return "fallback"
+    table = routes()
+    path = table.lookup(m, n, k) if table is not None else "fallback"
+    if path == "hk" and (n % hk_gemm.BLOCK_N or k % hk_gemm.K_STEP):
+        return "fallback"
+    if path == "hk_decode" and not decode_gemm.fits(m, n, k):
+        return "fallback"
+    return path if path in PATCH.paths else "fallback"
 
 
-def route_decode(m: int, n: int, k: int, *, bf16: bool = True,
-                 bias: bool = False, contiguous_weight: bool = True) -> bool:
-    """Whether a decode-sized GEMM goes to `ops.decode_gemm`. Pure, like `route`."""
-    from ..ops import decode_gemm  # noqa: PLC0415
+def route(m: int, n: int, k: int, **how) -> bool:
+    """Whether the call goes to the prefill GEMM."""
+    return route_for(m, n, k, **how) == "hk"
 
-    if not bf16 or bias or not contiguous_weight:
-        return False
-    return decode_gemm.fits(m, n, k)
+
+def route_decode(m: int, n: int, k: int, **how) -> bool:
+    """Whether the call goes to `ops.decode_gemm`."""
+    return route_for(m, n, k, **how) == "hk_decode"
 
 
 def _arch_ok(device) -> bool:
+    """Whether `device` is the arch the kernels are compiled for."""
     idx = device.index if device.index is not None else 0
     ok = _ARCH_OK.get(idx)
     if ok is None:
         import torch  # noqa: PLC0415
 
+        from ..target import current_arch  # noqa: PLC0415
+
         name = torch.cuda.get_device_properties(idx).gcnArchName or ""
-        ok = _ARCH_OK[idx] = name.split(":")[0] == ARCH
+        ok = _ARCH_OK[idx] = name.split(":")[0] == current_arch()
     return ok
 
 
@@ -147,57 +178,40 @@ def _fallback(x, weight, bias):
 
 
 def linear(x, weight, bias=None):
-    """y = x @ weight.T (+ bias), on the generated GEMM where `route` says."""
+    """y = x @ weight.T (+ bias), on the kernel the table names."""
     import torch  # noqa: PLC0415
 
     k = x.shape[-1]
     m = x.numel() // k if k else 0
     n = weight.shape[0]
-    how = dict(bf16=x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16,
-               bias=bias is not None, contiguous_weight=weight.is_contiguous())
-    if route(m, n, k, **how) and _arch_ok(x.device):
-        x2 = x.reshape(m, k)
-        if not x2.is_contiguous():
-            x2 = x2.contiguous()
-        out = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    path = route_for(m, n, k,
+                     bf16=x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16,
+                     bias=bias is not None, contiguous_weight=weight.is_contiguous())
+    if path == "fallback" or not _arch_ok(x.device):
+        PATCH.count("fallback")
+        return _fallback(x, weight, bias)
+    x2 = x.reshape(m, k)
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    if path == "hk":
         _op_for(m, n, k)(x2, weight, out)
-        STATS["hk"] += 1
-        return out.view(*x.shape[:-1], n)
-    if route_decode(m, n, k, **how) and _arch_ok(x.device):
+    else:
         from ..ops import decode_gemm  # noqa: PLC0415
 
         s = decode_gemm.schedule_for(m, k)
-        x2 = x.reshape(m, k)
-        if not x2.is_contiguous():
-            x2 = x2.contiguous()
-        out = torch.empty((m, n), device=x.device, dtype=x.dtype)
         if s["splits"] > 1:
             _decode_op(s)(x2, weight, out,
                           *decode_gemm.scratch_for(x.device, s["splits"], s["tokens"], n))
         else:
             _decode_op(s)(x2, weight, out)
-        STATS["hk_decode"] += 1
-        return out.view(*x.shape[:-1], n)
-    STATS["fallback"] += 1
-    return _fallback(x, weight, bias)
-
-
-def _linear_fake(x, weight, bias=None):
-    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+    PATCH.count(path)
+    return out.view(*x.shape[:-1], n)
 
 
 def register_op():
     """Define `torch.ops.hk_vllm.linear`. Idempotent."""
-    global _LIB
-    if _LIB is not None:
-        return
-    import torch  # noqa: PLC0415
-
-    lib = torch.library.Library("hk_vllm", "FRAGMENT")
-    lib.define("linear(Tensor x, Tensor weight, Tensor? bias=None) -> Tensor")
-    lib.impl("linear", linear, "CUDA")
-    torch.library.register_fake("hk_vllm::linear", _linear_fake, lib=lib)
-    _LIB = lib
+    PATCH.define(linear)
 
 
 def _gemm(layer, x, weight, bias=None):
@@ -227,14 +241,17 @@ def apply() -> str:
 
     if not current_platform.is_rocm():
         return "linear: not patched -- not a ROCm platform"
+    table = routes()
+    if table is None:
+        from ..target import current_arch  # noqa: PLC0415
+
+        return (f"linear: not patched -- no routing table for {current_arch()}; "
+                f"tools/hk-bench/route_tune.py writes one")
     register_op()
     _ORIG_DISPATCH = vu.dispatch_unquantized_gemm
     names = _common.rebind(PREFIXES, _ORIG_DISPATCH, dispatch_unquantized_gemm)
-    from ..ops import decode_gemm  # noqa: PLC0415
-
-    return (f"linear -> hk where M >= {M_ANY}, or M >= {M_ALIGNED} in whole "
-            f"128-row blocks, or M <= {16 * decode_gemm.MAX_TOKENS} on the "
-            f"decode kernel ({len(names)} binding"
+    return (f"linear -> hk where {table.source} measured it faster, on "
+            f"{len(list(table.shapes()))} shapes ({len(names)} binding"
             f"{'' if len(names) == 1 else 's'} rebound)")
 
 

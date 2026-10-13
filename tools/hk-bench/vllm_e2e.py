@@ -47,7 +47,12 @@ def one_arm(args, backend: str) -> dict:
 
     `hk` is the attention backend, `gemm` is the linear-layer patch over
     stock attention, `hk+gemm` is both; anything else names a vLLM backend.
+    `gemm@NAME` routes the linear layers by the table `--routes` names NAME.
     """
+    backend, _, table = backend.partition("@")
+    if table:
+        routes = dict(kv.split("=", 1) for kv in args.routes.split(",") if kv)
+        os.environ["HK_VLLM_ROUTES"] = routes[table]
     attn, _, extra = backend.partition("+")
     gemm = attn == "gemm" or extra == "gemm"
     if attn == "hk":
@@ -117,8 +122,9 @@ def one_arm(args, backend: str) -> dict:
                   flush=True)
     if gemm:
         # A patch that silently routed nothing would time exactly like stock.
-        print(f"  linear routing: {vllm_gemm.STATS}", flush=True)
+        print(f"  linear routing: {vllm_gemm.PATCH.summary()}", flush=True)
         out["_gemm_stats"] = dict(vllm_gemm.STATS)
+        out["_gemm_captured"] = dict(vllm_gemm.PATCH.captured)
     return out
 
 
@@ -135,7 +141,10 @@ def main() -> int:
     ap.add_argument("--arm", default="")
     ap.add_argument("--arms", default="stock,hk",
                     help="comma-separated: stock, hk, gemm, hk+gemm, or a "
-                         "vLLM backend name; stock is always included")
+                         "vLLM backend name; stock is always included. "
+                         "gemm@NAME routes by the table --routes names NAME")
+    ap.add_argument("--routes", default="",
+                    help="NAME=routes.json,... for gemm@NAME arms")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -153,7 +162,7 @@ def main() -> int:
     base = [sys.executable, str(HERE), "--model", args.model,
             "--context", args.context, "--batch", args.batch,
             "--tokens", str(args.tokens), "--short", str(args.short),
-            "--reps", str(args.reps)]
+            "--reps", str(args.reps), "--routes", args.routes]
     arms = ["stock"] + [a for a in args.arms.split(",") if a and a != "stock"]
     files, failed = {}, {}
     for rnd in range(args.reps):

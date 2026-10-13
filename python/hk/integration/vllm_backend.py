@@ -30,8 +30,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import ClassVar, Optional
 
+from . import engine
+
 #: What this backend calls itself in diagnostics.
 NAME = "HK_ATTN"
+
+#: The paths a forward takes, counted, and the CUDA-graph contract. vLLM reads
+#: the contract through the metadata builder's `_cudagraph_support`; `forward`
+#: refuses to be captured whatever vLLM decides.
+PATCH = engine.Patch(
+    NAME, paths=("decode", "decode_gather", "prefill", "prefill_sdpa"),
+    graph="never",
+    why="the decode split count is planned on the host from max_seq_len, the "
+        "first call per layer checks the metadata with a device read, and "
+        "scratch regrown after capture would leave the graph writing to freed "
+        "memory. vLLM captures the model piecewise around it instead.")
 
 #: What `get_name()` answers, which is not the same thing.
 #:
@@ -108,16 +121,15 @@ def _build():
                 RocmAttentionMetadataBuilder,
             )
 
+            support = type(RocmAttentionMetadataBuilder._cudagraph_support)
+
             class HKAttentionMetadataBuilder(RocmAttentionMetadataBuilder):
                 # The ROCm builder claims ALWAYS, which puts `forward` inside
-                # a full graph. There, the split count planned on the host
-                # from `max_seq_len` is frozen at the capture batch's value,
-                # the once-per-layer check syncs mid-capture, and a scratch
-                # buffer regrown after capture leaves the graph writing to
-                # freed memory. NEVER makes vLLM capture the model piecewise,
-                # with attention run eagerly between the pieces.
-                _cudagraph_support = type(
-                    RocmAttentionMetadataBuilder._cudagraph_support).NEVER
+                # a full graph; PATCH.why is what goes wrong there. NEVER
+                # makes vLLM capture the model piecewise, with attention run
+                # eagerly between the pieces.
+                _cudagraph_support = (support.NEVER if PATCH.graph == "never"
+                                      else support.ALWAYS)
 
             _BUILDER.append(HKAttentionMetadataBuilder)
             return HKAttentionMetadataBuilder
@@ -222,6 +234,7 @@ def _build():
                 return output.fill_(0)
             if output_scale is not None or output_block_scale is not None:
                 raise NotImplementedError(f"{NAME} has no fused output quant")
+            PATCH.check_capture()
 
             n = attn_metadata.num_actual_tokens
             k_cache, v_cache = kv_cache[0], kv_cache[1]
@@ -239,6 +252,7 @@ def _build():
             if attn_metadata.max_query_len == 1:
                 self._decode_all(query, output, k_cache, v_cache,
                                  attn_metadata, n)
+                PATCH.count("decode")
                 return output
 
             starts = attn_metadata.query_start_loc
@@ -267,6 +281,7 @@ def _build():
             if decode:
                 self._decode(query, output, k_cache, v_cache, attn_metadata,
                              starts, decode)
+                PATCH.count("decode_gather")
             return output
 
         def _prefill(self, query, key, value, output, lo, m):
@@ -296,8 +311,10 @@ def _build():
                 out = F.scaled_dot_product_attention(
                     q, k, v, is_causal=True, scale=self.scale,
                     enable_gqa=self.group > 1)
+                PATCH.count("prefill_sdpa")
             else:
                 out = hk_attn.attention(q, k, v, causal=True, scale=self.scale)
+                PATCH.count("prefill")
             output[lo:lo + m] = out[0].transpose(0, 1).reshape(m, h, d)
 
         def _buffers(self, n, splits, device, dtype):

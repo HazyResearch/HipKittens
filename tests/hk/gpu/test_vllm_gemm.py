@@ -48,18 +48,21 @@ def _took(fn):
     return out, {k: vllm_gemm.STATS[k] - before[k] for k in before}
 
 
-@pytest.mark.parametrize("m,path", [
-    (1, "hk_decode"), (4, "hk_decode"), (16, "hk_decode"), (17, "hk_decode"),
-    (40, "hk_decode"), (64, "hk_decode"), (65, "fallback"), (192, "fallback"),
-    (384, "hk"), (1000, "fallback"), (1024, "hk"), (1025, "hk"), (4000, "hk"),
-])
+@pytest.mark.parametrize("m", [1, 4, 16, 17, 40, 64, 65, 80, 129, 144, 192,
+                               208, 300, 384, 784, 1000, 1024, 1025, 1216, 4000])
 @pytest.mark.parametrize("n,k", [(6144, 4096), (4096, 12288)])
-def test_every_branch_computes_x_wt(op, m, path, n, k):
+def test_every_branch_computes_x_wt(op, m, n, k):
+    path = vllm_gemm.route_for(m, n, k)
     x, w = _wx(m, n, k)
     y, took = _took(lambda: op(x, w, None))
     assert y.shape == (m, n) and y.dtype == torch.bfloat16
     assert took == {p: int(p == path) for p in took}
     torch.testing.assert_close(y.float(), _ref(x, w), rtol=RTOL, atol=ATOL)
+
+
+def test_the_table_reaches_all_three_paths():
+    paths = {vllm_gemm.route_for(m, 6144, 4096) for m in (4, 192, 1024)}
+    assert paths == {"hk_decode", "fallback", "hk"}
 
 
 def test_a_decode_batch_with_a_leading_axis_is_padded_and_sliced(op):
