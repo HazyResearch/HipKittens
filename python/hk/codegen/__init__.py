@@ -1,7 +1,6 @@
-"""IR -> HipKittens C++."""
+"""The module boundary around a translated kernel: pybind, torch, or bare."""
 
-from . import cpp, scaffold
-from .cpp import CodegenError, emit
+from . import scaffold
 from .scaffold import render
 
-__all__ = ["cpp", "scaffold", "emit", "render", "CodegenError"]
+__all__ = ["scaffold", "render"]

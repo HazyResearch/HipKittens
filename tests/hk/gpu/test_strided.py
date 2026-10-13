@@ -16,15 +16,15 @@ torch = pytest.importorskip("torch")
 
 import hk  # noqa: E402
 from hk import bf16  # noqa: E402
-from hk.lang import ops  # noqa: E402
 
 
 def _copy_kernel():
-    ty = ops.rt(bf16, 16, 64, "row")
+    ty = hk.RT(bf16, 16, 64, "row")
 
-    def strided_copy(x: hk.GL[bf16], y: hk.GL[bf16]):
-        idx = ops.elem_coord(0, 0, ops.block_idx.y * 16, ops.block_idx.x * 64)
-        ops.store(y, ops.load(x, idx, ty), idx)
+    def strided_copy(x: hk.Tensor[bf16], y: hk.Tensor[bf16]):
+        idx = hk.elem_coord(0, 0, hk.arch.block_idx.y * 16,
+                            hk.arch.block_idx.x * 64)
+        y[idx] = x[idx].load(ty)
 
     return hk.kernel(strided_copy, arch="gfx1100", warps=1, name="strided_copy",
                      grid=lambda p: (p.x.cols // 64, p.x.rows // 16, 1))

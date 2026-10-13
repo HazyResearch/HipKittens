@@ -14,24 +14,23 @@ import shutil
 import pytest
 
 import hk
-from hk import fp8e4m3, fp8e5m2, fp32
-from hk.ir.verify import VerifyError
-from hk.lang import ops
+from hk import VerifyError, fp8e4m3, fp8e5m2, fp32
 from hk.target import current_arch, get_target
 
 
 def _fp8_kernel(arch, b_dtype=fp8e4m3, mma=True, name="fp8_probe"):
     def body(a, b, c):
-        ta = ops.load(a, ops.elem_coord(0, 0, ops.block_idx.x * 16, 0),
-                      ops.rt(fp8e4m3, 16, 64))
-        acc = ops.zeros(ops.rt(fp32, 16, 16, "col"))
+        ta = a[hk.elem_coord(0, 0, hk.arch.block_idx.x * 16, 0)].load(
+            hk.RT(fp8e4m3, 16, 64))
+        acc = hk.zeros(hk.RT(fp32, 16, 16, "col"))
         if mma:
-            tb = ops.load(b, ops.elem_coord(0, 0, 0, 0), ops.rt(b_dtype, 16, 64))
-            ops.mma_ABt(ta, tb, acc, out=acc)
-        ops.store(c, acc, ops.elem_coord(0, 0, ops.block_idx.x * 16, 0))
+            tb = b[hk.elem_coord(0, 0, 0, 0)].load(hk.RT(b_dtype, 16, 64))
+            acc += ta @ tb.T
+        c[hk.elem_coord(0, 0, hk.arch.block_idx.x * 16, 0)] = acc
 
     body.__name__ = name
-    body.__annotations__ = {"a": hk.GL[fp8e4m3], "b": hk.GL[b_dtype], "c": hk.GL[fp32]}
+    body.__annotations__ = {"a": hk.Tensor[fp8e4m3], "b": hk.Tensor[b_dtype],
+                            "c": hk.Tensor[fp32]}
     return hk.kernel(body, arch=arch, warps=1, name=name,
                      grid=lambda p: (p.a.rows // 16, 1, 1))
 

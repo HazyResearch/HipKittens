@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from .._mlir import ir
 from .._mlir.dialects import hk as hkd
-from ..ir.nodes import CoordType, GlobalType, ScalarType, i32
+from ..types import CoordType, GlobalType, ScalarType, i32
 from . import builder as B
 from .values import Coord, Global, Int, Scalar, View, as_int
 

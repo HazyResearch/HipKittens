@@ -1,4 +1,4 @@
-"""Rewrite a kernel's `for` and `if` so device values can steer them.
+"""Rewrite a kernel's `for`, `if` and `while` so device values can steer them.
 
     for i in range(n):          (x,) = __hk__.for_(__hk__.iter_(range, n),
         x = x + i          ->                      __hk_for_3, ..., ("x",), "i")
@@ -6,14 +6,17 @@
     if i < n:                   (x,) = __hk__.if_stmt(i < n, __hk_then_5,
         x = 1              ->                         __hk_else_5, ..., ("x",))
 
-The bodies become nested functions that take and return the names the
-statement rebinds -- the ones defined before it or read after it -- and
-hk.dsl.control decides at trace time whether the loop is Python or the
-kernel's. Only two shapes are rewritten: a `for` whose iterable is a call to
-something named `range` or `range_constexpr`, and an `if`. A body with a
-`return`, `break` or `continue` at its own level is left as Python, so it
-needs a trace-time condition; a device one raises where Python asks for its
-truth value, with that advice.
+    while k < n:                (k,) = __hk__.while_(__hk_test_7,
+        k = k + step       ->                        __hk_while_7, ..., ("k",))
+
+The bodies, and a loop's test, become nested functions that take and return
+the names the statement rebinds -- the ones defined before it or read after
+it -- and hk.dsl.control decides at trace time whether the loop is Python or
+the kernel's. Only three shapes are rewritten: a `for` whose iterable is a
+call to something named `range` or `range_constexpr`, an `if`, and a `while`
+without an `else`. A body with a `return`, `break` or `continue` at its own
+level is left as Python, so it needs a trace-time condition; a device one
+raises where Python asks for its truth value, with that advice.
 
 The rewritten function keeps the original's file, line numbers and closure
 cells, so a location captured inside it is the kernel author's line.
@@ -289,6 +292,8 @@ class _Rewriter:
             return self.for_(s, defined, later)
         if isinstance(s, ast.If) and not _jumps(s.body) and not _jumps(s.orelse):
             return self.if_(s, defined, later)
+        if isinstance(s, ast.While) and not s.orelse and not _jumps(s.body):
+            return self.while_(s, defined, later)
         # Anything else: rewrite inside its blocks, leave it as written.
         for field in ("body", "orelse", "finalbody"):
             block = getattr(s, field, None)
@@ -344,8 +349,28 @@ class _Rewriter:
                         args=[s.test, ast.Name(id=fns[0].name, ctx=ast.Load()),
                               ast.Name(id=fns[1].name, ctx=ast.Load()),
                               _fetch(carried), _strs(carried)],
-                        keywords=[])
+                        keywords=[ast.keyword(arg="has_else",
+                                              value=ast.Constant(value=bool(s.orelse)))])
         return [*fns, _assign(carried, call, s)]
+
+    def while_(self, s: ast.While, defined, later) -> List[ast.stmt]:
+        # Carried: what the body assigns that the test reads, that the body
+        # reads before assigning (from the iteration before), or that is read
+        # after the loop.
+        needed = later | _exposed(s.body) | _loads([s.test])
+        carried = sorted(_stores(s.body) & needed)
+        k = next(_counter)
+        body = self.block(s.body, defined, needed)
+        body.append(ast.Return(value=_tuple(carried, ast.Load)))
+        test = _def(f"__hk_test_{s.lineno}_{k}", carried,
+                    [ast.copy_location(ast.Return(value=s.test), s)], s)
+        fn = _def(f"__hk_while_{s.lineno}_{k}", carried, body, s)
+        call = ast.Call(func=_hk("while_"),
+                        args=[ast.Name(id=test.name, ctx=ast.Load()),
+                              ast.Name(id=fn.name, ctx=ast.Load()),
+                              _fetch(carried), _strs(carried)],
+                        keywords=[])
+        return [test, fn, _assign(carried, call, s)]
 
 
 def _compile(fn) -> Optional[types.CodeType]:
@@ -378,7 +403,7 @@ def _compile(fn) -> Optional[types.CodeType]:
 
 
 def rewrite(fn):
-    """`fn` with its `for` and `if` routed through hk.dsl.control. Cached on
+    """`fn` with its `for`, `if` and `while` routed through hk.dsl.control. Cached on
     the code object; a function whose source cannot be read is returned
     as it is."""
     code = fn.__code__
@@ -407,7 +432,7 @@ def _runtime(control):
     if not _RUNTIME:
         ns = types.SimpleNamespace(
             for_=control.for_, iter_=control.iter_, if_stmt=control.if_stmt,
-            fetch=fetch, UNDEF=control.UNDEF)
+            while_=control.while_, fetch=fetch, UNDEF=control.UNDEF)
         _RUNTIME.append(ns)
     return _RUNTIME[0]
 

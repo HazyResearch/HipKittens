@@ -1,4 +1,4 @@
-# hk — HipKittens as a Python kernel IR
+# hk — HipKittens kernels in Python, over an MLIR dialect
 
 Write Radeon kernels in Python, get HipKittens C++, get a `.so`, call it from
 torch. The point is not convenience: it is that three classes of *silently
@@ -6,24 +6,23 @@ wrong* kernel on RDNA3 stop being expressible.
 
 ```python
 import hk
-from hk import bf16
 
-@hk.kernel(arch="gfx1100",
-           grid=lambda p: (hk.cdiv(p.o.cols, 64), hk.cdiv(p.o.rows, 16), 1))
-def add(a: hk.GL[bf16], b: hk.GL[bf16], o: hk.GL[bf16], *, ROWS=16, COLS=64):
-    t   = hk.rt(bf16, ROWS, COLS)
-    idx = hk.tile_coord(0, 0, hk.block_idx.y, hk.block_idx.x)
-    hk.store(o, hk.load(a, idx, t) + hk.load(b, idx, t), idx)
+@hk.kernel(grid=lambda p: (hk.cdiv(p.o.cols, 64), hk.cdiv(p.o.rows, 16), p.o.batch))
+def add(a: hk.Tensor[hk.bf16], b: hk.Tensor[hk.bf16], o: hk.Tensor[hk.bf16]):
+    idx = hk.tile_coord(hk.arch.block_idx.z, 0, hk.arch.block_idx.y,
+                        hk.arch.block_idx.x)
+    t = hk.RT(hk.bf16, 16, 64)
+    o[idx] = a[idx].load(t) + b[idx].load(t)
 
-add(a, b, out)          # traces, compiles (once), launches
+add(a, b, out)          # traces, verifies, translates, compiles (once), launches
 ```
 
 Three entry points, in increasing order of what they need:
 
 | call | needs | does |
 |---|---|---|
-| `k.trace()` | nothing | runs the body once, returns the IR |
-| `k.source()` | nothing | the generated HipKittens C++ |
+| `k.trace()` | nothing | runs the body once into an hk MLIR module and runs the passes |
+| `k.source()` | nothing | the HipKittens C++ translated from that module |
 | `k.build()` | hipcc | compiles and **gates on the resource remarks** |
 | `k(*tensors)` | a Radeon + torch | launches |
 
@@ -41,33 +40,172 @@ But the real argument is the three traps, each of which cost days:
 
 1. **`s_waitcnt` carries no register dependence.** The compiler will hoist a
    WMMA above the wait that was supposed to guard it. Results are randomly
-   wrong, `ScratchSize` is 0, and nothing is reported. The emitter binds the
-   fragment with a volatile asm after every wait — you cannot forget to.
+   wrong, `ScratchSize` is 0, and nothing is reported. The translation binds
+   the fragment with a volatile asm after every wait — you cannot forget to.
 2. **A VGPR spill is silent corruption, not slowness**, because this library
    hand-places `s_waitcnt` and scratch traffic reorders against it.
-   `hk.build()` parses `-Rpass-analysis=kernel-resource-usage` and *refuses to
+   `k.build()` parses `-Rpass-analysis=kernel-resource-usage` and *refuses to
    return* a spilling kernel.
 3. **Only row-layout 16-bit operands reach `ds_read_b128`**; column layout
    degrades to 16 scalar `ds_read_u16`, eight times the instructions. The
-   verifier rejects it while tracing, not at benchmark time.
+   passes flag it while tracing, not at benchmark time.
 
 Plus the arch facts that used to live in `RDNA.md`, kernel comments and
-notebooks, now in `target/gfx1100.py` as data shared by the verifier, the LDS
-allocator, the register model and the emitter — the VGPR granule is 24, so
-occupancy 6 needs ≤240 registers, not ≤256.
+notebooks, now data: `target/gfx1100.py` for Python and
+`mlir/lib/Target/Target.cpp` for the passes, with a test that the two tables
+agree field by field — the VGPR granule is 24, so occupancy 6 needs ≤240
+registers, not ≤256.
 
 An op that the library does not implement for the requested dtype is the same
-kind of late failure, so it is caught the same way: `hk.gelu` on a bf16 tile
+kind of late failure, so it is caught the same way: `gelu` on a bf16 tile
 raises while tracing rather than producing `undefined hidden symbol` at the end
 of a 30-second compile.
+
+## The language
+
+A kernel is a Python function. Positional parameters are tensors
+(`hk.Tensor[dtype]`, 4-D `(batch, depth, rows, cols)`); keyword-only parameters
+are constexprs, baked into the source and ordinary Python values in the body,
+so `range(D // 16)` unrolls and `if KIND == "softmax"` picks a branch at trace
+time.
+
+```python
+T = hk.RT(hk.fp32, 16, 64)
+
+@hk.kernel(warps=4, grid=lambda p: (1, hk.cdiv(p.x.rows, 16), p.x.batch))
+def row_sumsq(x: hk.Tensor[hk.bf16], o: hk.Tensor[hk.fp32]):
+    row = hk.arch.block_idx.y * 16
+    acc = hk.zeros(hk.col_vec(T))
+    for cb in range(hk.arch.warp_id(), hk.cdiv(x.cols, 64), 4):
+        v = x.at[row, cb * 64].load(T)       # global -> registers, bf16 -> fp32
+        acc += (v * v).sum(axis=1)           # one row_sum, accumulated in place
+    o.at[row, hk.arch.warp_id()] = acc
+```
+
+* **Types are values you build**: `hk.RT(dtype, rows, cols, layout)` a register
+  tile, `hk.ST` an LDS tile, `hk.col_vec(t)` / `hk.row_vec(t)` the vectors a
+  reduction of `t` gives, `hk.SV` an LDS vector.
+* **Device values are objects with operators.** `a + b`, `t * v` (a vector
+  broadcasts along the axis it came off), `t.exp()`, `t.to(hk.bf16)`,
+  `t.sum(axis=1)`, `acc += a @ b.T` (one WMMA into `acc`; the variant follows
+  from the transposes), `-t`, `hk.min(a, b)`; scalars are `Int`/`Bool` with
+  Python arithmetic and comparisons.
+* **Memory is indexed.** `x[coord]`, `x.at[r, c]` (element coordinate) and
+  `x.tile[r, c]` are views; `.load(type)`, `.store(value)`, `x[idx] = value`,
+  `.load_scalar()`. LDS tiles come from `hk.lds.alloc`, and `s[i]`,
+  `s.subtile(...)`, `s.load(type, wait=False)`, `s.granules()` follow.
+* **Tiles are buffers.** An operation either makes a new tile or writes an
+  existing one — `+=`, `t.exp_()`, `into=` — which is how include/rdna3 spells
+  everything and what keeps a loop's registers the same registers.
+* **Control flow is Python.** The body is rewritten at the AST level, as CuTe
+  DSL does: a `for` over a device bound, an `if` on a device condition and a
+  `while` on a device test become `scf.for` / `scf.if` / `scf.while`. A scalar
+  the loop or branch rebinds is carried through it (iter_args, branch
+  results); rebinding a *tile* inside a runtime loop is refused, with the
+  in-place spelling in the message. `hk.range(n, unroll=4)` asks for a runtime
+  loop with a pragma, `hk.range_constexpr` insists on unrolling, and
+  `hk.scope()` / `hk.if_(c, opaque=True)` keep their register-allocator meaning.
+* **The rest has namespaces**: `hk.arch` (block and warp ids, `barrier`,
+  `sched_barrier`, `setprio`, `vm_wait`, `wg_arrive`), `hk.lds` (`alloc`,
+  `wait_for`), `hk.math` (elementwise functions, and `add`/`mul`/... with
+  `into=`), `hk.group(n)` (workgroup loads, stores and the staging pipeline),
+  `hk.collective` (`cross_warp`, `fold_rows`). `@hk.func` marks a helper that
+  is traced inline, with its control flow rewritten too.
+
+A device value used where Python needs a number — a tile extent, a list index,
+`range()` outside a traced function — raises at that line, saying which of
+those it was.
+
+## The IR
+
+`k.trace()` is an MLIR module in the `hk` dialect (`mlir/`), and
+`k.trace().dump()` prints it with the names the C++ will use:
+
+```mlir
+func.func @row_sumsq(%x: !hk.gl<bf16> {hk.name = "x"}, %o: !hk.gl<f32> {hk.name = "o"})
+    attributes {hk.arch = "gfx1100", hk.kernel, hk.warps = 4 : i64, hk.lds_bytes = 0 : i64, ...} {
+  %warp_id = hk.warp_id
+  %bid_y = hk.block_idx y
+  %mul = arith.muli %bid_y, %c_1 : i32
+  %zv = hk.zero -> !hk.rv<f32, 16x64, row, col>
+  %cols = hk.extent %x cols : !hk.gl<bf16>
+  %cdiv = arith.ceildivsi %cols, %c_0 : i32
+  scf.for %cb = %warp_id to %cdiv step %c4_i32 : i32 {
+    %idx = hk.coord %c, %c, %mul, %mul_2 : !hk.coord<element>
+    %ld = hk.load %x[%idx] : !hk.gl<bf16>, !hk.coord<element> -> !hk.rt<f32, 16x64, row>
+    %mul_4 = hk.mul %ld, %ld : !hk.rt<f32, 16x64, row>, !hk.rt<f32, 16x64, row> -> !hk.rt<f32, 16x64, row>
+    hk.row_sum %mul_4 into %zv {accumulate} : !hk.rt<f32, 16x64, row> into !hk.rv<f32, 16x64, row, col>
+  } {hk.iv_name = "cb"}
+  ...
+}
+func.func @row_sumsq__grid(...) -> (i32, i32, i32) attributes {hk.grid_of = @row_sumsq}
+```
+
+* **Types**: `!hk.rt<f32, 16x64, row>` register tile, `!hk.st<bf16, 128x64, 2>`
+  LDS tile (a double buffer), `!hk.rv<..., col>` register vector,
+  `!hk.sv`, `!hk.gl<bf16>` global, `!hk.coord<tile|element>`,
+  `!hk.granules`, `!hk.stage`. All print in full, so a dump reads on its own.
+* **Ops**, about seventy, each with an optional destination: `hk.add %a, %b`
+  makes a tile, `hk.add %a, %b into %d` writes one. Scalars are `arith`,
+  control flow is `scf`, a kernel is a `func.func` with `hk.*` attributes, and
+  the launch grid is a second, host-side function of the tensors.
+* **Passes**, in C++ (`mlir/lib/Dialect/HK/Transforms`), run by `k.trace()` as
+  `hk-kernel-pipeline`: `hk-verify` (op legality, dtype support, no workgroup
+  operation inside a branch or a runtime while), `hk-lds-alloc` (offsets, the
+  64 KB ceiling), `hk-lds-pipeline` (every `lgkmcnt` derived, every
+  asynchronously loaded tile proven waited for before it is read, loops walked
+  until they reach a steady state) and `hk-check-budgets` (the register
+  estimate against the occupancy the kernel asked for). Their errors come out
+  of `k.trace()` as `hk.VerifyError`, ending `at file:line in function` —
+  the kernel author's line.
+* **Translation** (`mlir/lib/Target/Cpp/HKToCpp.cpp`): hk + scf + arith to
+  HipKittens C++ — named tile aliases, the value names of the dump, a
+  provenance header — because it is the artifact you take to the disassembler
+  when something spills. `codegen/scaffold.py` adds the module boundary
+  (pybind, a `TORCH_LIBRARY` registration, or none) around the identical body.
+
+The C++ for the kernel above:
+
+```cpp
+    const int cdiv = (cols + c1 - 1) / c1;
+    for (int cb = warp_id; cb < cdiv; cb += 4) {
+        const int mul1 = cb * c1;
+        const kittens::coord<> idx(c, c, mul, mul1);
+        rt_fp32_16x64_row ld;
+        kittens::load(ld, g.x, idx);
+        rt_fp32_16x64_row mul2;
+        kittens::mul(mul2, ld, ld);
+        kittens::row_sum(zv, mul2, zv);
+    }
+```
+
+`hk-opt` and `hk-translate` run the same passes and translation on a `.mlir`
+file, which is how the lit tests in `mlir/test` are written.
+
+## Building
+
+The backend is the stock hipcc compiling the translated C++ against
+`include/rdna3`, so nothing at run time needs LLVM. The dialect does, once:
+
+```bash
+scripts/build_mlir.sh       # MLIR 23.1.3 only, X86 target, Python bindings (~20 min on 64 cores)
+scripts/build_hk_mlir.sh    # the dialect, passes, translation and hk._mlir (~1 min)
+```
+
+`build_mlir.sh` takes `LLVM_TAG`, `PYTHON`, `HK_LLVM_ROOT`, `JOBS` and
+`LINK_JOBS`; keep `JOBS` × ~2 GB under the memory limit (a 48 Gi pod is
+`JOBS=6 LINK_JOBS=1`). The bindings land in `python/hk/_mlir`, about 36 MB.
 
 ## Layout
 
 ```
-hk/lang/        the DSL surface -- @kernel, tile types, ops
-hk/ir/          Value/Op/KernelIR, the tracing builder, passes
+hk/dsl/         the language: @kernel / @func, values and operators, the AST
+                rewrite, control flow, hk.arch / lds / math / group / collective
+hk/types.py     dtypes and the tile / vector / tensor types a kernel is written in
+hk/compiler/    the MLIR context, the pass pipeline, the translation entry point
+hk/_mlir/       the built bindings (hk dialect + MLIR core), not checked in
 hk/target/      gfx1100 / gfx1201 facts, as data
-hk/codegen/     IR -> HipKittens C++ (cpp.py) and the module boundary (scaffold.py)
+hk/codegen/     the module boundary around a translated kernel (scaffold.py)
 hk/runtime/     arch detection, hipcc + content-hash cache, the resource gate,
                 and the torch.ops registration (torch_ext.py)
 hk/autotune/    schedule search: build the space, keep what passes the gate, time
@@ -76,22 +214,17 @@ hk/tuned/       the schedules that search picked, and the measured routing
 hk/ops/         kernels written in the DSL, plus the SDPA drop-in (sdpa.py)
 hk/integration/ patching a running vLLM or SGLang; engine.py is what every
                 patch shares (op, routes, counters, CUDA-graph contract)
+mlir/           the hk dialect (ODS), its passes, the C++ translation,
+                hk-opt / hk-translate, lit tests
 ```
-
-The generated C++ is kept readable — named tile aliases, value names shared
-with the IR dump, a provenance header — because it is the artifact you take to
-the disassembler when something spills.
-
-`codegen/scaffold.py` is separate from `codegen/cpp.py` so that the torch
-registration path can reuse the identical kernel body instead of becoming a
-second emitter that drifts.
 
 ## Caching
 
 Key = hipcc version + a content hash of `include/rdna3` + the full flag list +
-the generated source. A build lands in `~/.cache/hk/<key>/` via a rename, so a
-killed compile never leaves an importable half-written `.so`. Failed builds are
-kept as `failed-<key>/` with their source and log.
+the dialect version + the generated source. A build lands in
+`~/.cache/hk/<key>/` via a rename, so a killed compile never leaves an
+importable half-written `.so`. Failed builds are kept as `failed-<key>/` with
+their source and log.
 
 The thresholds (`max_vgprs`, `min_occupancy`) are *not* in the key — they are
 re-applied on every cache hit, so a kernel with a strict occupancy requirement
@@ -106,21 +239,30 @@ hipcc in it.
 
 ## Tests
 
-Three tiers, by what they need. The first two run anywhere:
+Four tiers, by what they need. The first three run anywhere:
 
 ```bash
-python3 -m pytest tests/hk/ir tests/hk/codegen -q   # no GPU, no torch
+ninja -C $HK_MLIR_BUILD check-hk                     # lit: the dialect, passes, translation
+python3 -m pytest tests/hk/ir tests/hk/codegen -q    # no GPU, no torch
 ```
 
 | tier | needs | what it catches |
 |---|---|---|
-| `tests/hk/ir/` | pure Python | tracing and emitted C++ |
+| `mlir/test/` | the MLIR build | op verifiers, pass results and errors, the C++ for hand-written IR |
+| `tests/hk/ir/` | hk._mlir | tracing, the language, pass errors from Python, generated C++ |
 | `tests/hk/codegen/` | hipcc | compiles; spill/occupancy gates fire |
 | `tests/hk/gpu/` | Radeon + torch | numerics vs torch |
 
 A tier that cannot run is skipped with a reason, never silently passed.
 
 ## Status
+
+The sections below are a record, in the order the work happened, and they name
+the API of their time: before the last section the IR was Python and kernels
+were written as flat calls (`hk.load(x, idx, ty, bounded=True)` is now
+`x[idx].load(ty, bounded=True)`). The kernels themselves have all been ported;
+the numbers are as measured then, and the last section re-measures the ones
+that matter against the port.
 
 **Phases 1 and 2 are done.** End to end: Python → IR → C++ → hipcc → `.so` →
 torch. 291 shipped kernels — elementwise (5 binary × 3 dtypes plus the unary ops
@@ -1475,3 +1617,158 @@ Not ported: the two SDPA rebinding patches (`vllm.py`, `sglang.py`) still
 keep their own counters.
 
 See `.claude/plans/` for the full plan and its gates.
+
+### The IR as an MLIR dialect, and kernels that read like the math
+
+Until here a kernel was a list of flat calls — `_ops.store(o, _ops.mul_row(
+_ops.load(x, _ops.elem_coord(...), ty), r), idx)` — recorded into a Python
+IR. That is a builder API, not an IR anyone would recognise, and nothing
+else could read it. Now the IR is MLIR: an `hk` dialect in C++ (`mlir/`)
+with its verifiers, the four passes and the translation to HipKittens C++,
+and kernels are written in a Python that reads like the operations it
+performs (`acc += a @ b.T`, `o[idx] = (v * r).to(hk.bf16)`, a plain `for`
+over a device bound). The Python IR, its builder, verifier and passes, the
+Python emitter and the flat API are deleted. The backend did not change:
+hipcc and include/rdna3, so nothing at run time needs LLVM.
+
+The move was gated three times, each against the code it replaced.
+
+**Gate A — the dialect against the Python IR.** A temporary converter
+turned every kernel the old front end traced into the dialect, and ran it
+through the C++ passes and the C++ translation. For all 354 shipped
+instantiations, and the constexpr points the tests use (708 translations),
+the C++ was byte-identical to the Python emitter's. The whole no-GPU suite
+ran under the gate as its corpus — 394 tests, the error paths included,
+where the C++ passes had to refuse what the Python ones refused, in the same
+words. Then the converter was deleted with the rest.
+
+**Gate B — each kernel family against its old self** (elementwise, norm,
+quant, fused, decode GEMV, GEMM, paged, attention):
+
+* All 422 instantiations rendered both ways. 49 are byte-identical, 281
+  differ only in a loop variable's name (`i` became the `kb` the source
+  wrote), and 92 differ in constant folding, hoist order or names. Those 92
+  were compiled: VGPRs, SGPRs, scratch, LDS and occupancy are identical in
+  every one.
+* tests/hk/gpu: 379 passed on gfx1100.
+* Old and new in one process, interleaved for 7 rounds, the old as control:
+
+  | kernel | shape | new / old |
+  |---|---|---|
+  | GEMM | 4096³ | 1.002x (71.6 TF) |
+  | attention d128 | N=4096, non-causal / causal | 1.001x / 0.993x |
+  | decode GEMV | M=1 N=4096, M=1 N=12288, M=4 N=4096 | 1.010x / 0.999x / 1.000x |
+  | rmsnorm | 8192x4096, 8192x8192, 32768x1024 | 0.998x / 1.002x / 1.002x |
+
+  Every gap is smaller than that row's own round-to-round spread, which is
+  the expected answer for kernels whose C++ differs in names.
+
+After the old front end was deleted, the 422 sources were rendered again:
+byte-identical to the migration commit's, so the numbers above are the
+shipped code's.
+
+**Gate C — the engine.** vLLM 0.16.1 serving Qwen3-8B on the W7900D with the
+GEMM patch (`vllm_e2e.py`, eager, context 1024, batch 1 and 16, 72 output
+tokens, three rounds of each arm alternating), once from the tree before the
+move and once after, each against stock vLLM in its own run:
+
+| | before | after |
+|---|---|---|
+| total, batch 1 / 16 | 1.820x / 1.338x | 1.824x / 1.340x |
+| prefill | 1.125x / 1.160x | 1.125x / 1.160x |
+| decode per step | 1.928x / 1.735x | 1.933x / 1.746x |
+
+The routing counters match call for call (5,472 prefill GEMMs, 102,553
+decode GEMVs, no fallback). At both shapes the first request's greedy output
+is identical to stock, and so to the other run's (72/72).
+
+The first attempt at this gate measured nothing. With vLLM's engine in its
+own process, the patch installed in the driver never reached the model, and
+both arms timed as stock (0.995–1.000x, `hk 0, hk_decode 0`). The tool prints
+the routing counters for exactly this reason. The gate is run with
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`, as every earlier measurement here was.
+
+**Tests, now.** `mlir/test` (lit): 8, for the op verifiers, a round trip
+through text, each of the four passes on hand-written IR (including the
+workgroup-operation checks and the budget warning), and the translation of
+a kernel and of a `while`. tests/hk/ir and
+tests/hk/codegen: 984, no xfails. tests/hk/gpu: 383 passed on
+gfx1100 (the 379 above and four for `while`).
+
+**Wheels.** `scripts/build_wheel.sh` builds one per interpreter, because
+`hk._mlir` is nanobind extension modules for one CPython:
+`hipkittens-0.2.0-cp310-cp310-linux_x86_64.whl` (11.2 MB) and
+`hipkittens-0.2.0-cp312-cp312-linux_x86_64.whl` (11.3 MB). Each
+carries the package, include/ (the generated kernels include it at JIT
+time) and the bindings. A wheel built for another interpreter installs and
+then fails at import, so the script refuses to build one. The link-time
+`libHKPythonCAPI.so` symlink is dropped, because a wheel would carry it as a
+second 34 MB copy. Installed outside the checkout, each wheel
+traces, translates, compiles against its own headers and launches on the
+W7900D, with a result equal to torch's bit for bit.
+
+**What porting the tests found.** About fifteen test files used the flat
+API, and porting them found real problems in the new front end, not just
+spelling:
+
+* *Error locations were wrong two ways.* The frame filter skipped every
+  file whose path contained `/hk/`, which includes `hk/ops` and `tests/hk`,
+  so an error in a shipped kernel pointed at its caller. That bug predates
+  the DSL. And an op that recorded its location directly (`barrier`,
+  `lds.alloc`, `lds.wait_for`, a store) skipped one frame too many, landing
+  on the line that called `k.trace()`. The filter is now the front end's own
+  directories, with no fixed frame count. `hk.scope()` no longer reports
+  contextlib, and a body lifted into a loop function reports the kernel
+  function's name.
+* *The dump and the C++ named values differently* (`%ld_0` vs `ld1`).
+  `dump()` now prints a copy renamed by the translation's own naming, so the
+  two cannot drift.
+* *Seven of the Python-side messages had lost information* — which mma
+  variant the layouts select, that an alternative is `x[idx].store(v)`, why a
+  subtile has to divide its parent, that `//` on a tile is not a rounding
+  division. The old wording is back. The C++ passes never lost theirs.
+
+**What the language does not do.** Each of these raises, with the
+spelling that works:
+
+* A loop or branch body that `return`s, `break`s or `continue`s is left as
+  Python, so its condition has to be known at trace time. `while ... else`
+  is not rewritten.
+* A workgroup operation (`barrier`, group loads and stores, staging) cannot
+  sit inside a runtime branch or a runtime `while`: a warp that leaves early
+  leaves the rest waiting. A `for` over a bound every warp agrees on is fine.
+* A tile rebound inside a runtime loop is refused; it is updated in place
+  (`+=`, `into=`), so that every iteration writes the same registers.
+* A kernel body must be source `inspect` can read. Code built with `exec`
+  or a lambda traces, but its loops cannot be runtime loops.
+* Pass errors name values by their base name (`lds`), not the C++'s
+  deduplicated one (`lds1`), so "add lds to that lds_wait_for" can be
+  ambiguous with several LDS tiles in flight. The old front end had the same
+  limit.
+* Nothing is eliminated before the passes, so an unused allocation still
+  counts in `lds_bytes`. The old front end behaved the same way.
+* MLIR is built from source (23.1.3). Wheels are Linux x86_64 only, one
+  CPython each; gfx1201 is still compile-only.
+
+**Reproducing.**
+
+```bash
+scripts/build_mlir.sh && scripts/build_hk_mlir.sh
+ninja -C $HK_MLIR_BUILD check-hk
+python3 -m pytest tests/hk/ir tests/hk/codegen -q
+python3 -m pytest tests/hk/gpu -q                       # gfx1100
+scripts/build_wheel.sh
+VLLM_ENABLE_V1_MULTIPROCESSING=0 HK_GPU_UTIL=0.85 python3 tools/hk-bench/vllm_e2e.py \
+    --context 1024 --batch 1,16 --tokens 72 --short 24 --reps 3 --arms stock,gemm
+```
+
+**For whoever continues**, in order of value:
+
+1. Name values in pass errors the way `dump()` does, by the translation's
+   naming, so a message names one tile.
+2. `break` and `continue` in runtime loops: a flag carried through an
+   `scf.while`, or the `cf` dialect.
+3. A canonicalize/DCE pass in front of the hk passes. It will change the
+   C++, so it needs Gate B again, resources first.
+4. Build MLIR in CI and publish the wheels; today they are built by hand on
+   the machines that have the toolchain.

@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hipkittens"
-version = "0.1.0"
-description = "A Python kernel IR for Radeon GPUs, generating HipKittens C++"
+version = "0.2.0"
+description = "Radeon kernels in Python over an MLIR dialect, generating HipKittens C++"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
-dependencies = ["pybind11>=2.10"]
+# numpy and typing_extensions are what the MLIR Python bindings import.
+dependencies = ["pybind11>=2.10", "numpy", "typing_extensions"]
 
 # torch is not a dependency. hk traces without it and compiles without it --
 # only launching needs it, and on a ROCm box it is already installed by
@@ -45,6 +46,13 @@ hk = [
     # the default tiling and JITs on its first call.
     "tuned/*.json",
     "tuned/README.md",
+    # The MLIR bindings for the hk dialect, built by scripts/build_hk_mlir.sh
+    # for one interpreter (see setup.py). Mostly namespace packages, so they
+    # are listed as data rather than found.
+    "_mlir/**/*.py",
+    "_mlir/**/*.pyi",
+    "_mlir/_mlir_libs/*.so",
+    "_mlir/_mlir_libs/*.so.*",
 ]
 
 [tool.pytest.ini_options]

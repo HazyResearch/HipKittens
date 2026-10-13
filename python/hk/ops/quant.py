@@ -28,7 +28,7 @@ on an activation is decided by whichever row has the worst outlier, and on a
 
 from .. import dsl as hk
 from ..dsl.collective import cross_warp, fold_rows
-from ..ir.nodes import bf16, fp16, fp32, i8
+from ..types import bf16, fp16, fp32, i8
 from .norm import (COLS, MAX_TPW, ROWS, WARP_COUNTS, _block_start, _ceil,
                    _exact, _split, _view)
 
@@ -61,9 +61,9 @@ def plan(cols: int, working_set: int | None = None):
     workgroup owns one row, so the workgroup has exactly one scale to write --
     but `store` writes a whole register vector, sixteen consecutive elements,
     which under FOLD would be sixteen copies of this row's scale laid over the
-    next fifteen rows' slots. The answer is `hk.store_scalar`, which writes one
+    next fifteen rows' slots. The answer is `store_scalar`, which writes one
     entry and refuses any vector not proven uniform; `fold_rows` is what proves
-    it. See lang.ops.store_scalar.
+    it. See View.store_scalar in hk.dsl.values.
 
     **FOLD is a last resort here, where in norm.plan it is tried first**, and
     that inversion is measured, not reasoned. norm folds a 4096-wide row even

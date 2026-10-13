@@ -40,7 +40,7 @@ from typing import Any, Dict, Optional
 from .. import autotune as _autotune
 from .. import dsl as hk
 from ..target import current_arch, get_target
-from ..ir.nodes import bf16, fp32
+from ..types import bf16, fp32
 
 NEG_INF = float("-inf")
 

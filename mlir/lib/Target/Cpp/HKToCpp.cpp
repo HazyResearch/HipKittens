@@ -145,6 +145,25 @@ public:
     return failure(bad);
   }
 
+  void applyNames() {
+    assignNames();
+    auto under = [&](const std::string &n, Location loc) -> Location {
+      if (auto nl = dyn_cast<NameLoc>(loc))
+        loc = nl.getChildLoc();
+      return NameLoc::get(StringAttr::get(kernel.getContext(), n), loc);
+    };
+    for (auto &[v, n] : names) {
+      if (auto ba = dyn_cast<BlockArgument>(v)) {
+        ba.setLoc(under(n, ba.getLoc()));
+        continue;
+      }
+      // One location per op: a multi-result op keeps MLIR's numbering.
+      Operation *op = v.getDefiningOp();
+      if (op->getNumResults() == 1)
+        op->setLoc(under(n, op->getLoc()));
+    }
+  }
+
 private:
   func::FuncOp kernel, grid;
   const TargetInfo *tgt = nullptr;
@@ -227,6 +246,16 @@ private:
         }
         return;
       }
+      if (auto wl = dyn_cast<scf::WhileOp>(op)) {
+        auto carried = wl->getAttrOfType<ArrayAttr>("hk.carried_names");
+        for (auto [i, a] : llvm::enumerate(wl.getBeforeArguments())) {
+          StringRef n = valueNameOf(a.getLoc());
+          if (carried && i < carried.size())
+            n = cast<StringAttr>(carried[i]).getValue();
+          bind(a, n.empty() ? "arg" : n);
+        }
+        return;
+      }
       if (auto i = dyn_cast<scf::IfOp>(op)) {
         auto rn = i->getAttrOfType<ArrayAttr>("hk.result_names");
         for (auto [k, r] : llvm::enumerate(i.getResults())) {
@@ -247,6 +276,16 @@ private:
     kernel.walk([&](scf::ForOp f) {
       for (auto [r, a] : llvm::zip(f.getResults(), f.getRegionIterArgs()))
         names[r] = names[a];
+    });
+    // A while's condition forwards its arguments unchanged (emitWhile
+    // refuses anything else), so the body's arguments and the loop's results
+    // are the same locals as the test's.
+    kernel.walk([&](scf::WhileOp wl) {
+      for (auto [a, b] :
+           llvm::zip(wl.getAfterArguments(), wl.getBeforeArguments()))
+        names[a] = names[b];
+      for (auto [r, b] : llvm::zip(wl.getResults(), wl.getBeforeArguments()))
+        names[r] = names[b];
     });
   }
 
@@ -614,6 +653,25 @@ private:
     w("}");
   }
 
+  void emitWhile(scf::WhileOp wl) {
+    Block &before = wl.getBefore().front(), &after = wl.getAfter().front();
+    auto cond = cast<scf::ConditionOp>(before.getTerminator());
+    for (auto [fwd, arg] : llvm::zip(cond.getArgs(), before.getArguments()))
+      if (fwd != arg)
+        return fail(wl, "a while loop's condition has to forward the loop's "
+                        "carried values unchanged");
+    for (auto [arg, init] : llvm::zip(before.getArguments(), wl.getInits()))
+      w(varCpp(arg.getType()) + " " + name(arg) + " = " + name(init) + ";");
+    w("while (true) {");
+    indent++;
+    emitBlock(before);
+    w("if (!(" + name(cond.getCondition()) + ")) break;");
+    emitBlock(after);
+    assignYield(after, before.getArguments());
+    indent--;
+    w("}");
+  }
+
   void emitIf(scf::IfOp i) {
     // A branch result is a local declared in front of the branch and
     // assigned at the end of each arm.
@@ -660,7 +718,9 @@ private:
     llvm::TypeSwitch<Operation *>(op)
         .Case([&](scf::ForOp f) { emitFor(f); })
         .Case([&](scf::IfOp i) { emitIf(i); })
-        .Case<scf::YieldOp, func::ReturnOp>([](Operation *) {})
+        .Case([&](scf::WhileOp wl) { emitWhile(wl); })
+        .Case<scf::YieldOp, scf::ConditionOp, func::ReturnOp>(
+            [](Operation *) {})
         // indices
         .Case([&](BlockIdxOp o) {
           w("const int " + name(o.getResult()) + " = blockIdx." +
@@ -1008,6 +1068,10 @@ LogicalResult mlir::hk::translateKernelToCpp(func::FuncOp kernel,
                                              ArrayRef<std::string> includes,
                                              raw_ostream &os) {
   return Emitter(kernel).emit(includes, os);
+}
+
+void mlir::hk::nameValuesAsCpp(func::FuncOp kernel) {
+  Emitter(kernel).applyNames();
 }
 
 void mlir::hk::registerToCppTranslation() {

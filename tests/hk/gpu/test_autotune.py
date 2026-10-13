@@ -45,10 +45,11 @@ def _make(*, ROWS, COLS):
     the row faster than the other."""
     name = f"tune_add_{ROWS}x{COLS}"
 
-    def body(a: hk.GL[bf16], b: hk.GL[bf16], o: hk.GL[bf16]):
-        t = hk.rt(bf16, ROWS, COLS)
-        idx = hk.tile_coord(hk.block_idx.z, 0, hk.block_idx.y, hk.block_idx.x)
-        hk.store(o, hk.load(a, idx, t) + hk.load(b, idx, t), idx)
+    def body(a: hk.Tensor[bf16], b: hk.Tensor[bf16], o: hk.Tensor[bf16]):
+        t = hk.RT(bf16, ROWS, COLS)
+        idx = hk.tile_coord(hk.arch.block_idx.z, 0, hk.arch.block_idx.y,
+                            hk.arch.block_idx.x)
+        o[idx] = a[idx].load(t) + b[idx].load(t)
 
     body.__name__ = name
     return hk.kernel(body, arch="gfx1100", warps=1, name=name,

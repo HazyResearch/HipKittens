@@ -29,11 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 import torch  # noqa: E402
 
 import hk  # noqa: E402
-from hk.ir.nodes import bf16, fp32, i8  # noqa: E402
-from hk.lang import ops as _ops  # noqa: E402
-from hk.lang.control import range as _range  # noqa: E402
-from hk.lang.host import cdiv  # noqa: E402
-from hk.lang.kernel import GL, kernel as _kernel  # noqa: E402
+from hk import bf16, fp32, i8  # noqa: E402
 from hk.ops import quant  # noqa: E402
 from hk.ops.norm import COLS, ROWS, _block_start  # noqa: E402
 
@@ -44,66 +40,67 @@ _TINY = 1e-12
 
 
 def _grid(p):
-    return (1, cdiv(p.x.rows, p.ROWS), 1)
+    return (1, hk.cdiv(p.x.rows, p.ROWS), 1)
 
 
 def _amax_body(x, s, *, ROWS=ROWS, COLS=COLS):
     """Pass 1 of quantize, and nothing else."""
-    t = _ops.rt(fp32, ROWS, COLS)
-    vt = _ops.col_vec(t)
-    ncols = _ops.cols(x)
-    nblk = _ops.s_cdiv(ncols, COLS)
-    row_lo, _ = _block_start(_ops.block_idx.y, ROWS, _ops.rows(x))
+    t = hk.RT(fp32, ROWS, COLS)
+    vt = hk.col_vec(t)
+    ncols = x.cols
+    nblk = hk.cdiv(ncols, COLS)
+    row_lo, _ = _block_start(hk.arch.block_idx.y, ROWS, x.rows)
 
-    amax = _ops.zeros_vec(vt)
-    for cb in _range(nblk):
+    amax = hk.zeros(vt)
+    for cb in hk.range(nblk):
         col_lo, pad = _block_start(cb, COLS, ncols)
-        v = _ops.load(x, _ops.elem_coord(0, 0, row_lo, col_lo), t)
-        _ops.row_max(_ops.abs(_ops.left_fill(v, pad(), 0.0)), out=amax, accumulate=True)
+        v = x[hk.elem_coord(0, 0, row_lo, col_lo)].load(t)
+        amax.max_(v.left_fill_(pad(), 0.0).abs().max(axis=1))
 
-    _ops.max(amax, _TINY, out=amax)
-    _ops.store(s, _ops.mul(amax, 1.0 / 127.0), _ops.elem_coord(0, 0, 0, row_lo))
+    amax.maximum(_TINY, into=amax)
+    s[hk.elem_coord(0, 0, 0, row_lo)] = amax * (1.0 / 127.0)
 
 
 def _store_f_body(x, q, s, *, ROWS=ROWS, COLS=COLS):
     """hk.quantize with the int8 store swapped for a bf16 one. Same arithmetic,
     same two passes, same convertor absent."""
-    t = _ops.rt(fp32, ROWS, COLS)
-    vt = _ops.col_vec(t)
-    ncols = _ops.cols(x)
-    nblk = _ops.s_cdiv(ncols, COLS)
-    row_lo, _ = _block_start(_ops.block_idx.y, ROWS, _ops.rows(x))
+    t = hk.RT(fp32, ROWS, COLS)
+    vt = hk.col_vec(t)
+    ncols = x.cols
+    nblk = hk.cdiv(ncols, COLS)
+    row_lo, _ = _block_start(hk.arch.block_idx.y, ROWS, x.rows)
 
     def tile(cb, mask):
         col_lo, pad = _block_start(cb, COLS, ncols)
-        idx = _ops.elem_coord(0, 0, row_lo, col_lo)
-        v = _ops.load(x, idx, t)
-        return (_ops.left_fill(v, pad(), 0.0) if mask else v), idx
+        idx = hk.elem_coord(0, 0, row_lo, col_lo)
+        v = x[idx].load(t)
+        return (v.left_fill_(pad(), 0.0) if mask else v), idx
 
-    amax = _ops.zeros_vec(vt)
-    for cb in _range(nblk):
+    amax = hk.zeros(vt)
+    for cb in hk.range(nblk):
         v, _ = tile(cb, True)
-        _ops.row_max(_ops.abs(v), out=amax, accumulate=True)
+        amax.max_(v.abs().max(axis=1))
 
-    _ops.max(amax, _TINY, out=amax)
-    inv = _ops.div(_ops.full_vec(vt, 127.0), amax)
-    _ops.store(s, _ops.mul(amax, 1.0 / 127.0), _ops.elem_coord(0, 0, 0, row_lo))
+    amax.maximum(_TINY, into=amax)
+    inv = hk.full(vt, 127.0) / amax
+    s[hk.elem_coord(0, 0, 0, row_lo)] = amax * (1.0 / 127.0)
 
-    for cb in _range(nblk):
+    for cb in hk.range(nblk):
         v, idx = tile(cb, False)
-        _ops.mul_row(v, inv, out=v)
-        _ops.store(q, _ops.cast(v, bf16), idx)
+        v *= inv
+        q[idx] = v.to(bf16)
 
 
 def _mk(body, name, anns):
     body.__name__ = name
     body.__annotations__ = anns
-    return _kernel(body, arch="gfx1100", warps=1, grid=_grid, name=name)
+    return hk.kernel(body, arch="gfx1100", warps=1, grid=_grid, name=name)
 
 
-AMAX = _mk(_amax_body, "probe_amax", {"x": GL[bf16], "s": GL[fp32]})
+AMAX = _mk(_amax_body, "probe_amax",
+           {"x": hk.Tensor[bf16], "s": hk.Tensor[fp32]})
 STORE_F = _mk(_store_f_body, "probe_store_f",
-              {"x": GL[bf16], "q": GL[bf16], "s": GL[fp32]})
+              {"x": hk.Tensor[bf16], "q": hk.Tensor[bf16], "s": hk.Tensor[fp32]})
 
 
 def main(rows=16384, cols=4096):

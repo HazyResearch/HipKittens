@@ -21,6 +21,10 @@ MLIR_CAPI_EXPORTED MlirLogicalResult mlirHKTranslateKernelToCpp(
     MlirStringCallback callback, void *userData,
     MlirStringCallback errorCallback, void *errorUserData);
 
+/// Re-locate the kernel's values under the names the C++ translation gives
+/// them, for printing. Locations only; the IR is unchanged.
+MLIR_CAPI_EXPORTED void mlirHKNameValuesAsCpp(MlirOperation kernel);
+
 /// The dialect's semantic version: bumped when what an hk module means, or
 /// the C++ hk-translate writes for it, changes. Part of the compile cache key.
 MLIR_CAPI_EXPORTED MlirStringRef mlirHKDialectVersion(void);

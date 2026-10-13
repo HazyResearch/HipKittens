@@ -1,8 +1,8 @@
 """The shape of an architecture description.
 
 A Target is pure data plus the arithmetic that follows from it. It holds no
-opinions about any particular kernel -- those live in hk.ir.verify, which reads
-this.
+opinions about any particular kernel -- those live in the hk passes
+(mlir/lib/Dialect/HK/Transforms), which read this table's C++ twin.
 """
 
 from dataclasses import dataclass, field
@@ -68,7 +68,7 @@ class Target:
     #: False when no part was available and the numbers are inferred from
     #: builtin signatures rather than measured. Consumers must degrade rather
     #: than present an inferred number as a measured one: see
-    #: hk.ir.verify, which downgrades budget *errors* to warnings on an
+    #: the hk-check-budgets pass, which downgrades budget *errors* to warnings on an
     #: unverified target because a wrong hard limit is worse than none.
     verified: bool = True
 

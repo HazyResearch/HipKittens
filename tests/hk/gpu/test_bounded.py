@@ -1,5 +1,5 @@
-"""Row-predicated global load and store: `hk.load(..., bounded=True)` and
-`hk.store(..., bounded=True)`.
+"""Row-predicated global load and store: `x[idx].load(..., bounded=True)` and
+`x[idx].store(..., bounded=True)`.
 
 What has to hold, and the case that reaches it:
 
@@ -21,16 +21,15 @@ torch = pytest.importorskip("torch")
 
 import hk  # noqa: E402
 from hk import bf16, fp32  # noqa: E402
-from hk.lang import ops  # noqa: E402
 
 
 def _copy_kernel(name, tile_dtype):
-    ty = ops.rt(tile_dtype, 16, 64, "row")
+    ty = hk.RT(tile_dtype, 16, 64, "row")
 
-    def body(x: hk.GL[bf16], y: hk.GL[bf16]):
-        col = ops.block_idx.x * 64
-        t = ops.load(x, ops.elem_coord(0, 0, 0, col), ty, bounded=True)
-        ops.store(y, t, ops.elem_coord(0, 0, 0, col), bounded=True)
+    def body(x: hk.Tensor[bf16], y: hk.Tensor[bf16]):
+        col = hk.arch.block_idx.x * 64
+        t = x[hk.elem_coord(0, 0, 0, col)].load(ty, bounded=True)
+        y[hk.elem_coord(0, 0, 0, col)].store(t, bounded=True)
 
     body.__name__ = name
     return hk.kernel(body, arch="gfx1100", warps=1, name=name,
@@ -69,11 +68,11 @@ def test_rows_past_the_end_are_read_as_zero_not_from_memory():
 
 
 def _zero_probe():
-    ty = ops.rt(bf16, 16, 64, "row")
+    ty = hk.RT(bf16, 16, 64, "row")
 
-    def body(x: hk.GL[bf16], y: hk.GL[bf16]):
-        t = ops.load(x, ops.elem_coord(0, 0, 0, 0), ty, bounded=True)
-        ops.store(y, t, ops.elem_coord(0, 0, 0, 0))
+    def body(x: hk.Tensor[bf16], y: hk.Tensor[bf16]):
+        t = x[hk.elem_coord(0, 0, 0, 0)].load(ty, bounded=True)
+        y[hk.elem_coord(0, 0, 0, 0)].store(t)
 
     body.__name__ = "bounded_zero_probe"
     return hk.kernel(body, arch="gfx1100", warps=1, name="bounded_zero_probe",

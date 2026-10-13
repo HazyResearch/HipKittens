@@ -21,26 +21,26 @@ from hk import bf16, fp32
 
 
 @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-def causal_mask(s: hk.GL[fp32], o: hk.GL[fp32], *, N=32):
+def causal_mask(s: hk.Tensor[fp32], o: hk.Tensor[fp32], *, N=32):
     idx = hk.tile_coord(0, 0, 0, 0)
-    t = hk.load(s, idx, hk.rt(fp32, N, N, "col"))
+    t = s[idx].load(hk.RT(fp32, N, N, "col"))
     # -inf, not 0: these entries go through exp2 before they are summed, and
     # exp2(0) is 1.
-    hk.store(o, hk.make_causal_t(t, float("-inf")), idx)
+    o[idx] = t.make_causal(float("-inf"), transposed=True)
 
 
 @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-def relabel(s: hk.GL[fp32], o: hk.GL[fp32], *, R=16, C=64):
-    t = hk.load(s, hk.tile_coord(0, 0, 0, 0), hk.rt(fp32, R, C, "row"))
+def relabel(s: hk.Tensor[fp32], o: hk.Tensor[fp32], *, R=16, C=64):
+    t = s[hk.tile_coord(0, 0, 0, 0)].load(hk.RT(fp32, R, C, "row"))
     # Mirrored shape *and* opposite layout -- the signature says so, and the
     # store has to agree or the coord template will not match.
-    hk.store(o, hk.transpose(t), hk.tile_coord(0, 0, 0, 0))
+    o[hk.tile_coord(0, 0, 0, 0)] = hk.transpose(t)
 
 
 @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-def move(s: hk.GL[fp32], o: hk.GL[fp32], *, R=16, C=64):
-    t = hk.load(s, hk.tile_coord(0, 0, 0, 0), hk.rt(fp32, R, C, "row"))
-    hk.store(o, hk.transpose_sep(t), hk.tile_coord(0, 0, 0, 0))
+def move(s: hk.Tensor[fp32], o: hk.Tensor[fp32], *, R=16, C=64):
+    t = s[hk.tile_coord(0, 0, 0, 0)].load(hk.RT(fp32, R, C, "row"))
+    o[hk.tile_coord(0, 0, 0, 0)] = hk.transpose_sep(t)
 
 
 def _only(k):

@@ -15,6 +15,7 @@ tests/unit/*/unit_tests
 hsakmt_counters.csv
 *.o
 build/
+dist/
 *.egg-info/
 *.pyc
 *.pyo

@@ -14,53 +14,89 @@ import pytest
 
 import hk
 from hk import fp32, i8
+from hk._mlir import ir
+from hk.compiler import mlir as M
 
 
 @hk.kernel(arch="gfx1100", grid=lambda p: (1, hk.cdiv(p.x.rows, 16), 1))
-def rowsum(x: hk.GL[fp32], o: hk.GL[fp32], *, ROWS=16, COLS=64):
-    t = hk.rt(fp32, ROWS, COLS)
-    acc = hk.zeros_vec(hk.col_vec(t))
-    n = hk.s_cdiv(hk.cols(x), COLS)
+def rowsum(x: hk.Tensor[fp32], o: hk.Tensor[fp32], *, ROWS=16, COLS=64):
+    t = hk.RT(fp32, ROWS, COLS)
+    acc = hk.zeros(hk.col_vec(t))
+    n = hk.cdiv(x.cols, COLS)
     for cb in hk.range(n):
-        idx = hk.elem_coord(0, 0, hk.s_mul(hk.block_idx.y, ROWS), hk.s_mul(cb, COLS))
-        hk.row_sum(hk.load(x, idx, t), out=acc, accumulate=True)
-    hk.store(o, acc, hk.elem_coord(0, 0, 0, hk.s_mul(hk.block_idx.y, ROWS)))
+        idx = hk.elem_coord(0, 0, hk.arch.block_idx.y * ROWS, cb * COLS)
+        acc += x[idx].load(t).sum(axis=1)
+    o[hk.elem_coord(0, 0, 0, hk.arch.block_idx.y * ROWS)] = acc
+
+
+def _kernel(traced):
+    """The kernel's func.func in the traced module."""
+    return M.kernel_of(traced.module)
+
+
+def _body(op):
+    """The ops directly in `op`'s (first) region -- not the nested ones."""
+    return list(op.regions[0].blocks[0].operations)
+
+
+def _walk(op):
+    """Every op nested in `op`'s regions at any depth, in program order."""
+    out = []
+
+    def visit(o):
+        out.append(o)
+        return ir.WalkResult.ADVANCE
+
+    with M.context():
+        op.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    return out[1:]  # pre-order: the first is `op` itself
+
+
+def _ops(op, name):
+    return [o for o in _walk(op) if o.name == name]
 
 
 # -- regions ------------------------------------------------------------------
 
 
 def test_a_loop_is_a_region_not_a_flattened_body():
-    ir = rowsum.trace()
-    (loop,) = ir.ops("for")
-    assert loop.body, "hk.range produced no region"
-    assert [op.opcode for op in ir.body].count("load_global") == 0
-    assert [op.opcode for op in loop.walk()].count("load_global") == 1
+    k = _kernel(rowsum.trace())
+    (loop,) = _ops(k, "scf.for")
+    assert [op for op in _body(loop) if op.name != "scf.yield"], \
+        "hk.range produced no region"
+    assert [op.name for op in _body(k)].count("hk.load") == 0
+    assert [op.name for op in _walk(loop)].count("hk.load") == 1
 
 
 def test_the_induction_variable_is_a_block_argument():
     """Scoped to the region. If it were an ordinary result the emitter would
     declare it outside the `for`, where the loop cannot assign it."""
-    (loop,) = rowsum.trace().ops("for")
-    (iv,) = loop.block_args
-    assert iv not in [r for op in loop.walk() for r in op.results]
+    (loop,) = _ops(_kernel(rowsum.trace()), "scf.for")
+    (iv,) = loop.regions[0].blocks[0].arguments
+    assert isinstance(iv, ir.BlockArgument)
+    assert iv not in [r for op in _walk(loop) for r in op.results]
+    # ... and so the C++ declares it in the `for` header and nowhere else.
+    src = rowsum.source()
+    assert "for (int cb = 0;" in src and src.count("int cb") == 1
 
 
 def test_walk_reaches_into_regions_and_ops_does_too():
-    ir = rowsum.trace()
-    assert len(ir.ops("row_sum")) == 1
-    assert sum(1 for _ in ir.walk()) > len(ir.body)
+    k = _kernel(rowsum.trace())
+    assert len(_ops(k, "hk.row_sum")) == 1
+    assert len(_walk(k)) > len(_body(k))
 
 
 # -- in-place -----------------------------------------------------------------
 
 
 def test_an_accumulating_reduction_writes_the_accumulator_it_was_given():
-    (red,) = rowsum.trace().ops("row_sum")
-    assert red.attrs["inplace"] and red.attrs["accumulate"]
-    assert red.dst is red.operands[0]
-    assert not red.results, "an in-place op that also produces a result would "\
-        "let the emitter declare a fresh destination inside the loop"
+    k = _kernel(rowsum.trace())
+    (red,) = _ops(k, "hk.row_sum")
+    (acc,) = _ops(k, "hk.zero")
+    assert red.opview.dst is not None and "accumulate" in red.attributes
+    assert red.opview.dst == acc.result
+    assert not list(red.results), "an in-place op that also produces a result "\
+        "would let the emitter declare a fresh destination inside the loop"
 
 
 def test_the_accumulator_is_declared_once_outside_the_loop():
@@ -69,7 +105,7 @@ def test_the_accumulator_is_declared_once_outside_the_loop():
     no diagnostic."""
     src = rowsum.source()
     body = src.split("for (int", 1)[1]
-    decl = "_col zv;"  # named for hk.zeros_vec, the op that produced it
+    decl = "_col zv;"  # named for hk.zeros of a vector, the op that produced it
     assert src.count(decl) == 1 and decl not in body
 
 
@@ -82,13 +118,13 @@ def test_an_accumulating_reduction_passes_its_destination_as_the_third_argument(
 
 def test_a_non_accumulating_reduction_declares_its_own_destination():
     @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-    def once(x: hk.GL[fp32], o: hk.GL[fp32]):
-        t = hk.rt(fp32, 16, 64)
+    def once(x: hk.Tensor[fp32], o: hk.Tensor[fp32]):
+        t = hk.RT(fp32, 16, 64)
         i = hk.elem_coord(0, 0, 0, 0)
-        hk.store(o, hk.row_max(hk.load(x, i, t)), hk.elem_coord(0, 0, 0, 0))
+        o[hk.elem_coord(0, 0, 0, 0)] = x[i].load(t).max(axis=1)
 
-    (red,) = once.trace().ops("row_max")
-    assert not red.attrs.get("inplace")
+    (red,) = _ops(_kernel(once.trace()), "hk.row_max")
+    assert red.opview.dst is None and len(red.results) == 1
     assert "_col row_max;" in once.source()
     assert "kittens::row_max(row_max, ld);" in once.source()
 
@@ -101,17 +137,16 @@ def test_a_fill_carries_a_runtime_index_not_a_constant():
     index had to be a literal could not express it at all."""
 
     @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-    def masked(x: hk.GL[fp32], o: hk.GL[fp32], *, COLS=64):
-        t = hk.rt(fp32, 16, COLS)
-        n = hk.cols(x)
-        lo = hk.s_min(hk.s_mul(hk.block_idx.x, COLS), hk.s_sub(n, COLS))
-        pad = hk.s_sub(hk.s_mul(hk.block_idx.x, COLS), lo)
+    def masked(x: hk.Tensor[fp32], o: hk.Tensor[fp32], *, COLS=64):
+        t = hk.RT(fp32, 16, COLS)
+        n = x.cols
+        lo = hk.min(hk.arch.block_idx.x * COLS, n - COLS)
+        pad = hk.arch.block_idx.x * COLS - lo
         idx = hk.elem_coord(0, 0, 0, lo)
-        hk.store(o, hk.left_fill(hk.load(x, idx, t), pad, 0.0), idx)
+        o[idx] = x[idx].load(t).left_fill_(pad, 0.0)
 
-    ir = masked.trace()
-    (fill,) = ir.ops("left_fill")
-    assert fill.operands[2].producer.opcode == "s_sub"
+    (fill,) = _ops(_kernel(masked.trace()), "hk.left_fill")
+    assert fill.opview.idx.owner.name == "arith.subi"
     assert "kittens::left_fill(ld, ld, sub1, (float)0.0);" in masked.source()
 
 
@@ -124,15 +159,15 @@ def test_a_fill_writes_its_source_in_place():
     place makes the early return leave the loaded values alone."""
 
     @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-    def m(x: hk.GL[fp32], o: hk.GL[fp32]):
-        t = hk.rt(fp32, 16, 64)
+    def m(x: hk.Tensor[fp32], o: hk.Tensor[fp32]):
+        t = hk.RT(fp32, 16, 64)
         i = hk.elem_coord(0, 0, 0, 0)
-        v = hk.load(x, i, t)
-        assert hk.left_fill(v, 3, 0.0) is v
-        hk.store(o, v, i)
+        v = x[i].load(t)
+        assert v.left_fill_(3, 0.0) is v
+        o[i] = v
 
-    (fill,) = m.trace().ops("left_fill")
-    assert fill.attrs["inplace"] and fill.dst is fill.operands[1]
+    (fill,) = _ops(_kernel(m.trace()), "hk.left_fill")
+    assert fill.opview.dst is not None and fill.opview.dst == fill.opview.src
     src = m.source()
     assert src.count("rt_fp32_16x64_row ld;") == 1
     assert src.count("rt_fp32_16x64_row ") == 2, "a fill declared a second tile"
@@ -143,13 +178,13 @@ def test_an_explicit_out_on_a_fill_copies_first():
     Emitting the fill alone here would be the same uninitialized-dst bug."""
 
     @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-    def m(x: hk.GL[fp32], o: hk.GL[fp32]):
-        t = hk.rt(fp32, 16, 64)
+    def m(x: hk.Tensor[fp32], o: hk.Tensor[fp32]):
+        t = hk.RT(fp32, 16, 64)
         i = hk.elem_coord(0, 0, 0, 0)
-        v = hk.load(x, i, t)
+        v = x[i].load(t)
         w = hk.zeros(t)
-        hk.right_fill(v, 8, 1.0, out=w)
-        hk.store(o, w, i)
+        v.right_fill_(8, 1.0, into=w)
+        o[i] = w
 
     src = m.source()
     assert src.index("kittens::copy(z, ld);") < src.index("kittens::right_fill(z, ld,")
@@ -160,9 +195,9 @@ def test_neg_infty_fill_uses_the_named_constant_not_a_c_literal():
     file would not compile. It did not, once."""
 
     @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-    def m(o: hk.GL[fp32]):
-        t = hk.rt(fp32, 16, 64)
-        hk.store(o, hk.full(t, float("-inf")), hk.elem_coord(0, 0, 0, 0))
+    def m(o: hk.Tensor[fp32]):
+        t = hk.RT(fp32, 16, 64)
+        o[hk.elem_coord(0, 0, 0, 0)] = hk.full(t, float("-inf"))
 
     src = m.source()
     assert "-inf" not in src
@@ -173,11 +208,11 @@ def test_neg_infty_fill_uses_the_named_constant_not_a_c_literal():
 
 
 def test_scalar_arithmetic_stays_on_the_host_side_of_the_type_system():
-    ir = rowsum.trace()
-    assert {op.opcode for op in ir.walk()} >= {"s_mul", "s_cdiv"}
-    for op in ir.walk():
-        if op.opcode.startswith("s_"):
-            assert isinstance(op.result.type, hk.ir.ScalarType)
+    ops = _walk(_kernel(rowsum.trace()))
+    assert {op.name for op in ops} >= {"arith.muli", "arith.ceildivsi"}
+    for op in ops:
+        if op.name.startswith("arith."):
+            assert [str(r.type) for r in op.results] == ["i32"], op
 
 
 def test_a_hoisted_scalar_is_emitted_once():
@@ -188,9 +223,9 @@ def test_a_hoisted_scalar_is_emitted_once():
 
 def test_there_is_no_rounding_division_on_a_tile():
     @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-    def bad(x: hk.GL[fp32], o: hk.GL[fp32]):
+    def bad(x: hk.Tensor[fp32], o: hk.Tensor[fp32]):
         i = hk.elem_coord(0, 0, 0, 0)
-        hk.store(o, hk.load(x, i, hk.rt(fp32, 16, 64)) // 2, i)
+        o[i] = x[i].load(hk.RT(fp32, 16, 64)) // 2
 
     with pytest.raises(TypeError, match="rounding division"):
         bad.trace()
@@ -203,9 +238,9 @@ def test_int8_is_a_global_type_and_not_a_register_type():
     """gfx1100 has no int8 WMMA and no packed int8 ALU, so rt<int8> would be a
     template error at the end of a 30 s compile. Refuse it at trace time with
     the reason."""
-    assert hk.GL[i8]
+    assert hk.Tensor[i8]
     with pytest.raises(TypeError, match="no i8 register tile"):
-        hk.rt(i8, 16, 64)
+        hk.RT(i8, 16, 64)
 
 
 def test_a_load_from_an_int8_global_lands_in_a_float_tile():
@@ -369,7 +404,7 @@ def test_an_exact_layernorm_neither_masks_nor_copies():
 
 
 def test_an_exact_kernel_does_not_clamp_its_column():
-    """No back-up means no s_min against the end of the row. The clamp is one
+    """No back-up means no hk.min against the end of the row. The clamp is one
     scalar op, but its presence is the observable half of the claim: if it is
     still there, some block can still be backed up and dropping the mask would
     be wrong."""

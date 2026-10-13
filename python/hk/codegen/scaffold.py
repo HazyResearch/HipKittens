@@ -1,7 +1,8 @@
 """What wraps the kernel: the module boundary.
 
-Split from cpp.py because the kernel body is the same artifact in every
-deployment and only its wrapper changes. A pybind module is what `hk.compile()`
+Split from the translation because the kernel body -- what hk-translate
+writes from the traced module -- is the same artifact in every deployment and
+only its wrapper changes. A pybind module is what `hk.compile()`
 loads; a TORCH_LIBRARY registration is what vLLM and SGLang want (Phase 6); an
 AOT build wants neither, just the object file. Keeping this in one place means
 those three share a single emitter and cannot drift.
@@ -15,16 +16,14 @@ about the real cause.
 
 from __future__ import annotations
 
-from typing import List
+from typing import TYPE_CHECKING, List
 
-from ..ir.nodes import GlobalType, KernelIR
-from . import cpp
+from ..types import GlobalType
+
+if TYPE_CHECKING:
+    from ..dsl.kernel import TracedKernel
 
 MODULE_NAME_MACRO = "HK_MODULE_NAME"
-
-#: Opcodes that write through a global. `store_frag` is deliberately absent:
-#: it writes into a shared tile, not into memory the caller can see.
-GLOBAL_WRITERS = ("store_global", "store_scalar", "group_store")
 
 #: hk dtype -> the at:: scalar type a tensor must have to be read as it.
 _AT_DTYPE = {
@@ -38,22 +37,14 @@ _AT_DTYPE = {
 }
 
 
-def _members(ir: KernelIR) -> str:
+def _members(ir: "TracedKernel") -> str:
     return ", ".join(f"&globals::{p.name}" for p in ir.tensors())
 
 
-def _emitter(ir, emit):
-    if emit is not None:
-        return emit
-    if hasattr(ir, "cpp"):
-        return lambda traced, includes: traced.cpp(includes)
-    return cpp.emit
-
-
-def pybind_module(ir: KernelIR, emit=None) -> str:
+def pybind_module(ir: "TracedKernel") -> str:
     """A self-contained pybind11 extension exporting one function, `ir.name`,
     that takes the tensor parameters positionally in declaration order."""
-    src = _emitter(ir, emit)(ir, includes=('"kittens.cuh"', '"pyutils/hk_bind.cuh"'))
+    src = ir.cpp(('"kittens.cuh"', '"pyutils/hk_bind.cuh"'))
     lines = [
         src,
         f"#ifndef {MODULE_NAME_MACRO}",
@@ -77,32 +68,23 @@ def pybind_module(ir: KernelIR, emit=None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def bare(ir: KernelIR, emit=None) -> str:
+def bare(ir: "TracedKernel") -> str:
     """Kernel and `launch`, no module boundary. For AOT objects and for reading
     the generated code when debugging a schedule."""
-    return _emitter(ir, emit)(ir, includes=('"kittens.cuh"',))
+    return ir.cpp(('"kittens.cuh"',))
 
 
-def written_tensors(ir: KernelIR) -> List[str]:
+def written_tensors(ir: "TracedKernel") -> List[str]:
     """The tensor parameters the kernel stores into, in declaration order.
 
     A torch schema has to say which arguments are mutated -- get it wrong and
     the functionalization pass in torch.compile will happily reorder a read
-    before the write that fed it. The IR already knows: a global that is the
-    destination of a store is an output and nothing else is. Deriving it beats
-    asking the kernel author, who would have to repeat themselves and could
-    disagree with their own kernel.
+    before the write that fed it. The module already knows: a global that is
+    the destination of a store is an output and nothing else is. Deriving it
+    beats asking the kernel author, who would have to repeat themselves and
+    could disagree with their own kernel.
     """
-    if hasattr(ir, "written_tensors"):
-        return ir.written_tensors()
-    out = []
-    for op in ir.walk():
-        if op.opcode in GLOBAL_WRITERS and op.operands:
-            dst = op.operands[0]
-            if isinstance(dst.type, GlobalType) and dst.name not in out:
-                out.append(dst.name)
-    order = [p.name for p in ir.tensors()]
-    return [n for n in order if n in out]
+    return ir.written_tensors()
 
 
 def _alias_letters(n: int) -> List[str]:
@@ -111,7 +93,7 @@ def _alias_letters(n: int) -> List[str]:
     return [chr(ord("a") + i) for i in range(n)]
 
 
-def torch_schema(ir: KernelIR, op_name: str = "") -> str:
+def torch_schema(ir: "TracedKernel", op_name: str = "") -> str:
     """The op's torch schema: tensors in declaration order, outputs marked
     mutable, returning nothing. Everything the kernel needs besides tensors is
     a constexpr baked into the source, so there are no other arguments."""
@@ -125,11 +107,10 @@ def torch_schema(ir: KernelIR, op_name: str = "") -> str:
     return f"{name}({', '.join(args)}) -> ()"
 
 
-def torch_library(ir: KernelIR, ns: str = "hk", op_name: str = "",
-                  emit=None) -> str:
+def torch_library(ir: "TracedKernel", ns: str = "hk", op_name: str = "") -> str:
     """A shared object registering one `torch.ops.<ns>.<op>`.
 
-    Out-parameter form on purpose. The IR cannot say which shape an output
+    Out-parameter form on purpose. The kernel cannot say which shape an output
     should have -- the grid is an expression over the globals, and the kernel
     stores wherever it was told to -- so an op that allocated its own result
     would have to guess. Taking the destination as an argument also happens to
@@ -160,7 +141,7 @@ def torch_library(ir: KernelIR, ns: str = "hk", op_name: str = "",
             raise ValueError(
                 f"{ir.name} takes {p.name} as a runtime non-tensor argument, "
                 f"which the generated globals struct has no member for. Make "
-                f"it a hk.const (it is baked into the source, and each value "
+                f"it a constexpr (it is baked into the source, and each value "
                 f"gets its own cached build) or pass it as a tensor."
             )
 
@@ -189,7 +170,7 @@ def torch_library(ir: KernelIR, ns: str = "hk", op_name: str = "",
         for p in tensors
     )
 
-    src = _emitter(ir, emit)(ir, includes=('"kittens.cuh"',))
+    src = ir.cpp(('"kittens.cuh"',))
     return "\n".join([
         src,
         "#include <torch/library.h>",
@@ -274,13 +255,12 @@ def torch_library(ir: KernelIR, ns: str = "hk", op_name: str = "",
 SCAFFOLDS = {"pybind": pybind_module, "bare": bare, "torch": torch_library}
 
 
-def render(ir: KernelIR, scaffold: str = "pybind", emit=None) -> str:
-    """The whole translation unit. `emit(ir, includes)` writes the kernel
-    itself; by default the Python emitter, codegen.cpp."""
+def render(ir: "TracedKernel", scaffold: str = "pybind") -> str:
+    """The whole translation unit: the translated kernel and its wrapper."""
     try:
         fn = SCAFFOLDS[scaffold]
     except KeyError:
         raise ValueError(
             f"unknown scaffold {scaffold!r}; have {sorted(SCAFFOLDS)}"
         ) from None
-    return fn(ir, emit=emit)
+    return fn(ir)

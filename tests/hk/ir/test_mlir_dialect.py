@@ -1,4 +1,5 @@
-"""The hk MLIR dialect, driven from Python, against the Python IR it replaces.
+"""The hk MLIR dialect, driven from Python: the target tables, the textual
+form of a traced kernel, and how a pass error reads.
 
 Skipped where hk._mlir has not been built (scripts/build_hk_mlir.sh).
 """
@@ -11,7 +12,7 @@ import pytest
 
 pytest.importorskip("hk._mlir")
 
-from hk.compiler import gate_a, mlir as M  # noqa: E402
+from hk.compiler import mlir as M  # noqa: E402
 from hk.target import TARGETS  # noqa: E402
 
 
@@ -81,21 +82,17 @@ def test_the_textual_ir_round_trips_with_its_names():
     assert 'loc("x")' in text and 'loc("rsqrt"' in text
 
 
-def test_a_pass_error_reads_as_the_python_one(monkeypatch):
-    # With the gate on, a C++ message that differed would surface as a
-    # GateError instead of the VerifyError asked for here.
+def test_a_pass_error_names_the_line_that_caused_it():
     import hk
-    from hk import bf16
-    from hk.ir.verify import VerifyError
 
-    monkeypatch.setenv("HK_GATE_A", "1")
+    def body(a: hk.Tensor[hk.bf16], o: hk.Tensor[hk.bf16]):
+        s = hk.lds.alloc(hk.ST(hk.bf16, 16, 16), name="s")
+        t = s.load(hk.RT(hk.bf16, 16, 16), wait=False)
+        o[hk.elem_coord(0, 0, 0, 0)] = t.exp()
 
-    def body(a, o):
-        s = hk.alloc_shared(hk.st(bf16, 16, 16), name="s")
-        t = hk.load_shared(s, hk.rt(bf16, 16, 16), wait=False)
-        hk.store(o, hk.exp(t), hk.elem_coord(0, 0, 0, 0))
-
-    body.__annotations__ = {"a": hk.GL[bf16], "o": hk.GL[bf16]}
-    k = hk.kernel(body, warps=1, name="early_read", grid=lambda p: (1, 1, 1))
-    with pytest.raises(VerifyError, match="whose LDS reads are still in flight"):
+    k = hk.kernel(body, arch="gfx1100", warps=1, name="early_read",
+                  grid=lambda p: (1, 1, 1))
+    with pytest.raises(hk.VerifyError,
+                       match="whose LDS reads are still in flight") as e:
         k.trace()
+    assert "test_mlir_dialect.py:" in str(e.value)

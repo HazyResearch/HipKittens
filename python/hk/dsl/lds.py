@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Optional
 
 from .._mlir.dialects import hk as hkd
-from ..compiler.from_kernel_ir import mlir_type
-from ..ir.nodes import RegVecType, SharedTileType, SharedVecType
+from .module import mlir_type
+from ..types import RegVecType, SharedTileType, SharedVecType
 from . import builder as B
 from .values import SharedTile, SharedVec, Tile, lds_loads
 

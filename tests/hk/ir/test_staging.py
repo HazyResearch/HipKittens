@@ -11,16 +11,18 @@ ds_reads.
 The last point is the one worth the file. The handwritten GEMM computes that
 term by hand, under the name TAIL_OPS, with a paragraph explaining that an
 lgkmcnt immediate which is too *large* does not over-wait -- it fails to wait
-at all, and the kernel is then wrong only sometimes.
+at all, and the kernel is then wrong only sometimes. The accounting is the C++
+pass hk-lds-pipeline, which records each derived count on the wait as
+`hk.lds_wait_for ... {n = K}`.
 """
+
+import re
 
 import pytest
 
 import hk
-from hk import bf16, fp32
-from hk.ir.nodes import StageBufferType
-from hk.ir.verify import VerifyError
-from hk.lang import ops
+from hk import VerifyError, bf16, fp32
+from hk.types import StageBufferType
 
 
 def _trace(body, **kw):
@@ -35,17 +37,16 @@ def _src(body, **kw):
     return k.source(**kw)
 
 
-def _waits(ir):
+def _waits(traced):
+    """The derived count of every lds_wait_for in the kernel body, innermost
+    regions included, in program order."""
     out = []
-
-    def walk(ops_):
-        for op in ops_:
-            if op.body is not None:
-                walk(op.body)
-            elif op.opcode == "lds_wait_for":
-                out.append(op)
-
-    walk(ir.body)
+    for ln in traced.dump().splitlines():
+        if "hk.lds_wait_for" not in ln:
+            continue
+        m = re.search(r"\{n = (\d+) : i64\}", ln)
+        assert m, f"lds_wait_for without a derived count: {ln}"
+        out.append(int(m.group(1)))
     return out
 
 
@@ -60,27 +61,27 @@ def test_stage_calls_is_the_cpp_expression_transcribed():
     safety in one direction only -- a buffer one float4 short is an
     out-of-bounds write to the stack.
     """
-    assert StageBufferType(ops.st(bf16, 128, 32), 256).calls == 2
-    assert StageBufferType(ops.st(bf16, 128, 32), 64).calls == 8
+    assert StageBufferType(hk.ST(bf16, 128, 32), 256).calls == 2
+    assert StageBufferType(hk.ST(bf16, 128, 32), 64).calls == 8
     # fp32 packs half as many elements per float4, so twice the calls.
-    assert StageBufferType(ops.st(fp32, 128, 32), 256).calls == 4
+    assert StageBufferType(hk.ST(fp32, 128, 32), 256).calls == 4
     # And it rounds up: three warps cannot divide 512 float4s evenly.
-    assert StageBufferType(ops.st(bf16, 128, 32), 96).calls == 6
+    assert StageBufferType(hk.ST(bf16, 128, 32), 96).calls == 6
 
 
 def test_the_buffer_reaches_the_source_at_that_size():
-    def staged(a: hk.GL[bf16]):
+    def staged(a: hk.Tensor[bf16]):
         g = hk.group(8)
-        As = ops.alloc_shared(ops.st(bf16, 128, 32), count=2, name="As")
+        As = hk.lds.alloc(hk.ST(bf16, 128, 32), count=2, name="As")
         g.stage_buffer(As, name="buf")
 
     assert "float4 buf[2];" in _src(staged)
 
 
 def test_depth_is_a_second_dimension_not_a_bigger_one():
-    def staged(a: hk.GL[bf16]):
+    def staged(a: hk.Tensor[bf16]):
         g = hk.group(8)
-        As = ops.alloc_shared(ops.st(bf16, 128, 32), count=2, name="As")
+        As = hk.lds.alloc(hk.ST(bf16, 128, 32), count=2, name="As")
         g.stage_buffer(As, depth=2, name="buf")
 
     assert "float4 buf[2][2];" in _src(staged)
@@ -92,24 +93,24 @@ def test_depth_is_a_second_dimension_not_a_bigger_one():
 def test_a_stack_is_one_allocation_of_n_tiles():
     """count=2 doubles the bytes and keeps a single offset, which is what makes
     the XOR swap legal: the two buffers have to differ in one address bit."""
-    def two(a: hk.GL[bf16]):
-        ops.alloc_shared(ops.st(bf16, 128, 32), count=2, name="As")
+    def two(a: hk.Tensor[bf16]):
+        hk.lds.alloc(hk.ST(bf16, 128, 32), count=2, name="As")
 
     ir = _trace(two)
     assert ir.lds_bytes == 2 * 128 * 32 * 2
 
 
 def test_indexing_a_lone_tile_is_an_error():
-    def lone(a: hk.GL[bf16]):
-        ops.shared_at(ops.alloc_shared(ops.st(bf16, 64, 64)), 0)
+    def lone(a: hk.Tensor[bf16]):
+        hk.lds.alloc(hk.ST(bf16, 64, 64))[0]
 
     with pytest.raises(TypeError):
         _trace(lone)
 
 
 def test_constant_index_is_bounds_checked():
-    def oob(a: hk.GL[bf16]):
-        ops.shared_at(ops.alloc_shared(ops.st(bf16, 64, 64), count=2), 2)
+    def oob(a: hk.Tensor[bf16]):
+        hk.lds.alloc(hk.ST(bf16, 64, 64), count=2)[2]
 
     with pytest.raises(IndexError):
         _trace(oob)
@@ -118,9 +119,9 @@ def test_constant_index_is_bounds_checked():
 def test_a_stack_cannot_be_used_where_a_tile_is_meant():
     """The failure this prevents is silent: an un-indexed stack decays to its
     first tile in C++, so half the double buffering would just not happen."""
-    def forgot(a: hk.GL[bf16]):
+    def forgot(a: hk.Tensor[bf16]):
         g = hk.group(8)
-        As = ops.alloc_shared(ops.st(bf16, 128, 32), count=2, name="As")
+        As = hk.lds.alloc(hk.ST(bf16, 128, 32), count=2, name="As")
         buf = g.stage_buffer(As, name="buf")
         g.commit(As, buf)
 
@@ -131,24 +132,24 @@ def test_a_stack_cannot_be_used_where_a_tile_is_meant():
 def test_a_buffer_sized_for_another_group_is_refused():
     """Same silent class: the count is baked into the buffer, and handing it to
     a group of a different size overruns or underfills it with no diagnostic."""
-    def mixed(a: hk.GL[bf16]):
-        As = ops.alloc_shared(ops.st(bf16, 128, 32), count=2, name="As")
+    def mixed(a: hk.Tensor[bf16]):
+        As = hk.lds.alloc(hk.ST(bf16, 128, 32), count=2, name="As")
         buf = hk.group(8).stage_buffer(As, name="buf")
-        hk.group(4).commit(ops.shared_at(As, 0), buf)
+        hk.group(4).commit(As[0], buf)
 
     with pytest.raises(TypeError, match="threads"):
         _trace(mixed)
 
 
 def test_vm_wait_fits_in_the_vmcnt_field():
-    def over(a: hk.GL[bf16]):
-        ops.vm_wait(64)
+    def over(a: hk.Tensor[bf16]):
+        hk.arch.vm_wait(64)
 
     with pytest.raises(TypeError, match="6 bits"):
         _trace(over)
 
-    def ok(a: hk.GL[bf16]):
-        ops.vm_wait(63)
+    def ok(a: hk.Tensor[bf16]):
+        hk.arch.vm_wait(63)
 
     assert "kittens::vm_wait<63>();" in _src(ok)
 
@@ -159,17 +160,17 @@ def test_vm_wait_fits_in_the_vmcnt_field():
 def test_a_subtile_must_tile_its_parent():
     """subtile_inplace indexes in units of the subtile, so a window that does
     not divide the parent has no index to be given."""
-    def ragged(a: hk.GL[bf16]):
-        ops.subtile(ops.alloc_shared(ops.st(bf16, 128, 32)), 48, 16)
+    def ragged(a: hk.Tensor[bf16]):
+        hk.lds.alloc(hk.ST(bf16, 128, 32)).subtile(48, 16)
 
     with pytest.raises(ValueError, match="does not divide"):
         _trace(ragged)
 
 
 def test_a_subtile_narrows_the_type():
-    def win(a: hk.GL[bf16]):
-        s = ops.alloc_shared(ops.st(bf16, 128, 32))
-        v = ops.subtile(s, 32, 16, 1, 0)
+    def win(a: hk.Tensor[bf16]):
+        s = hk.lds.alloc(hk.ST(bf16, 128, 32))
+        v = s.subtile(32, 16, 1, 0)
         assert (v.type.rows, v.type.cols) == (32, 16)
 
     _trace(win)
@@ -180,9 +181,9 @@ def test_a_subtile_binds_by_value():
     parent's swizzle constants -- so `auto &` does not compile. The register
     overload of the same name does return a reference, which is exactly the
     trap."""
-    def win(a: hk.GL[bf16]):
-        s = ops.alloc_shared(ops.st(bf16, 128, 32))
-        ops.subtile(s, 32, 16, 1, 0)
+    def win(a: hk.Tensor[bf16]):
+        s = hk.lds.alloc(hk.ST(bf16, 128, 32))
+        s.subtile(32, 16, 1, 0)
 
     line = [ln.strip() for ln in _src(win).splitlines() if "subtile_inplace" in ln]
     assert len(line) == 1, line
@@ -201,30 +202,30 @@ def _pipelined(write_pos: int):
     lands -- the C++ has the same knob, for the same reason, because moving it
     changes how much math the ds_writes get to hide behind.
     """
-    def body(a: hk.GL[bf16]):
+    def body(a: hk.Tensor[bf16]):
         g = hk.group(8)
-        As = hk.alloc_shared(ops.st(bf16, 128, 32), count=2, name="As")
+        As = hk.lds.alloc(hk.ST(bf16, 128, 32), count=2, name="As")
         buf = g.stage_buffer(As, name="buf")
-        acc = ops.zeros(ops.rt(fp32, 32, 16, "col"))
-        rt_a = ops.rt(bf16, 32, 16, "row")
-        rt_b = ops.rt(bf16, 16, 16, "row")
-        for i in hk.range(ops.rows(a)):
-            s = ops.shared_at(As, i % 2)
-            other = ops.shared_at(As, 1 - i % 2)
+        acc = hk.zeros(hk.RT(fp32, 32, 16, "col"))
+        rt_a = hk.RT(bf16, 32, 16, "row")
+        rt_b = hk.RT(bf16, 16, 16, "row")
+        for i in hk.range(a.rows):
+            s = As[i % 2]
+            other = As[1 - i % 2]
 
             def drain(at):
                 if at == write_pos:
-                    ops.vm_wait(0)
+                    hk.arch.vm_wait(0)
                     g.commit(other, buf)
-                    g.stage(buf, a, ops.elem_coord(0, 0, 0, 0))
+                    g.stage(buf, a[hk.elem_coord(0, 0, 0, 0)])
 
-            t = ops.load_shared(ops.subtile(s, 32, 16, 0, 0), rt_a, wait=False)
-            b0 = ops.load_shared(ops.subtile(s, 16, 16, 0, 1), rt_b, wait=False)
+            t = s.subtile(32, 16, 0, 0).load(rt_a, wait=False)
+            b0 = s.subtile(16, 16, 0, 1).load(rt_b, wait=False)
             drain(0)
-            ops.lds_wait_for(t, b0)
-            ops.mma_ABt(t, b0, acc, out=acc)
+            hk.lds.wait_for(t, b0)
+            acc += t @ b0.T
             drain(1)
-            ops.barrier(drain=True)
+            hk.arch.barrier(drain=True)
 
     body.__name__ = f"pipelined{write_pos}"
     return _trace(body)
@@ -243,7 +244,7 @@ def test_an_interleaved_write_counts_toward_the_wait():
     This is also the position that pays: the writes now have a whole chunk of
     WMMAs to complete behind, so the lgkmcnt(0) at the barrier is nearly free.
     """
-    assert [w.attrs["n"] for w in _waits(_pipelined(write_pos=0))] == [2]
+    assert _waits(_pipelined(write_pos=0)) == [2]
 
 
 def test_a_write_after_the_last_wait_costs_a_full_drain():
@@ -251,7 +252,7 @@ def test_a_write_after_the_last_wait_costs_a_full_drain():
     so the derived immediate is 0 and the writes have nothing to hide behind
     -- the barrier's lgkmcnt(0) eats the whole latency. Same answer, worse
     schedule, and the IR says which is which without a benchmark."""
-    assert [w.attrs["n"] for w in _waits(_pipelined(write_pos=1))] == [0]
+    assert _waits(_pipelined(write_pos=1)) == [0]
 
 
 def test_the_loop_reaches_a_steady_state():
@@ -276,12 +277,12 @@ def test_a_barrier_with_writes_in_flight_is_refused():
     WRITE_POS settings that happen not to need one are safe by accident of
     where the last wait falls.
     """
-    def racy(a: hk.GL[bf16]):
+    def racy(a: hk.Tensor[bf16]):
         g = hk.group(8)
-        As = hk.alloc_shared(ops.st(bf16, 128, 32), count=2, name="As")
+        As = hk.lds.alloc(hk.ST(bf16, 128, 32), count=2, name="As")
         buf = g.stage_buffer(As, name="buf")
-        g.commit(ops.shared_at(As, 1), buf)
-        ops.barrier()
+        g.commit(As[1], buf)
+        hk.arch.barrier()
 
     with pytest.raises(VerifyError, match="ds_writes still in flight"):
         _trace(racy)
@@ -291,11 +292,10 @@ def test_a_barrier_with_reads_in_flight_is_refused_too():
     """The mirror hazard, and the one that is easier to talk yourself out of:
     the reads have landed *somewhere*, just not yet in registers, and the
     buffer they came from is about to be overwritten by another warp."""
-    def racy(a: hk.GL[bf16]):
-        s = ops.alloc_shared(ops.st(bf16, 128, 32))
-        ops.load_shared(ops.subtile(s, 32, 16, 0, 0),
-                        ops.rt(bf16, 32, 16, "row"), wait=False)
-        ops.barrier()
+    def racy(a: hk.Tensor[bf16]):
+        s = hk.lds.alloc(hk.ST(bf16, 128, 32))
+        s.subtile(32, 16, 0, 0).load(hk.RT(bf16, 32, 16, "row"), wait=False)
+        hk.arch.barrier()
 
     with pytest.raises(VerifyError, match="ds_reads still in flight"):
         _trace(racy)
@@ -304,19 +304,19 @@ def test_a_barrier_with_reads_in_flight_is_refused_too():
 def test_draining_costs_an_lgkmcnt_zero_in_the_source():
     """And it is a separate instruction before the barrier, not a flag on it:
     s_barrier has no memory semantics to attach one to."""
-    def drained(a: hk.GL[bf16]):
+    def drained(a: hk.Tensor[bf16]):
         g = hk.group(8)
-        As = hk.alloc_shared(ops.st(bf16, 128, 32), count=2, name="As")
+        As = hk.lds.alloc(hk.ST(bf16, 128, 32), count=2, name="As")
         buf = g.stage_buffer(As, name="buf")
-        g.commit(ops.shared_at(As, 1), buf)
-        ops.barrier(drain=True)
+        g.commit(As[1], buf)
+        hk.arch.barrier(drain=True)
 
     src = _src(drained)
     i = src.index("kittens::lds_wait<0>();")
     assert src.index("__builtin_amdgcn_s_barrier();", i) > i
     # And a plain barrier does not pay for it.
-    def plain(a: hk.GL[bf16]):
-        ops.barrier()
+    def plain(a: hk.Tensor[bf16]):
+        hk.arch.barrier()
 
     assert "lds_wait<0>" not in _src(plain)
 
@@ -326,8 +326,8 @@ def test_the_barrier_is_the_builtin_not_syncthreads():
     that with a `buffer_gl0_inv` -- a per-WGP vector L0 flush. In the GEMM that
     is one flush per K-tile and it was the whole measured gap against the
     handwritten kernel. This op only ever promised execution ordering."""
-    def plain(a: hk.GL[bf16]):
-        ops.barrier()
+    def plain(a: hk.Tensor[bf16]):
+        hk.arch.barrier()
 
     src = _src(plain)
     assert "__builtin_amdgcn_s_barrier();" in src
@@ -337,19 +337,19 @@ def test_the_barrier_is_the_builtin_not_syncthreads():
 def test_a_wait_the_math_needed_anyway_is_enough():
     """The cheap fix the error message points at: no drain, because the wait
     that feeds the next WMMA already retires the writes."""
-    def clean(a: hk.GL[bf16]):
+    def clean(a: hk.Tensor[bf16]):
         g = hk.group(8)
-        As = hk.alloc_shared(ops.st(bf16, 128, 32), count=2, name="As")
+        As = hk.lds.alloc(hk.ST(bf16, 128, 32), count=2, name="As")
         buf = g.stage_buffer(As, name="buf")
-        acc = ops.zeros(ops.rt(fp32, 32, 16, "col"))
-        g.commit(ops.shared_at(As, 1), buf)
-        t = ops.load_shared(ops.subtile(ops.shared_at(As, 0), 32, 16, 0, 0),
-                            ops.rt(bf16, 32, 16, "row"), wait=False)
-        b0 = ops.load_shared(ops.subtile(ops.shared_at(As, 0), 16, 16, 0, 1),
-                             ops.rt(bf16, 16, 16, "row"), wait=False)
-        ops.lds_wait_for(t, b0)
-        ops.mma_ABt(t, b0, acc, out=acc)
-        ops.barrier()
+        acc = hk.zeros(hk.RT(fp32, 32, 16, "col"))
+        g.commit(As[1], buf)
+        t = As[0].subtile(32, 16, 0, 0).load(hk.RT(bf16, 32, 16, "row"),
+                                             wait=False)
+        b0 = As[0].subtile(16, 16, 0, 1).load(hk.RT(bf16, 16, 16, "row"),
+                                              wait=False)
+        hk.lds.wait_for(t, b0)
+        acc += t @ b0.T
+        hk.arch.barrier()
 
     assert "lds_wait<0>" not in _src(clean)
 
@@ -360,26 +360,26 @@ def test_rebinding_an_already_retired_tile_is_free():
     track which half of an operand pair is still moving, which is precisely the
     bookkeeping the pass exists to take over.
     """
-    def rebind(a: hk.GL[bf16]):
-        s = ops.alloc_shared(ops.st(bf16, 128, 32))
-        acc = ops.zeros(ops.rt(fp32, 32, 16, "col"))
-        rt_a = ops.rt(bf16, 32, 16, "row")
-        rt_b = ops.rt(bf16, 16, 16, "row")
-        t = ops.load_shared(ops.subtile(s, 32, 16, 0, 0), rt_a, wait=False)
-        b0 = ops.load_shared(ops.subtile(s, 16, 16, 0, 1), rt_b, wait=False)
-        ops.lds_wait_for(t, b0)
-        ops.mma_ABt(t, b0, acc, out=acc)
-        ops.lds_wait_for(t, b0)       # pure re-bind: waits for nothing
-        ops.mma_ABt(t, b0, acc, out=acc)
+    def rebind(a: hk.Tensor[bf16]):
+        s = hk.lds.alloc(hk.ST(bf16, 128, 32))
+        acc = hk.zeros(hk.RT(fp32, 32, 16, "col"))
+        rt_a = hk.RT(bf16, 32, 16, "row")
+        rt_b = hk.RT(bf16, 16, 16, "row")
+        t = s.subtile(32, 16, 0, 0).load(rt_a, wait=False)
+        b0 = s.subtile(16, 16, 0, 1).load(rt_b, wait=False)
+        hk.lds.wait_for(t, b0)
+        acc += t @ b0.T
+        hk.lds.wait_for(t, b0)        # pure re-bind: waits for nothing
+        acc += t @ b0.T
 
-    assert [w.attrs["n"] for w in _waits(_trace(rebind))] == [0, 0]
+    assert _waits(_trace(rebind)) == [0, 0]
 
 
 def test_naming_a_tile_that_never_moved_is_still_an_error():
     """The relaxation above is narrow on purpose: it forgives a tile whose
     reads this kernel issued and retired, not one that was never loaded."""
-    def never(a: hk.GL[bf16]):
-        ops.lds_wait_for(ops.zeros(ops.rt(bf16, 32, 16, "row")))
+    def never(a: hk.Tensor[bf16]):
+        hk.lds.wait_for(hk.zeros(hk.RT(bf16, 32, 16, "row")))
 
     with pytest.raises(VerifyError):
         _trace(never)

@@ -143,11 +143,3 @@ class ParamRef:
             f"kernel. Tensors: {sorted(self._names)}; "
             f"constexprs: {sorted(self._consts)}"
         )
-
-
-def emit_dim(d: Numeric) -> str:
-    if isinstance(d, HostExpr):
-        return d.emit()
-    if isinstance(d, int):
-        return str(d)
-    raise TypeError(f"grid dimension must be an int or a host expression, got {d!r}")

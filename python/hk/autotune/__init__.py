@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from ..ir.verify import VerifyError
+from ..errors import VerifyError
 from ..runtime.compile import cache_dir, toolchain_fingerprint
 from ..runtime.resources import ResourceError
 

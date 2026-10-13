@@ -2,9 +2,10 @@
 
 Every number here was measured on the part, not read off a datasheet. The
 provenance of each one is in the module that defines it. One definition, shared
-by the verifier, the LDS allocator, the register-budget model, the autotuner and
-the C++ emitter -- these facts used to be scattered across RDNA.md, kernel
-comments and a notebook, and they drifted.
+by the frontend, the autotuner and the runtime's occupancy arithmetic; the C++
+passes read the same table from mlir/lib/Target/Target.cpp, and a test holds
+the two equal field by field -- these facts used to be scattered across
+RDNA.md, kernel comments and a notebook, and they drifted.
 """
 
 from .base import MmaShape, Target

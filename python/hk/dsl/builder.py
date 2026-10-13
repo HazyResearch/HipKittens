@@ -14,6 +14,8 @@ read and diffed:
 
 from __future__ import annotations
 
+import contextlib
+import os
 import threading
 import traceback
 from contextlib import contextmanager
@@ -24,12 +26,35 @@ from ..compiler import mlir as M
 
 _tls = threading.local()
 
+#: The frontend's own code. A kernel can live anywhere -- hk/ops ships some --
+#: so the test for "the user's line" is the implementation's directories, not
+#: a path that merely mentions hk. contextlib is the frame between a `with
+#: hk.scope():` and the region it opens.
+_PKG = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_INTERNAL = tuple(os.path.join(_PKG, d) + os.sep for d in ("dsl", "compiler", "_mlir"))
+_CONTEXTLIB = os.path.abspath(contextlib.__file__)
 
-def capture_loc(skip: int = 3) -> Optional[str]:
-    """The user's line, skipping frames inside hk itself."""
-    for frame in reversed(traceback.extract_stack()[:-skip]):
-        if "/hk/" not in frame.filename.replace("\\", "/"):
-            return f"{frame.filename}:{frame.lineno} in {frame.name}"
+
+def _internal(filename: str) -> bool:
+    f = os.path.abspath(filename)
+    return f.startswith(_INTERNAL) or f == _CONTEXTLIB
+
+
+def capture_loc() -> Optional[str]:
+    """The kernel author's line: the innermost frame outside the frontend,
+    however many frontend frames the op went through on the way. The function
+    named is the author's too: a loop or branch body the rewriter lifted into
+    `__hk_for_*` reports the function it was written in."""
+    frames = traceback.extract_stack()
+    for i in range(len(frames) - 1, -1, -1):
+        if _internal(frames[i].filename):
+            continue
+        j = i
+        while j > 0 and (frames[j].name.startswith("__hk_")
+                         or _internal(frames[j].filename)):
+            j -= 1
+        f = frames[i]
+        return f"{f.filename}:{f.lineno} in {frames[j].name}"
     return None
 
 
@@ -64,7 +89,7 @@ class Trace:
             self._ips.pop()
 
     def loc(self, name: str = "") -> ir.Location:
-        return M.loc(capture_loc(skip=4), name)
+        return M.loc(capture_loc(), name)
 
     def hoisted(self, key, build):
         """An operand-free op, emitted once at the top of the kernel.

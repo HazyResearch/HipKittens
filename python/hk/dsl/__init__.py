@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import builtins as _builtins
 
-from ..ir.nodes import (  # noqa: F401
+from ..types import (  # noqa: F401
     DType, bf16, fp16, fp32, fp8e4m3, fp8e5m2, i8, i32,
     RegTileType as _RT, RegVecType as _RV, SharedTileType as _ST,
     SharedVecType as _SV,
 )
-from ..lang import host as _host
+from . import host as _host
 from . import arch, collective, lds, math  # noqa: F401
 from .control import if_, range, range_constexpr, scope  # noqa: A004
 from .group import Group, group

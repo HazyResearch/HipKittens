@@ -5,6 +5,8 @@ what it uses, that tile coordinates are converted at the use site, that the
 scaffold is separable. Whether it *compiles* is tests/hk/codegen's job; that
 tier needs hipcc and this one does not, so the fast loop stays fast.
 
+The C++ is written by hk-translate from the traced MLIR module.
+
 Deliberately not a golden-file diff of the whole output: a golden file makes
 every formatting change a test change, and the properties below are the ones
 that being wrong would produce a wrong kernel rather than an ugly one.
@@ -22,10 +24,11 @@ from hk import bf16, fp32
     arch="gfx1100",
     grid=lambda p: (hk.cdiv(p.o.cols, 64), hk.cdiv(p.o.rows, 16), 1),
 )
-def add2(a: hk.GL[bf16], b: hk.GL[bf16], o: hk.GL[bf16], *, ROWS=16, COLS=64):
-    t = hk.rt(bf16, ROWS, COLS)
-    idx = hk.tile_coord(0, 0, hk.block_idx.y, hk.block_idx.x)
-    hk.store(o, hk.load(a, idx, t) + hk.load(b, idx, t), idx)
+def add2(a: hk.Tensor[bf16], b: hk.Tensor[bf16], o: hk.Tensor[bf16], *,
+         ROWS=16, COLS=64):
+    t = hk.RT(bf16, ROWS, COLS)
+    idx = hk.tile_coord(0, 0, hk.arch.block_idx.y, hk.arch.block_idx.x)
+    o[idx] = a[idx].load(t) + b[idx].load(t)
 
 
 @pytest.fixture(scope="module")
@@ -101,9 +104,9 @@ def test_scalar_operand_is_cast_to_the_tile_dtype():
     literal binds to the wrong overload or does not bind at all."""
 
     @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-    def scaled(a: hk.GL[bf16], o: hk.GL[bf16]):
+    def scaled(a: hk.Tensor[bf16], o: hk.Tensor[bf16]):
         i = hk.tile_coord()
-        hk.store(o, hk.mul(hk.load(a, i, hk.rt(bf16, 16, 16)), 2.0), i)
+        o[i] = a[i].load(hk.RT(bf16, 16, 16)) * 2.0
 
     assert "kittens::mul(mul, ld, (bf16)2.0);" in scaled.source()
 
@@ -113,9 +116,9 @@ def test_neg_lowers_to_a_multiply():
     `neg` would not compile, so the tracer has to lower it."""
 
     @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-    def negate(a: hk.GL[fp32], o: hk.GL[fp32]):
+    def negate(a: hk.Tensor[fp32], o: hk.Tensor[fp32]):
         i = hk.tile_coord()
-        hk.store(o, -hk.load(a, i, hk.rt(fp32, 16, 16)), i)
+        o[i] = -a[i].load(hk.RT(fp32, 16, 16))
 
     src = negate.source()
     assert "kittens::neg(" not in src
@@ -124,9 +127,9 @@ def test_neg_lowers_to_a_multiply():
 
 def test_an_op_without_a_dtype_specialisation_is_refused_at_trace_time():
     @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-    def bad(a: hk.GL[bf16], o: hk.GL[bf16]):
+    def bad(a: hk.Tensor[bf16], o: hk.Tensor[bf16]):
         i = hk.tile_coord()
-        hk.store(o, hk.gelu(hk.load(a, i, hk.rt(bf16, 16, 16))), i)
+        o[i] = a[i].load(hk.RT(bf16, 16, 16)).gelu()
 
     with pytest.raises(TypeError, match="no bf16 implementation"):
         bad.trace()
@@ -152,11 +155,10 @@ def _scalar_kernel(coord=None, name="scalar_probe"):
 
     # hk.i32 rather than a bare `i32`: PEP 563 makes these annotations strings
     # resolved against this module's globals, not against this function's.
-    def body(table: hk.GL[hk.i32], x: hk.GL[bf16], o: hk.GL[bf16]):
-        blk = hk.load_scalar(table, mk(0, 0, 0, hk.block_idx.x))
-        t = hk.rt(bf16, 16, 64)
-        hk.store(o, hk.load(x, hk.elem_coord(blk, 0, 0, 0), t),
-                 hk.elem_coord(0, 0, 0, 0))
+    def body(table: hk.Tensor[hk.i32], x: hk.Tensor[bf16], o: hk.Tensor[bf16]):
+        blk = table[mk(0, 0, 0, hk.arch.block_idx.x)].load_scalar()
+        t = hk.RT(bf16, 16, 64)
+        o[hk.elem_coord(0, 0, 0, 0)] = x[hk.elem_coord(blk, 0, 0, 0)].load(t)
 
     return hk.kernel(body, arch="gfx1100", warps=1, name=name,
                      grid=lambda p: (1, 1, 1))
@@ -164,7 +166,8 @@ def _scalar_kernel(coord=None, name="scalar_probe"):
 
 def test_load_scalar_emits_the_library_call():
     src = _scalar_kernel().source("bare")
-    # A plain int, so it composes with s_* and elem_coord like block_idx does.
+    # A plain int, so it composes with Int arithmetic and elem_coord like
+    # block_idx does.
     assert "const int scalar = kittens::load_scalar(g.table," in src
 
 
@@ -181,9 +184,9 @@ def test_load_scalar_refuses_a_tile_coordinate():
 
 
 def test_load_scalar_refuses_a_float_global():
-    def body(x: hk.GL[bf16], o: hk.GL[bf16]):
-        hk.load_scalar(x, hk.elem_coord(0, 0, 0, 0))
-        hk.store(o, hk.zeros(hk.rt(bf16, 16, 64)), hk.elem_coord(0, 0, 0, 0))
+    def body(x: hk.Tensor[bf16], o: hk.Tensor[bf16]):
+        x[hk.elem_coord(0, 0, 0, 0)].load_scalar()
+        o[hk.elem_coord(0, 0, 0, 0)] = hk.zeros(hk.RT(bf16, 16, 64))
 
     with pytest.raises(TypeError, match="must be i32"):
         hk.kernel(body, arch="gfx1100", warps=1, name="p_float",

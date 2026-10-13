@@ -16,27 +16,28 @@ from hk.codegen import scaffold
 
 @hk.kernel(arch="gfx1100",
            grid=lambda p: (hk.cdiv(p.o.cols, 64), hk.cdiv(p.o.rows, 16), 1))
-def _add(a: hk.GL[bf16], b: hk.GL[bf16], o: hk.GL[bf16], *, ROWS=16, COLS=64):
-    t = hk.rt(bf16, ROWS, COLS)
-    idx = hk.tile_coord(0, 0, hk.block_idx.y, hk.block_idx.x)
-    hk.store(o, hk.load(a, idx, t) + hk.load(b, idx, t), idx)
+def _add(a: hk.Tensor[bf16], b: hk.Tensor[bf16], o: hk.Tensor[bf16], *,
+         ROWS=16, COLS=64):
+    t = hk.RT(bf16, ROWS, COLS)
+    idx = hk.tile_coord(0, 0, hk.arch.block_idx.y, hk.arch.block_idx.x)
+    o[idx] = a[idx].load(t) + b[idx].load(t)
 
 
 @hk.kernel(arch="gfx1100",
            grid=lambda p: (hk.cdiv(p.o.cols, 64), hk.cdiv(p.o.rows, 16), 1))
-def _two_out(a: hk.GL[bf16], o: hk.GL[bf16], o2: hk.GL[fp32],
+def _two_out(a: hk.Tensor[bf16], o: hk.Tensor[bf16], o2: hk.Tensor[fp32],
              *, ROWS=16, COLS=64):
-    t = hk.rt(bf16, ROWS, COLS)
-    idx = hk.tile_coord(0, 0, hk.block_idx.y, hk.block_idx.x)
-    v = hk.load(a, idx, t)
-    hk.store(o, v, idx)
-    hk.store(o2, hk.cast(v, fp32), idx)
+    t = hk.RT(bf16, ROWS, COLS)
+    idx = hk.tile_coord(0, 0, hk.arch.block_idx.y, hk.arch.block_idx.x)
+    v = a[idx].load(t)
+    o[idx] = v
+    o2[idx] = v.to(fp32)
 
 
 @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-def _no_store(a: hk.GL[bf16], *, ROWS=16, COLS=64):
+def _no_store(a: hk.Tensor[bf16], *, ROWS=16, COLS=64):
     idx = hk.tile_coord(0, 0, 0, 0)
-    hk.load(a, idx, hk.rt(bf16, ROWS, COLS))
+    a[idx].load(hk.RT(bf16, ROWS, COLS))
 
 
 def test_the_output_is_the_tensor_the_kernel_stores_into():
@@ -102,8 +103,8 @@ def test_the_namespace_and_op_name_are_settable():
 
 
 def test_the_kernel_body_is_the_same_one_pybind_gets():
-    # The whole point of scaffold.py being separate from cpp.py: two
-    # deployments of one kernel, not two kernels.
+    # The whole point of scaffold.py being separate from the translation
+    # (hk-translate): two deployments of one kernel, not two kernels.
     ir = _add.trace()
     body = scaffold.bare(ir)
     kernel_src = body[body.index("struct globals"):]
@@ -118,7 +119,7 @@ def test_torch_is_a_registered_scaffold():
 
 
 def test_a_shipped_op_renders():
-    # An elementwise op from hk.ops, end to end through the real IR rather
+    # An elementwise op from hk.ops, end to end through the real module rather
     # than the toy above.
     k = hk.ops.elementwise.KERNELS["add_bf16"]
     src = scaffold.torch_library(k.trace())

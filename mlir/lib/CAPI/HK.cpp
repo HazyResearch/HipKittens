@@ -58,6 +58,11 @@ MlirLogicalResult mlirHKTranslateKernelToCpp(
   return mlirLogicalResultSuccess();
 }
 
+void mlirHKNameValuesAsCpp(MlirOperation kernel) {
+  if (auto f = llvm::dyn_cast<mlir::func::FuncOp>(unwrap(kernel)))
+    mlir::hk::nameValuesAsCpp(f);
+}
+
 void mlirHKTargetFacts(MlirStringRef arch, MlirStringCallback callback,
                        void *userData) {
   const mlir::hk::TargetInfo *t =

@@ -29,7 +29,7 @@ global every round; it is a few hundred KB and stays in L2.
 from typing import Any, Dict, Optional, Tuple
 
 from .. import dsl as hk
-from ..ir.nodes import bf16, fp32, i32
+from ..types import bf16, fp32, i32
 from ..target import current_arch, get_target
 
 

@@ -256,6 +256,14 @@ struct Walker {
         st = walk(*forOp.getBody(), std::move(first), scope);
         continue;
       }
+      if (auto wl = dyn_cast<scf::WhileOp>(op)) {
+        // The test runs once more than the body: twice round, then the exit.
+        Block &test = wl.getBefore().front(), &body = wl.getAfter().front();
+        for (int round = 0; round < 2; ++round)
+          st = walk(body, walk(test, std::move(st), scope), scope);
+        st = walk(test, std::move(st), scope);
+        continue;
+      }
       if (auto w = dyn_cast<LdsWaitForOp>(op)) {
         waitFor(w, st, scope);
         continue;

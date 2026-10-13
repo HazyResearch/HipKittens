@@ -1,13 +1,14 @@
-"""Control flow: what `for` and `if` become.
+"""Control flow: what `for`, `if` and `while` become.
 
 A kernel body is ordinary Python, rewritten (hk.dsl.rewrite) so that a `for`
-over a range and an `if` hand their bodies to the functions here. Those
-decide, from the values they are given, which kind of control flow it is:
+over a range, an `if` and a `while` hand their bodies to the functions here.
+Those decide, from the values they are given, which kind of control flow it
+is:
 
 * `for i in range(4)`, `if KIND == "softmax"`: everything is known at trace
   time, so it is Python -- the loop unrolls, the branch is taken or not.
-* `for i in range(n)` with a device `n`, `if i < n`: a loop or a branch the
-  kernel compiles, `scf.for` / `scf.if`.
+* `for i in range(n)` with a device `n`, `if i < n`, `while k < n`: a loop or
+  a branch the kernel compiles, `scf.for` / `scf.if` / `scf.while`.
 
 A name a runtime loop or branch reassigns is carried: an index or a flag
 becomes a loop-carried value (`iter_args`) or a branch result. A tile is a
@@ -29,7 +30,7 @@ from typing import Any, Callable, Iterator, Sequence, Tuple
 
 from .._mlir import ir
 from .._mlir.dialects import arith, scf
-from ..ir.nodes import ScalarType, i32
+from ..types import ScalarType, i32
 from . import builder as B
 from .values import Bool, Int, Value, as_int, i1
 
@@ -155,6 +156,9 @@ def _runtime_for(rng: DynRange, body, carried, names, iv_name):
     loop = scf.ForOp(lb, ub, step, [carried[i].v for i in changed],
                      loc=t.loc())
     loop.attributes["hk.iv_name"] = ir.StringAttr.get(iv_name)
+    loop.induction_variable.set_location(ir.Location.name(iv_name))
+    for i, a in zip(changed, loop.inner_iter_args):
+        a.set_location(ir.Location.name(names[i]))
     if rng.unroll != 1:
         loop.attributes["hk.unroll"] = ir.IntegerAttr.get(
             ir.IntegerType.get_signless(64), rng.unroll)
@@ -193,9 +197,9 @@ def as_value(x, like) -> ir.Value:
 
 
 def if_stmt(cond, then: Callable, orelse: Callable, carried: Tuple,
-            names: Sequence[str]):
+            names: Sequence[str], *, has_else: bool = True):
     """`if <cond>: <then> else: <orelse>`, with `carried` the names either
-    branch assigns."""
+    branch assigns. `has_else` is whether the source wrote an `else`."""
     if not isinstance(cond, Value):
         return then(*carried) if cond else orelse(*carried)
     t = B.current()
@@ -205,7 +209,7 @@ def if_stmt(cond, then: Callable, orelse: Callable, carried: Tuple,
     # With nothing carried there is nothing to find out.
     if carried:
         probe_then = _probe(t, cond, then, carried)
-        probe_else = _probe(t, cond, orelse, carried)
+        probe_else = _probe(t, cond, orelse, carried) if has_else else carried
     else:
         probe_then = probe_else = ()
     results = []
@@ -223,13 +227,19 @@ def if_stmt(cond, then: Callable, orelse: Callable, carried: Tuple,
             f"is written in place in both arms instead.")
     types = [carried[i] if carried[i] is not UNDEF else probe_then[i]
              for i in results]
-    op = scf.IfOp(i1(cond), [x.v.type for x in types], has_else=True,
-                  loc=t.loc())
+    # A branch that produces values needs an else to produce them on the
+    # other path, written or not; one that produces none needs one only if
+    # the source has it.
+    op = scf.IfOp(i1(cond), [x.v.type for x in types],
+                  has_else=has_else or bool(results), loc=t.loc())
     if results:
         op.attributes["hk.result_names"] = ir.ArrayAttr.get(
             [ir.StringAttr.get(names[i]) for i in results])
+    arms = [(op.then_block, then)]
+    if has_else or results:
+        arms.append((op.else_block, orelse))
     outs = []
-    for block, fn in ((op.then_block, then), (op.else_block, orelse)):
+    for block, fn in arms:
         with t.at(ir.InsertionPoint(block)):
             got = list(fn(*carried))
             scf.YieldOp([as_value(got[i], types[k]) for k, i in enumerate(results)])
@@ -248,6 +258,83 @@ def _probe(t, cond, fn, carried):
         scf.YieldOp([])
     probe.operation.erase()
     return got
+
+
+def _scratch(t, fn):
+    """`fn()`, traced into a region that is then thrown away."""
+    probe = scf.ExecuteRegionOp([], loc=ir.Location.unknown())
+    block = probe.region.blocks.append()
+    with t.at(ir.InsertionPoint(block)):
+        got = fn()
+    probe.operation.erase()
+    return got
+
+
+def while_(test: Callable, body: Callable, carried: Tuple, names: Sequence[str]):
+    """`while <test>: <body>`, with `carried` the names the body rebinds.
+
+    A test on Python values is a loop at trace time. One on device values is
+    an scf.while, and it is decided once, on entry: a test that starts as
+    Python and turns into a device value part way is refused where Python
+    asks for its truth value."""
+    carried = tuple(carried)
+    t = B.current()
+    if not isinstance(_scratch(t, lambda: test(*carried)), Value):
+        while test(*carried):
+            carried = tuple(body(*carried))
+        return carried
+    return _runtime_while(test, body, carried, tuple(names))
+
+
+def _runtime_while(test, body, carried, names):
+    t = B.current()
+    original = carried
+    carried = _promote(carried)
+    scalars = [i for i, v in enumerate(carried) if isinstance(v, (Int, Bool))]
+
+    def bind(args, which):
+        ins = list(carried)
+        for i, a in zip(which, args):
+            ins[i] = type(carried[i])(a, carried[i].ty)
+        return ins
+
+    # As for a runtime `for`: only the scalars the body rebinds are carried.
+    changed = []
+    if scalars:
+        outs = _scratch(t, lambda: list(body(*carried)))
+        changed = [i for i in scalars if outs[i] is not carried[i]]
+
+    tys = [carried[i].v.type for i in changed]
+    loop = scf.WhileOp(tys, [carried[i].v for i in changed], loc=t.loc())
+    if changed:
+        loop.attributes["hk.carried_names"] = ir.ArrayAttr.get(
+            [ir.StringAttr.get(names[i]) for i in changed])
+    arg_locs = [ir.Location.name(names[i]) for i in changed]
+    before = loop.before.blocks.append(*tys, arg_locs=arg_locs)
+    after = loop.after.blocks.append(*tys, arg_locs=arg_locs)
+    with t.at(ir.InsertionPoint(before)):
+        cond = test(*bind(before.arguments, changed))
+        if not isinstance(cond, Value):
+            raise TypeError(f"the test of a runtime while loop became {cond!r}")
+        scf.ConditionOp(i1(cond), list(before.arguments))
+    with t.at(ir.InsertionPoint(after)):
+        ins = bind(after.arguments, changed)
+        outs = list(body(*ins))
+        for i, (was, now) in enumerate(zip(ins, outs)):
+            if i not in changed and now is not was and now is not carried[i]:
+                kind = "tile" if isinstance(was, Value) else "Python value"
+                raise TypeError(
+                    f"`{names[i]}` is rebound inside a runtime while loop, and "
+                    f"it is a {kind}. A loop the kernel runs cannot change a "
+                    f"Python value per iteration, and a tile is a buffer: "
+                    f"update it in place -- `{names[i]} += ...`, "
+                    f"`into={names[i]}` -- so every iteration writes the same "
+                    f"registers.")
+        scf.YieldOp([as_value(outs[i], ins[i]) for i in changed])
+    result = list(original)
+    for i, r in zip(changed, loop.results):
+        result[i] = type(carried[i])(r, carried[i].ty)
+    return tuple(result)
 
 
 @contextmanager
@@ -280,4 +367,4 @@ def scope() -> Iterator[None]:
 
 
 __all__ = ["range", "range_constexpr", "if_", "scope", "iter_", "for_",
-           "if_stmt", "UNDEF", "DynRange"]
+           "if_stmt", "while_", "UNDEF", "DynRange"]

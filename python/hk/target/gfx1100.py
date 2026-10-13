@@ -72,6 +72,7 @@ CEILINGS = {
 #: The compiler can hoist a WMMA above an s_waitcnt because the wait carries no
 #: register dependence. The result is randomly wrong with ScratchSize=0 and no
 #: diagnostic anywhere. Any emitted wait must be followed by an empty volatile
-#: asm binding the fragments it was meant to protect; see
-#: hk.codegen.cpp.emit_lds_wait, which is the only place that should emit one.
+#: asm binding the fragments it was meant to protect; the translation's
+#: LdsWaitForOp case (mlir/lib/Target/Cpp/HKToCpp.cpp) is the only place that
+#: emits one.
 LDS_WAIT_NEEDS_FRAGMENT_BIND = True

@@ -34,7 +34,7 @@ import math
 from typing import Dict, Optional
 
 from .. import dsl as hk
-from ..ir.nodes import bf16, fp32, i32
+from ..types import bf16, fp32, i32
 
 #: The cache's page size. Also the kernel's KV block, by construction.
 KV_BLOCK = 32

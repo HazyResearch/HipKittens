@@ -20,6 +20,11 @@ LogicalResult translateKernelToCpp(func::FuncOp kernel,
                                    ArrayRef<std::string> includes,
                                    raw_ostream &os);
 
+/// Re-locate every value the translation names under a NameLoc of that name,
+/// so a module printed with names as prefixes calls each value what the C++
+/// calls it -- `%ld1`, not MLIR's own `%ld_0`. Changes locations only.
+void nameValuesAsCpp(func::FuncOp kernel);
+
 /// `hk-to-cpp` for hk-translate: every kernel in the module, in order.
 void registerToCppTranslation();
 

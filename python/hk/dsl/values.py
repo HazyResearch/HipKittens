@@ -18,8 +18,8 @@ from typing import Any, Optional, Sequence, Union
 
 from .._mlir import ir
 from .._mlir.dialects import arith, hk as hkd
-from ..compiler.from_kernel_ir import mlir_type
-from ..ir.nodes import (
+from .module import mlir_type
+from ..types import (
     FP8, CoordType, DType, GlobalType, GranuleSetType, RegTileType, RegVecType,
     ScalarType, SharedTileType, SharedVecType, StageBufferType, fp32, i32,
 )
@@ -387,6 +387,7 @@ class View:
 
     def store(self, value, *, bounded: bool = False) -> None:
         """Register tile or vector -> global."""
+        value = _vec_of(value)
         if not isinstance(value, (Tile, Vec)):
             raise TypeError(f"store value is {value!r}, expected a tile or a vector")
         if bounded and not isinstance(value, Tile):
@@ -399,10 +400,17 @@ class View:
     def load_scalar(self) -> Int:
         """One int32 element -> a wave-uniform scalar (a page index, a length)."""
         if self.idx.unit != "element":
-            raise TypeError("load_scalar reads one element; index with x.at[...]")
+            raise TypeError(
+                f"load_scalar takes an element coordinate, got coord<"
+                f"{self.idx.unit}>. It reads one element, so a tile-unit index "
+                f"would be off by the tile size -- index with x.at[...] or "
+                f"hk.elem_coord.")
         if self.tensor.dtype is not i32:
-            raise TypeError(f"load_scalar reads an int32 global, not "
-                            f"{self.tensor.dtype.name}")
+            raise TypeError(
+                f"load_scalar reads an integer index, so the global must be "
+                f"i32, not {self.tensor.dtype.name}. A page table, a sequence "
+                f"length and a slot mapping are all int32 tensors; a float out "
+                f"of memory is a load into a vector.")
         t = _t()
         return Int(hkd.LoadScalarOp(_i32(), self.tensor.v, self.idx.v,
                                     loc=t.loc("scalar")).result, ScalarType(i32))
@@ -410,11 +418,22 @@ class View:
     def store_scalar(self, vec: "Vec") -> None:
         """One entry of a *uniform* register vector -> one element."""
         if self.idx.unit != "element":
-            raise TypeError("store_scalar writes one element; index with x.at[...]")
-        if not isinstance(vec, Vec) or not vec.ty.uniform:
             raise TypeError(
-                "store_scalar needs a uniform vector -- every entry the same "
-                "value, which is what hk.collective.fold_rows returns.")
+                f"store_scalar takes an element coordinate, got coord<"
+                f"{self.idx.unit}>. It writes one element, so a tile-unit index "
+                f"would be off by the tile size -- index with x.at[...].")
+        if not isinstance(vec, Vec) or not vec.ty.uniform:
+            got = vec.ty if isinstance(vec, Value) else vec
+            raise TypeError(
+                f"store_scalar needs a uniform vector, got {got}. Every entry "
+                f"of a uniform vector holds the same value, so writing one of "
+                f"them is writing the answer; writing one entry of anything "
+                f"else would pick an arbitrary row's value and be wrong on the "
+                f"other fifteen -- silently, since the shapes all agree. "
+                f"Uniformity comes from hk.collective.fold_rows, which is what "
+                f"a FOLD'd kernel already calls to combine its row; carry that "
+                f"vector here, or use x[idx].store(v) if the sixteen entries "
+                f"really are sixteen rows.")
         t = _t()
         hkd.StoreScalarOp(self.tensor.v, vec.v, self.idx.v, loc=t.loc())
 
@@ -564,6 +583,17 @@ class _Elementwise(Value):
     def __imul__(self, o): return self._inplace("mul", o)
     def __itruediv__(self, o): return self._inplace("div", o)
 
+    # Index arithmetic only: `//` on a float tile would have to round, and
+    # kittens::div does not.
+    def __floordiv__(self, o): return self._index_only("//")
+    def __rfloordiv__(self, o): return self._index_only("//")
+    def __mod__(self, o): return self._index_only("%")
+    def __rmod__(self, o): return self._index_only("%")
+
+    def _index_only(self, sym):
+        raise TypeError(f"{sym} is index arithmetic and {self.ty} is not an "
+                        f"index. There is no rounding division on a tile.")
+
     def _inplace(self, op, o):
         binary(op, self, _vec_of(o), into=self)
         return self
@@ -632,8 +662,9 @@ class Tile(_Elementwise):
     def __matmul__(self, other) -> "MatMul":
         return MatMul(self, other)
 
-    # masks, in place (an empty mask is a no-op in the library, so a fresh
-    # destination would keep garbage; see hk.lang.ops._fill)
+    # masks, in place: an empty mask is a no-op in the library, so a fresh
+    # destination would keep garbage -- `into=` a new tile copies the source
+    # in first
     def _fill(self, op: str, idx: Scalar, value: float, into=None):
         cls = {"left_fill": hkd.LeftFillOp, "right_fill": hkd.RightFillOp,
                "upper_fill": hkd.UpperFillOp, "lower_fill": hkd.LowerFillOp,
@@ -642,7 +673,7 @@ class Tile(_Elementwise):
         if out is not self:
             if out.ty != self.ty:
                 raise TypeError(f"{op}: into is {out.ty} but the tile is {self.ty}")
-            _make(hkd.CastOp, self.ty, (self.v,), into=out, name="cvt")
+            _make(hkd.CopyOp, self.ty, (self.v,), into=out, name="copy")
         t = _t()
         cls(None, self.v, as_int(idx).v, float(value), dst=out.v,
             loc=t.loc(op))
@@ -733,9 +764,15 @@ def mma(variant: str, a: Tile, b: Tile, acc: Tile, *, into=None) -> Tile:
                         f"accumulates into a col-layout fp32 tile.")
     for v, want, what in ((a, spec[0], "A"), (b, spec[1], "B")):
         if v.ty.layout != want:
-            raise TypeError(f"{variant} wants {what} in '{want}' layout and it "
-                            f"is '{v.ty.layout}'. Stage the operand the other "
-                            f"way round, or use the variant that matches.")
+            other = next(n for n, sp in _MMA_SPEC.items()
+                         if (a.ty.layout, b.ty.layout) == sp[:2])
+            raise TypeError(
+                f"{variant} wants {what} in '{want}' layout and it is "
+                f"'{v.ty.layout}'. With the layouts you have, the variant that "
+                f"applies is {other} -- which computes a different product, so "
+                f"if it is not the one you want, the fix is to stage the operand "
+                f"the other way round, not to relabel it. swap_layout moves "
+                f"data on this architecture.")
     if getattr(a.ty, spec[4]) != getattr(b.ty, spec[5]):
         raise TypeError(f"{variant}: reduction extents disagree -- A.{spec[4]}="
                         f"{getattr(a.ty, spec[4])}, B.{spec[5]}="
@@ -792,8 +829,10 @@ class Vec(_Elementwise):
     def any_ne(self, other: "Vec") -> Int:
         """Wave-level: did any entry differ from `other`. A uniform branch."""
         if not isinstance(other, Vec) or self.ty.plain != other.ty.plain:
-            raise TypeError(f"any_ne compares vectors of one shape, got "
-                            f"{self.ty} and {getattr(other, 'ty', other)}")
+            raise TypeError(
+                f"any_ne: operands are {self.ty} and "
+                f"{getattr(other, 'ty', other)}. The comparison is entry by "
+                f"entry, so the two have to be the same shape.")
         t = _t()
         return Int(hkd.AnyNeOp(_i32(), self.v, other.v, loc=t.loc("grew")).result,
                    ScalarType(i32))
@@ -891,9 +930,13 @@ class SharedTile(Value):
         if st.count != 1:
             raise TypeError(f"subtile of {st}, a stack; index it first")
         for n, v, whole in (("rows", rows, st.rows), ("cols", cols, st.cols)):
-            if v <= 0 or v % 16 or whole % v:
-                raise ValueError(f"subtile {n}={v} must be a multiple of 16 "
-                                 f"that divides the {whole} of {st}")
+            if v <= 0 or v % 16:
+                raise ValueError(f"subtile {n}={v} must be a positive multiple of 16")
+            if whole % v:
+                raise ValueError(
+                    f"subtile {n}={v} does not divide the {whole} of {st}. A "
+                    f"subtile is indexed in units of itself, so a window that "
+                    f"does not tile the parent has no index to give.")
         t = _t()
         ty = SharedTileType(st.dtype, rows, cols)
         return SharedTile(hkd.SubtileOp(mlir_type(ty), self.v, as_int(row).v,

@@ -95,15 +95,27 @@ struct VerifyPass : public mlir::hk::impl::HKVerifyBase<VerifyPass> {
       if (!isa<BarrierOp, StageLoadOp, StageCommitOp, GroupLoadOp,
                GroupStoreOp>(op))
         return WalkResult::advance();
-      if (!op->getParentOfType<scf::IfOp>())
-        return WalkResult::advance();
-      op->emitError() << opcodeOf(op)
-                      << " is inside an hk.if_. It is a workgroup operation "
-                         "-- every warp has to reach it or the ones that do "
-                         "wait forever. Hoist it out and put only the work it "
-                         "guards inside the branch."
-                      << atLoc(op);
-      return WalkResult::interrupt();
+      if (op->getParentOfType<scf::IfOp>()) {
+        op->emitError() << opcodeOf(op)
+                        << " is inside an hk.if_. It is a workgroup operation "
+                           "-- every warp has to reach it or the ones that do "
+                           "wait forever. Hoist it out and put only the work "
+                           "it guards inside the branch."
+                        << atLoc(op);
+        return WalkResult::interrupt();
+      }
+      if (op->getParentOfType<scf::WhileOp>()) {
+        op->emitError() << opcodeOf(op)
+                        << " is inside a runtime while loop. It is a "
+                           "workgroup operation -- every warp has to reach it "
+                           "the same number of times, and a test that differs "
+                           "between warps leaves the ones still looping "
+                           "waiting forever. Loop with a for over a bound "
+                           "every warp agrees on."
+                        << atLoc(op);
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
     });
     if (div.wasInterrupted())
       return signalPassFailure();

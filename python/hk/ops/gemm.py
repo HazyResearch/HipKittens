@@ -20,7 +20,7 @@ Three things the DSL does that the C++ cannot:
   * **The lgkmcnt immediates are derived.** The C++ computes them with a
     constexpr `reads_in_flight()` plus a `TAIL_OPS` term for the interleaved
     ds_writes, and a paragraph explaining why. Here `lds_wait_for` names the
-    tiles it retires and `hk.ir.passes.lds_pipeline` walks the issue queue. An
+    tiles it retires and the hk-lds-pipeline pass walks the issue queue. An
     immediate that is too large does not over-wait, it fails to wait at all --
     so this is the difference between a schedule you can edit and one you can
     only admire.
@@ -41,7 +41,7 @@ from typing import Any, Dict, Tuple
 from .. import autotune as _autotune
 from .. import dsl as hk
 from ..target import current_arch, get_target
-from ..ir.nodes import bf16, fp32
+from ..types import bf16, fp32
 
 
 def _derive(block_m: int, block_n: int, k_step: int, dot_slice: int,

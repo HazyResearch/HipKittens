@@ -23,10 +23,11 @@ from hk.runtime.compile import cache_key
     arch="gfx1100",
     grid=lambda p: (hk.cdiv(p.o.cols, 64), hk.cdiv(p.o.rows, 16), 1),
 )
-def add2(a: hk.GL[bf16], b: hk.GL[bf16], o: hk.GL[bf16], *, ROWS=16, COLS=64):
-    t = hk.rt(bf16, ROWS, COLS)
-    idx = hk.tile_coord(0, 0, hk.block_idx.y, hk.block_idx.x)
-    hk.store(o, hk.load(a, idx, t) + hk.load(b, idx, t), idx)
+def add2(a: hk.Tensor[bf16], b: hk.Tensor[bf16], o: hk.Tensor[bf16], *,
+         ROWS=16, COLS=64):
+    t = hk.RT(bf16, ROWS, COLS)
+    idx = hk.tile_coord(0, 0, hk.arch.block_idx.y, hk.arch.block_idx.x)
+    o[idx] = a[idx].load(t) + b[idx].load(t)
 
 
 @pytest.fixture(scope="module")
@@ -95,9 +96,9 @@ def test_a_failed_build_keeps_its_source():
     from hk.runtime.compile import CompileError
 
     @hk.kernel(arch="gfx1100", grid=lambda p: (1, 1, 1))
-    def broken(o: hk.GL[bf16]):
+    def broken(o: hk.Tensor[bf16]):
         i = hk.tile_coord()
-        hk.store(o, hk.zeros(hk.rt(bf16, 16, 16)), i)
+        o[i] = hk.zeros(hk.RT(bf16, 16, 16))
 
     src = broken.source().replace("kittens::store", "kittens::no_such_op")
     with pytest.raises(CompileError) as e:

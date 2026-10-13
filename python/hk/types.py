@@ -1,18 +1,18 @@
-"""The HK IR: types, values, ops, and a kernel.
+"""hk's types: dtypes, and the tile, vector, tensor and index types a kernel
+is written in.
 
-Deliberately small. This is a *tile* IR -- the unit of everything here is a
-tile, not a scalar and not a thread. That is the HipKittens abstraction and it
-is the reason the IR can be this small while still describing a kernel that runs
-at 77 TFLOPs: the hard parts live in include/rdna3, and the IR's job is to pick
-the right call and prove the choice is legal.
+These are the Python face of the dialect's types -- `RegTileType(fp32, 16,
+64, "col")` is `!hk.rt<f32, 16x64, col>` -- and what a kernel author builds
+with `hk.RT`, `hk.ST`, `hk.col_vec` and friends. They carry the checks that
+belong at the point a type is made (a register tile is a multiple of 16, an
+LDS vector's length is one a tile can be loaded from) so that a bad shape
+fails on the line that wrote it.
 """
 
 from __future__ import annotations
 
-import itertools
-import traceback
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any
 
 # ---------------------------------------------------------------- dtypes
 
@@ -87,7 +87,7 @@ class RegTileType(Type):
 
     `layout` is row or col and is not cosmetic -- it decides which mma variant
     applies and whether a shared->register load hits ds_read_b128 or degrades to
-    16 scalar reads. See hk.ir.verify.
+    16 scalar reads. The hk-check-budgets pass warns on it.
     """
 
     dtype: DType
@@ -98,7 +98,7 @@ class RegTileType(Type):
     def __post_init__(self):
         if self.layout not in ("row", "col"):
             raise ValueError(f"layout must be row or col, got {self.layout!r}")
-        # fp8 is let through here and judged per kernel by hk.ir.verify, which
+        # fp8 is let through here and judged per kernel by the hk-verify pass, which
         # knows the target: gfx1201 has fp8 WMMA tiles, gfx1100 has none.
         if self.dtype.bits < 16 and self.dtype not in FP8:
             raise TypeError(
@@ -143,7 +143,7 @@ class SharedTileType(Type):
     rows: int
     cols: int
     #: How many of these the allocation holds. >1 is a multi-buffer: the
-    #: allocator hands out one contiguous, size-aligned block and the emitter
+    #: allocator hands out one contiguous, size-aligned block and the translation
     #: writes the `[N]`. Contiguity is the point -- the XOR buffer swap flips
     #: one address bit, which is only legal if the pair differs in one bit.
     count: int = 1
@@ -304,7 +304,7 @@ class SharedVecType(Type):
     read, and this is that somewhere.
 
     `count` is how many warps' worth are stacked: the allocator hands out one
-    contiguous block and the emitter indexes it, rather than N separate
+    contiguous block and the translation indexes it, rather than N separate
     allocations that the 64 KB accounting would have to chase separately.
     """
 
@@ -330,7 +330,7 @@ class SharedVecType(Type):
         return self.length * self.count * self.dtype.bytes
 
     def element(self) -> "SharedVecType":
-        """One entry of the stack -- the type the emitter declares."""
+        """One entry of the stack -- the type the translation declares."""
         return SharedVecType(self.dtype, self.length, 1)
 
     def cpp(self) -> str:
@@ -339,7 +339,7 @@ class SharedVecType(Type):
         `sv<T,L>[N]` is a declarator, not a type name: it is spellable in the
         line that declares the array and nowhere else. Since every other use
         site -- the load, the store -- names one entry anyway, cpp() gives the
-        entry and the emitter writes the `[N]` where C++ allows it.
+        entry and the translation writes the `[N]` where C++ allows it.
         """
         return f"kittens::sv<{self.dtype.cpp}, {self.length}>"
 
@@ -349,7 +349,7 @@ class RegVecType(Type):
     """A register vector: one entry per row (kind="col") or per column
     (kind="row") of the tile it came off.
 
-    It carries that tile rather than just a length, and the emitter names it
+    It carries that tile rather than just a length, and the translation names it
     `typename <tile>::col_vec`, because an rv's layout is not free: `row_max`
     on an rt<float,16,64,row> produces a vector in a specific replication
     across lanes, and a vector declared with any other layout compiles and
@@ -460,172 +460,6 @@ class CoordType(Type):
         return f"coord<{self.unit}>"
 
 
-# ---------------------------------------------------------------- values / ops
-
-
-_ids = itertools.count()
-
-
-@dataclass(eq=False)
-class Value:
-    type: Type
-    name: str = ""
-    producer: Optional["Op"] = None
-    id: int = field(default_factory=lambda: next(_ids))
-
-    def __repr__(self) -> str:
-        return f"%{self.name or self.id}"
-
-    # Arithmetic sugar. These are defined here rather than in lang/ops so that
-    # an IR built by a pass reads the same as one built by tracing.
-    #
-    # A scalar dispatches to the s_* family, not to the tile maps: `cb * COLS`
-    # inside a kernel is index arithmetic on one uniform register, and writing
-    # it as `hk.s_mul(cb, COLS)` to distinguish it from a tile multiply would
-    # only make the index expressions unreadable. The dispatch is on the type,
-    # so which machine a line runs on is still decided by the operand, not by
-    # which spelling the author happened to pick.
-    def _bin(self, other, op):
-        from ..lang import ops
-
-        if isinstance(self.type, ScalarType):
-            return getattr(ops, f"s_{op}")(self, other)
-        return getattr(ops, op)(self, other)
-
-    def _rbin(self, other, op):
-        from ..lang import ops
-
-        if isinstance(self.type, ScalarType):
-            return getattr(ops, f"s_{op}")(other, self)
-        raise TypeError(
-            f"{op}: a tile or vector has to be the left operand ({other!r} {op} "
-            f"{self!r}); the maps in include/rdna3 are not commutative in their "
-            f"argument order even where the operation is."
-        )
-
-    def __add__(self, o):
-        return self._bin(o, "add")
-
-    def __radd__(self, o):
-        return self._rbin(o, "add")
-
-    def __sub__(self, o):
-        return self._bin(o, "sub")
-
-    def __rsub__(self, o):
-        return self._rbin(o, "sub")
-
-    def __mul__(self, o):
-        return self._bin(o, "mul")
-
-    def __rmul__(self, o):
-        return self._rbin(o, "mul")
-
-    def __truediv__(self, o):
-        return self._bin(o, "div")
-
-    # Integer-only, so they are not offered on a tile: `//` on a float tile
-    # would have to round, and kittens::div does not.
-    def __floordiv__(self, o):
-        return self._int_only(o, "div", "//")
-
-    def __mod__(self, o):
-        return self._int_only(o, "mod", "%")
-
-    def _int_only(self, other, op, sym):
-        from ..lang import ops
-
-        if not isinstance(self.type, ScalarType):
-            raise TypeError(
-                f"{sym} is index arithmetic and {self.type} is not an index. "
-                f"There is no rounding division on a tile."
-            )
-        return getattr(ops, f"s_{op}")(self, other)
-
-    def __neg__(self):
-        from ..lang import ops
-
-        if isinstance(self.type, ScalarType):
-            return ops.s_sub(0, self)
-        return ops.neg(self)
-
-    def __getitem__(self, i):
-        """One buffer of a multi-buffer LDS allocation.
-
-        The index may be a runtime value -- it is an LDS address computation,
-        not a register index, so unlike the stage buffer's slot there is no
-        reason it has to be a constant.
-        """
-        from ..lang import ops
-
-        return ops.shared_at(self, i)
-
-
-@dataclass(eq=False)
-class Op:
-    """One operation.
-
-    Note what this IR is *not*: it is not SSA. A Value is a register, and an op
-    may write into one that already exists -- `attrs["inplace"]` marks the
-    first operand as the destination. That is how the target language works
-    (`kittens::row_sum(acc, src, acc)`), and modelling it as SSA with
-    loop-carried arguments would mean the emitter had to undo the modelling
-    again on the way out. The cost is that program order is meaningful: a pass
-    may not reorder across an in-place write.
-    """
-
-    opcode: str
-    operands: List[Value] = field(default_factory=list)
-    results: List[Value] = field(default_factory=list)
-    attrs: Dict[str, Any] = field(default_factory=dict)
-    #: Where in the user's Python this op came from. Carried so a verifier
-    #: failure points at the line that wrote the kernel, not at the emitter.
-    loc: Optional[str] = None
-    #: Nested ops, for structured control flow. None for everything else --
-    #: an empty list means "a loop with an empty body", which is different.
-    body: Optional[List["Op"]] = None
-    #: Values defined by the op for its region, e.g. a loop's induction
-    #: variable. In scope only inside `body`.
-    block_args: List[Value] = field(default_factory=list)
-
-    def __repr__(self) -> str:
-        res = ", ".join(repr(r) for r in self.results)
-        ops_ = ", ".join(repr(o) for o in self.operands)
-        at = "".join(f" {k}={v!r}" for k, v in sorted(self.attrs.items()))
-        lhs = f"{res} = " if res else ""
-        return f"{lhs}{self.opcode}({ops_}){at}"
-
-    @property
-    def result(self) -> Value:
-        if len(self.results) != 1:
-            raise ValueError(f"{self.opcode} has {len(self.results)} results, not 1")
-        return self.results[0]
-
-    @property
-    def dst(self) -> Optional[Value]:
-        """The value this op writes, whether it made it or was handed it."""
-        if self.attrs.get("inplace"):
-            return self.operands[0]
-        return self.results[0] if self.results else None
-
-    def walk(self):
-        """This op and every op nested inside it, in program order."""
-        yield self
-        for inner in self.body or ():
-            yield from inner.walk()
-
-
-def capture_loc(skip: int = 3) -> Optional[str]:
-    """The user's line, skipping frames inside hk itself."""
-    for frame in reversed(traceback.extract_stack()[:-skip]):
-        if "/hk/" not in frame.filename.replace("\\", "/"):
-            return f"{frame.filename}:{frame.lineno} in {frame.name}"
-    return None
-
-
-# ---------------------------------------------------------------- kernel
-
-
 @dataclass
 class Param:
     """One kernel argument. Tensors become members of the globals struct;
@@ -636,114 +470,3 @@ class Param:
     type: Type
     is_const: bool = False
     const_value: Any = None
-
-
-@dataclass
-class KernelIR:
-    name: str
-    params: List[Param] = field(default_factory=list)
-    body: List[Op] = field(default_factory=list)
-    consts: Dict[str, Any] = field(default_factory=dict)
-    arch: str = "gfx1100"
-    warps: int = 1
-    #: Host-side grid expression, three entries (x, y, z).
-    grid: Tuple[Any, Any, Any] = (1, 1, 1)
-    #: Bytes of dynamic LDS, filled in by the lds_alloc pass.
-    lds_bytes: int = 0
-    #: Bytes of static LDS the library declares on an op's behalf (the slot
-    #: wg_arrive broadcasts through), also from lds_alloc. The hardware
-    #: limit is on the sum of the two.
-    lds_static: int = 0
-    #: (name, offset, size) per shared tile, from lds_alloc.
-    lds_map: List[Tuple[str, int, int]] = field(default_factory=list)
-    #: Non-fatal findings from hk.ir.verify -- things that make the kernel slow
-    #: rather than wrong.
-    warnings: List[Any] = field(default_factory=list)
-
-    @property
-    def threads(self) -> int:
-        return self.warps * 32
-
-    def tensors(self) -> List[Param]:
-        return [p for p in self.params if isinstance(p.type, GlobalType)]
-
-    def const_params(self) -> List[Param]:
-        return [p for p in self.params if p.is_const]
-
-    def walk(self):
-        """Every op in the kernel, nested ones included, in program order."""
-        for op in self.body:
-            yield from op.walk()
-
-    def ops(self, opcode: str) -> List[Op]:
-        """Every op with this opcode, at any nesting depth -- a check that
-        looked only at the top level would silently ignore a loop body."""
-        return [o for o in self.walk() if o.opcode == opcode]
-
-    def value_names(self) -> Dict[int, str]:
-        """A unique, deterministic name for every value in the kernel.
-
-        Shared by `dump()` and the C++ emitter so the textual IR and the
-        generated source call the same value the same thing -- when a kernel
-        spills you read both, and two naming schemes make that harder than it
-        needs to be. Deterministic means derived from position, not from the
-        global value counter, so a golden test does not depend on what else the
-        process traced first.
-        """
-        names: Dict[int, str] = {}
-        counts: Dict[str, int] = {}
-
-        def bind(v: Value, base: str) -> None:
-            n = counts.get(base, 0)
-            counts[base] = n + 1
-            names[id(v)] = base if n == 0 else f"{base}{n}"
-
-        for p in self.params:
-            names[p.name] = p.name  # keyed by name; params are not Values
-        for op in self.walk():
-            for a in op.block_args:
-                bind(a, a.name or "arg")
-            for r in op.results:
-                bind(r, r.name or "v")
-        return names
-
-    def dump(self) -> str:
-        """Textual IR. Stable enough to golden-test against."""
-        names = self.value_names()
-
-        def fmt(v: Value) -> str:
-            return "%" + names.get(id(v), v.name or str(v.id))
-
-        sig = ", ".join(
-            f"{p.name}: {p.type}" + (f" = {p.const_value!r}" if p.is_const else "")
-            for p in self.params
-        )
-        head = (
-            f"kernel @{self.name}({sig})\n"
-            f"  arch={self.arch} warps={self.warps} "
-            f"threads={self.threads} lds={self.lds_bytes}B grid={self.grid}\n"
-        )
-        lines: List[str] = []
-
-        def emit(ops: List[Op], depth: int) -> None:
-            pad = "  " * depth
-            for op in ops:
-                res = ", ".join(fmt(r) for r in op.results)
-                ins = ", ".join(fmt(o) for o in op.operands)
-                at = "".join(f" {k}={v!r}" for k, v in sorted(op.attrs.items()))
-                args = (
-                    f" [{', '.join(fmt(a) for a in op.block_args)}]"
-                    if op.block_args
-                    else ""
-                )
-                open_ = " {" if op.body is not None else ""
-                lines.append(
-                    f"{pad}{res + ' = ' if res else ''}"
-                    f"{op.opcode}({ins}){at}{args}{open_}\n"
-                )
-                if op.body is not None:
-                    emit(op.body, depth + 1)
-                    lines.append(f"{pad}}}\n")
-
-        emit(self.body, 1)
-        return head + "".join(lines)

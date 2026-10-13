@@ -8,7 +8,7 @@ saves is different. Whatever norm measured does not transfer, so measure this.
 
 FOLD is in the sweep now. It was not at first -- a folded workgroup owns one
 row and so has one scale to write, which `store` cannot express -- and the
-answer was `hk.store_scalar`. See quant.plan.
+answer was `x[idx].store_scalar(v)`. See quant.plan.
 
 The cases below sit on both sides of the 96 MB Infinity Cache, because that
 used to be a question `plan` branched on -- a pass whose working set fits in

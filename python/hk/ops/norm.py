@@ -88,7 +88,7 @@ from typing import Any
 
 from .. import dsl as hk
 from ..dsl.collective import cross_warp, fold_rows
-from ..ir.nodes import bf16, fp16, fp32
+from ..types import bf16, fp16, fp32
 
 #: 16 rows x 64 columns of fp32 is 32 VGPRs. 64 bf16 columns is also what makes
 #: the global load issue 16-byte accesses instead of going elementwise.

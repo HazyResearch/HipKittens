@@ -1,29 +1,27 @@
-"""hk.wg_arrive: the cross-workgroup reduction primitive, without a GPU."""
+"""hk.arch.wg_arrive: the cross-workgroup reduction primitive, without a GPU."""
 
 from __future__ import annotations
 
 import pytest
 
 import hk
-from hk import fp32, i32
-from hk.ir.verify import VerifyError
-from hk.lang import ops
+from hk import VerifyError, fp32, i32
 
 
 def _kernel(name, lds_tile_rows=0, counter_dtype=i32):
     def body(x, cnt, y):
         if lds_tile_rows:
-            buf = ops.alloc_shared(ops.st(fp32, lds_tile_rows, 64))
-            ops.store_shared(buf, ops.zeros(ops.rt(fp32, lds_tile_rows, 64)))
-            ops.barrier(drain=True)
-        t = ops.load(x, ops.elem_coord(0, ops.block_idx.y, 0, 0), ops.rt(fp32, 16, 16))
-        a = ops.wg_arrive(cnt, ops.elem_coord(0, 0, 0, ops.block_idx.x), 4)
-        with hk.if_(ops.s_eq(a, 3)):
-            ops.store(y, t, ops.elem_coord(0, 0, 0, 0))
+            buf = hk.lds.alloc(hk.ST(fp32, lds_tile_rows, 64))
+            buf.store(hk.zeros(hk.RT(fp32, lds_tile_rows, 64)))
+            hk.arch.barrier(drain=True)
+        t = x[hk.elem_coord(0, hk.arch.block_idx.y, 0, 0)].load(hk.RT(fp32, 16, 16))
+        a = hk.arch.wg_arrive(cnt[hk.elem_coord(0, 0, 0, hk.arch.block_idx.x)], 4)
+        if a == 3:
+            y[hk.elem_coord(0, 0, 0, 0)] = t
 
     body.__name__ = name
-    body.__annotations__ = {"x": hk.GL[fp32], "cnt": hk.GL[counter_dtype],
-                            "y": hk.GL[fp32]}
+    body.__annotations__ = {"x": hk.Tensor[fp32], "cnt": hk.Tensor[counter_dtype],
+                            "y": hk.Tensor[fp32]}
     return hk.kernel(body, arch="gfx1100", warps=1, name=name,
                      grid=lambda p: (1, 4, 1))
 
@@ -35,7 +33,7 @@ def test_it_emits_the_library_call_and_returns_a_scalar():
 
 def test_its_static_lds_is_counted():
     ir = _kernel("arrive_count").trace()
-    assert ir.lds_static == 16
+    assert "hk.lds_static = 16 : i64" in ir.dump()
 
 
 def test_a_kernel_that_would_fail_to_launch_fails_to_build():

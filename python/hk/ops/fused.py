@@ -35,7 +35,7 @@ of the tile width.
 from functools import lru_cache as _lru_cache
 
 from .. import dsl as hk
-from ..ir.nodes import bf16, fp16, fp32
+from ..types import bf16, fp16, fp32
 
 ROWS, COLS = 16, 64
 

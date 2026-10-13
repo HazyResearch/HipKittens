@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from ..ir.nodes import RegTileType, RegVecType
+from ..types import RegTileType, RegVecType
 from . import arch, lds
 from .values import SharedVec, Vec, as_vec, broadcast_col, binary
 

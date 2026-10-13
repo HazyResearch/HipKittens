@@ -7,7 +7,7 @@ granule in particular has NOT been measured here -- on gfx1100 it turned out to
 be 24 rather than the 8 everyone assumes, and that was only discovered by
 compiling a sweep and diffing against LLVM's occupancy remark.
 
-`verified=False` makes hk.ir.verify report budget violations as warnings rather
+`verified=False` makes hk-check-budgets report budget violations as warnings rather
 than hard errors on this target. A wrong hard limit is worse than no limit.
 Before trusting anything here, run tools/rdna-probes on the hardware and the
 granule sweep in /kernel-resource-check.

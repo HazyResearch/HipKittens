@@ -71,6 +71,12 @@ NB_MODULE(_hkDialects, m) {
       "The kernel func.func as HipKittens C++ (no module boundary).");
 
   hk.def(
+      "name_values_as_cpp",
+      [](MlirOperation kernel) { mlirHKNameValuesAsCpp(kernel); },
+      nb::arg("kernel"),
+      "Re-locate the kernel's values under their C++ names, for printing.");
+
+  hk.def(
       "target_facts",
       [](const std::string &arch) {
         std::string out;

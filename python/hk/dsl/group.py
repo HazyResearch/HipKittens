@@ -13,8 +13,8 @@ copies, synchronous and staged through registers.
 from __future__ import annotations
 
 from .._mlir.dialects import hk as hkd
-from ..compiler.from_kernel_ir import mlir_type
-from ..ir.nodes import StageBufferType
+from .module import mlir_type
+from ..types import StageBufferType
 from . import builder as B
 from .values import SharedTile, Stage, View
 

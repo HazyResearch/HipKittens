@@ -1,4 +1,4 @@
-"""`hk.load_scalar`: indexing by a value fetched from memory.
+"""`x[idx].load_scalar()`: indexing by a value fetched from memory.
 
 This is the primitive a paged kernel needs and the one the IR did not have.
 `block_idx` and arithmetic on it can express "block number 7"; a page table
@@ -21,13 +21,14 @@ ROWS, COLS = 16, 64
 
 
 def _gather_kernel():
-    def body(table: hk.GL[hk.i32], x: hk.GL[hk.bf16], o: hk.GL[hk.bf16]):
+    def body(table: hk.Tensor[hk.i32], x: hk.Tensor[hk.bf16],
+             o: hk.Tensor[hk.bf16]):
         # One workgroup per output tile. Which input tile it reads is a
         # number in memory, not a number the grid knows.
-        src = hk.load_scalar(table, hk.elem_coord(0, 0, 0, hk.block_idx.z))
-        t = hk.rt(hk.bf16, ROWS, COLS)
-        hk.store(o, hk.load(x, hk.elem_coord(src, 0, 0, 0), t),
-                 hk.elem_coord(hk.block_idx.z, 0, 0, 0))
+        src = table[hk.elem_coord(0, 0, 0, hk.arch.block_idx.z)].load_scalar()
+        t = hk.RT(hk.bf16, ROWS, COLS)
+        o[hk.elem_coord(hk.arch.block_idx.z, 0, 0, 0)] = (
+            x[hk.elem_coord(src, 0, 0, 0)].load(t))
 
     return hk.kernel(body, arch="gfx1100", warps=1, name="gather_probe",
                      grid=lambda p: (1, 1, p.o.batch))
