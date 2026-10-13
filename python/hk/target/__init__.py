@@ -34,4 +34,28 @@ def get_target(arch: str):
     return TARGETS[key]
 
 
-__all__ = ["GFX1100", "GFX1201", "TARGETS", "get_target", "Target", "MmaShape"]
+_CURRENT = []
+
+
+def current_arch() -> str:
+    """The arch a kernel that names none is built for, decided once per process.
+
+    hk.runtime.arch.detect's answer -- `$HK_ARCH` first, which is the only
+    way to build for a part that is not in the machine and how the gfx1201
+    kernels get their compile gate here; then the GPU torch or rocminfo sees.
+    Else gfx1100, the part this library was measured on: tracing and
+    compiling need no GPU, and a box without one should get the source a
+    W7900 would.
+    """
+    if not _CURRENT:
+        from ..runtime.arch import detect  # noqa: PLC0415
+
+        arch = detect() or ""
+        if _ALIASES.get(arch, arch) not in TARGETS:
+            arch = "gfx1100"
+        _CURRENT.append(_ALIASES.get(arch, arch))
+    return _CURRENT[0]
+
+
+__all__ = ["GFX1100", "GFX1201", "TARGETS", "current_arch", "get_target",
+           "Target", "MmaShape"]

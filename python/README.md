@@ -1316,4 +1316,39 @@ graph.) Not measured: vLLM's own eager kernels, the baseline only in
 `enforce_eager` mode. The strided global stays: it is what the next patch
 that receives a view instead of a tensor needs.
 
+### gfx1201: no arch baked into `hk.ops`, and fp8 WMMA tiles
+
+Every kernel in `hk.ops` named `arch="gfx1100"`. They now name none, and a
+kernel that names none is built for `hk.target.current_arch()`:
+`$HK_ARCH`, else the GPU in the machine (`hk.runtime.arch.detect`), else
+gfx1100. It is resolved on first use, so importing `hk.ops` still builds no
+IR and probes no GPU. The two LDS limits that were spelled `65536` in a
+gfx1100 error message read the target instead.
+
+RDNA4 has an fp8 WMMA and RDNA3 does not, so fp8 support depends on the
+target:
+
+* `hk.fp8e4m3` and `hk.fp8e5m2` are dtypes. Register tiles of them, and
+  `mma_*` on them -- including mixed e4m3/e5m2, which the four gfx12
+  builtins allow -- are accepted where the target lists an fp8 WMMA shape.
+  The gfx1201 target lists one: 2 VGPRs per 16x16 operand, from the builtin
+  signature, unmirrored.
+* On gfx1100 the `mma` says "fp8 operands need an fp8 WMMA, and gfx1100 has
+  none -- gfx1201 (RDNA4) does". A kernel that only *holds* an fp8 tile is
+  refused by the verifier with the alternative, load into fp32 or bf16. Both
+  happen at trace time, not as a template error forty lines deep.
+* A gfx1201 fp8 kernel (two fp8 loads, `mma_ABt`, an fp32 store) compiles
+  with hipcc for gfx1201 at 37 VGPRs, no scratch, and its ISA is four
+  `v_wmma_f32_16x16x16_fp8_bf8`. The strided global had to be mirrored into
+  the RDNA4 layout first: that was the only thing that did not compile.
+
+**Not verified on hardware.** There is no gfx12 part here, so none of this
+has run: what is checked is the type rules, the build gate and the ISA. The
+gfx1201 target's register granule and LDS pool are still carried over from
+gfx1100 and marked unverified in `hk/target/gfx1201.py`.
+
+Every `hk.ops` kernel now generates for gfx1201 (`HK_ARCH=gfx1201`). Under
+gfx1100 all 306 instantiations generate byte-identical source and resource
+caps to the previous commit, so no gfx1100 build changed.
+
 See `.claude/plans/` for the full plan and its gates.

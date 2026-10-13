@@ -40,6 +40,11 @@ GFX1201 = Target(
         # neither half holds everything and both directions must cross.
         "bf16": MmaShape(m=16, n=16, k=16, operand_vgprs=4, accum_vgprs=8),
         "fp16": MmaShape(m=16, n=16, k=16, operand_vgprs=4, accum_vgprs=8),
+        # v_wmma_f32_16x16x16_{fp8,bf8}_{fp8,bf8}_w32_gfx12: a 16x16 fp8
+        # operand is 256 B over 32 lanes, unmirrored -- 2 VGPRs. Read out of
+        # the builtin signatures in include/rdna4 mma.cuh, not measured.
+        "fp8e4m3": MmaShape(m=16, n=16, k=16, operand_vgprs=2, accum_vgprs=8),
+        "fp8e5m2": MmaShape(m=16, n=16, k=16, operand_vgprs=2, accum_vgprs=8),
     },
 
     # Absent on gfx12 as well as gfx11.

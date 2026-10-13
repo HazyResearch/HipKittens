@@ -33,9 +33,7 @@ from typing import Any, Dict, Optional, Tuple
 from .. import lang as _ops
 from ..lang import GL, kernel as _kernel
 from ..ir.nodes import bf16, fp32, i32
-from ..target import get_target
-
-_TARGET = get_target("gfx1100")
+from ..target import current_arch, get_target
 
 
 def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
@@ -67,6 +65,7 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
     """
     m_rows = 16 * tokens
     kc = 16 * slices
+    tgt = get_target(current_arch())
 
     ty_w = _ops.rt(bf16, 16, kc, "row")
     ty_x = _ops.rt(bf16, m_rows, kc, "row")
@@ -80,12 +79,12 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
         # Largest whole number of partials that still lets only `resident`
         # workgroups share the pool -- less the 16 B of static LDS wg_arrive
         # declares, which counts against the same 64 KB a workgroup may take.
-        budget = _TARGET.lds_pool_bytes // resident - (16 if splits > 1 else 0)
+        budget = tgt.lds_pool_bytes // resident - (16 if splits > 1 else 0)
         slots = max(warps, budget // st_part.nbytes)
-        if warps == 1 or slots * st_part.nbytes > _TARGET.lds_per_workgroup:
+        if warps == 1 or slots * st_part.nbytes > tgt.lds_per_workgroup:
             raise ValueError(
                 f"resident={resident} needs {slots * st_part.nbytes} B of LDS "
-                f"per workgroup; one may hold {_TARGET.lds_per_workgroup}, "
+                f"per workgroup; one may hold {tgt.lds_per_workgroup}, "
                 f"and a one-warp workgroup has no combine to size")
 
     def partial(x, w, k0, rounds, finish):
@@ -149,7 +148,7 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
                               "ws": GL[fp32], "cnt": GL[i32]}
     fn.__name__ = name
 
-    return _kernel(fn, arch="gfx1100", warps=warps, name=name,
+    return _kernel(fn, warps=warps, name=name,
                    grid=lambda p: (p.w.rows // 16, splits, 1),
                    max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 

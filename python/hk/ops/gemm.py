@@ -43,6 +43,7 @@ from typing import Any, Dict, Tuple
 from .. import autotune as _autotune
 from .. import lang as _ops
 from ..lang import GL, const, kernel as _kernel
+from ..target import current_arch, get_target
 from ..ir.nodes import bf16, fp32
 
 
@@ -63,8 +64,9 @@ def _derive(block_m: int, block_n: int, k_step: int, dot_slice: int,
     if k_step % dot_slice:
         raise ValueError(f"DOT_SLICE={dot_slice} must divide K_STEP={k_step}")
     lds = 2 * (block_m + block_n) * k_step * 2
-    if lds > 65536:
-        raise ValueError(f"{lds} B of LDS; a gfx1100 workgroup has 65536")
+    cap = get_target(current_arch()).lds_per_workgroup
+    if lds > cap:
+        raise ValueError(f"{lds} B of LDS; a {current_arch()} workgroup has {cap}")
     return dict(
         warp_cols=warp_cols, reg_m=reg_m, reg_n=reg_n, split_n=split_n,
         slices=k_step // dot_slice, lds=lds,
@@ -272,7 +274,7 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
     if write_pos not in (0, 1, 2):
         raise ValueError(f"write_pos={write_pos} must be 0, 1 or 2")
 
-    return _kernel(body, arch="gfx1100", warps=warps, grid=_grid, name=name,
+    return _kernel(body, warps=warps, grid=_grid, name=name,
                    max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 
 

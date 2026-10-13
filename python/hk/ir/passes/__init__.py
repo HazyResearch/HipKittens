@@ -28,6 +28,7 @@ def run_all(ir: KernelIR) -> List["_verify.Warning_"]:
     # than at whatever lowering turned it into. The rule is about the traced
     # program and no pass introduces a workgroup op inside a branch.
     _verify.check_divergence(ir)
+    _verify.check_dtypes(ir)
     for p in PIPELINE:
         p(ir)
     warns = _verify.check_layouts(ir) + _verify.check_budgets(ir)

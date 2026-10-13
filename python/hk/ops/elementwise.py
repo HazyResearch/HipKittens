@@ -54,7 +54,7 @@ def _binary_kernel(name: str, op: str, dtype):
     body.__annotations__ = {
         "a": GL[dtype], "b": GL[dtype], "o": GL[dtype],
     }
-    return _kernel(body, arch="gfx1100", warps=1, grid=_grid, name=name)
+    return _kernel(body, warps=1, grid=_grid, name=name)
 
 
 def _unary_kernel(name: str, op: str, dtype):
@@ -65,7 +65,7 @@ def _unary_kernel(name: str, op: str, dtype):
 
     body.__name__ = name
     body.__annotations__ = {"a": GL[dtype], "o": GL[dtype]}
-    return _kernel(body, arch="gfx1100", warps=1, grid=_grid, name=name)
+    return _kernel(body, warps=1, grid=_grid, name=name)
 
 
 _DTYPES = {"bf16": bf16, "fp16": fp16, "fp32": fp32}

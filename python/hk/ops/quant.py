@@ -230,7 +230,7 @@ def _quantize_kernel(name: str, dtype, warps: int):
 
     body.__name__ = name
     body.__annotations__ = {"x": GL[dtype], "q": GL[i8], "s": GL[fp32]}
-    return _kernel(body, arch="gfx1100", warps=warps, grid=_grid_q, name=name)
+    return _kernel(body, warps=warps, grid=_grid_q, name=name)
 
 
 def _dequantize_kernel(name: str, dtype, warps: int):
@@ -257,7 +257,7 @@ def _dequantize_kernel(name: str, dtype, warps: int):
 
     body.__name__ = name
     body.__annotations__ = {"q": GL[i8], "s": GL[fp32], "o": GL[dtype]}
-    return _kernel(body, arch="gfx1100", warps=warps, grid=_grid_dq, name=name)
+    return _kernel(body, warps=warps, grid=_grid_dq, name=name)
 
 
 _DTYPES = {"bf16": bf16, "fp16": fp16, "fp32": fp32}

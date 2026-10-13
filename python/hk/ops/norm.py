@@ -562,7 +562,7 @@ def _row_reduce_kernel(name: str, dtype, kind: str, warps: int):
 
     body.__name__ = name
     body.__annotations__ = {"x": GL[dtype], "o": GL[dtype]}
-    return _kernel(body, arch="gfx1100", warps=warps, grid=_grid, name=name)
+    return _kernel(body, warps=warps, grid=_grid, name=name)
 
 
 _DTYPES = {"bf16": bf16, "fp16": fp16, "fp32": fp32}

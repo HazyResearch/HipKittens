@@ -33,6 +33,8 @@ _AT_DTYPE = {
     "fp32": "at::kFloat",
     "i32": "at::kInt",
     "i8": "at::kChar",
+    "fp8e4m3": "at::kFloat8_e4m3fn",
+    "fp8e5m2": "at::kFloat8_e5m2",
 }
 
 

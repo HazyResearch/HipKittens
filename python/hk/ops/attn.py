@@ -42,6 +42,7 @@ from typing import Any, Dict, Optional
 from .. import autotune as _autotune
 from .. import lang as _ops
 from ..lang import GL, const, kernel as _kernel
+from ..target import current_arch, get_target
 from ..ir.nodes import bf16, fp32
 
 NEG_INF = float("-inf")
@@ -82,8 +83,9 @@ def _derive(head_dim: int, q_block: int, kv_block: int, warps: int,
             f"split this file implements."
         )
     lds = (kv_block * head_dim + head_dim * kv_block) * 2
-    if lds > 65536:
-        raise ValueError(f"{lds} B of LDS; a gfx1100 workgroup has 65536")
+    cap = get_target(current_arch()).lds_per_workgroup
+    if lds > cap:
+        raise ValueError(f"{lds} B of LDS; a {current_arch()} workgroup has {cap}")
     return dict(
         q_tile=q_block * warps,
         d_frags=head_dim // 16,
@@ -405,7 +407,7 @@ def attn_kernel(name: str, *, head_dim: int = 128, q_block: int = 16,
     def _grid(p):
         return (_ops.cdiv(p.q.rows, q_tile), p.q.depth, p.q.batch)
 
-    return _kernel(body, arch="gfx1100", warps=warps, grid=_grid, name=name,
+    return _kernel(body, warps=warps, grid=_grid, name=name,
                    max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 
 

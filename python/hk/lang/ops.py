@@ -28,10 +28,12 @@ from ..ir.nodes import (
     SharedVecType,
     StageBufferType,
     Value,
+    FP8,
     bf16,
     fp32,
     i32,
 )
+from ..target import get_target
 
 Scalar = Union[int, float, Value]
 
@@ -1377,15 +1379,24 @@ def _mma(variant: str, a: Value, b: Value, acc: Value, out: Optional[Value]) -> 
     for v, what in ((a, "A"), (b, "B"), (acc, "C")):
         _expect(v, RegTileType, f"{variant} {what} operand")
 
-    if a.type.dtype != b.type.dtype:
+    fp8 = a.type.dtype in FP8 and b.type.dtype in FP8
+    if a.type.dtype != b.type.dtype and not fp8:
         raise TypeError(
             f"{variant}: A is {a.type.dtype} and B is {b.type.dtype}. WMMA takes "
-            f"one operand type, not a mixed pair."
+            f"one operand type, not a mixed pair (fp8 e4m3/e5m2 excepted)."
         )
-    if a.type.dtype.bits != 16:
+    arch = _b().kernel.arch
+    if fp8:
+        if a.type.dtype.name not in get_target(arch).mma:
+            raise TypeError(
+                f"{variant}: fp8 operands need an fp8 WMMA, and {arch} has none "
+                f"-- gfx1201 (RDNA4) does. On {arch} keep fp8 as a storage "
+                f"type and dequantize to bf16 before the mma."
+            )
+    elif a.type.dtype.bits != 16:
         raise TypeError(
-            f"{variant}: operands are {a.type.dtype}. gfx1100 WMMA takes bf16 or "
-            f"fp16 operands only -- there is no fp8 or int8 form, and the "
+            f"{variant}: operands are {a.type.dtype}. {arch} WMMA takes bf16 or "
+            f"fp16 operands (fp8 on gfx1201) -- there is no int8 form, and the "
             f"fp16-accumulate form is not wired up in include/rdna3."
         )
     if acc.type.dtype != fp32:

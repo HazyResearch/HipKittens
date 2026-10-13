@@ -58,7 +58,7 @@ class Kernel:
         self,
         fn: Callable,
         *,
-        arch: str = "gfx1100",
+        arch: Optional[str] = None,
         warps: int = 1,
         grid: Optional[Callable] = None,
         name: Optional[str] = None,
@@ -66,7 +66,10 @@ class Kernel:
         min_occupancy: Optional[int] = None,
     ):
         self.fn = fn
-        self.arch = arch
+        #: None means "whatever this process builds for" -- see
+        #: hk.target.current_arch. Resolved on first read, not here, so that
+        #: importing hk.ops builds no IR and probes no GPU.
+        self._arch = arch
         self.warps = warps
         self.grid_fn = grid
         self.name = name or fn.__name__
@@ -87,6 +90,14 @@ class Kernel:
         #: kwargs rather than on the resolved constexprs.
         self._launch_cache: Dict[Tuple, Any] = {}
         functools.update_wrapper(self, fn)
+
+    @property
+    def arch(self) -> str:
+        if self._arch is None:
+            from ..target import current_arch  # noqa: PLC0415
+
+            return current_arch()
+        return self._arch
 
     # -- signature ---------------------------------------------------------
 
@@ -299,7 +310,7 @@ class Kernel:
         key = self._key(self._resolve_consts(const_overrides))
         if key not in self._spec_cache:
             k = Kernel(
-                self.fn, arch=self.arch, warps=self.warps, grid=self.grid_fn,
+                self.fn, arch=self._arch, warps=self.warps, grid=self.grid_fn,
                 name=self.name, max_vgprs=self.max_vgprs,
                 min_occupancy=self.min_occupancy,
             )
@@ -314,7 +325,7 @@ class Kernel:
 def kernel(
     fn: Optional[Callable] = None,
     *,
-    arch: str = "gfx1100",
+    arch: Optional[str] = None,
     warps: int = 1,
     grid: Optional[Callable] = None,
     name: Optional[str] = None,

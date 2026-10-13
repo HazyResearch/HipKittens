@@ -105,7 +105,7 @@ def _silu_mul_kernel(name: str, dtype, warps: int):
 
     body.__name__ = name
     body.__annotations__ = {"a": GL[dtype], "b": GL[dtype], "o": GL[dtype]}
-    return _kernel(body, arch="gfx1100", warps=warps, grid=_silu_mul_grid, name=name)
+    return _kernel(body, warps=warps, grid=_silu_mul_grid, name=name)
 
 
 # ---------------------------------------------------------------- rope
@@ -154,7 +154,7 @@ def _rope_kernel(name: str, dtype, half: int):
     body.__annotations__ = {
         "x": GL[dtype], "cos": GL[fp32], "sin": GL[fp32], "o": GL[dtype],
     }
-    return _kernel(body, arch="gfx1100", warps=1, grid=_rope_grid, name=name)
+    return _kernel(body, warps=1, grid=_rope_grid, name=name)
 
 
 _DTYPES = {"bf16": bf16, "fp16": fp16, "fp32": fp32}

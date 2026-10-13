@@ -20,6 +20,7 @@ from typing import List
 
 from ..target import get_target
 from .nodes import (
+    FP8,
     GranuleSetType,
     StageBufferType,
     CoordType,
@@ -174,6 +175,20 @@ def estimate_vgprs(ir: KernelIR) -> int:
             if last_use.get(id(v)) == i:
                 live.pop(id(v), None)
     return peak
+
+
+def check_dtypes(ir: KernelIR) -> None:
+    """fp8 register tiles exist only where the target has an fp8 WMMA."""
+    tgt = get_target(ir.arch)
+    for op in ir.walk():
+        for v in (*op.operands, *op.results):
+            ty = v.type
+            if isinstance(ty, RegTileType) and ty.dtype in FP8 and ty.dtype.name not in tgt.mma:
+                raise _fail(op, (
+                    f"{v.name} is an {ty.dtype} register tile, and {ir.arch} has no "
+                    f"fp8 WMMA or fp8 tile to put it in -- gfx1201 (RDNA4) does. "
+                    f"On {ir.arch} fp8 is a storage type: load it into an fp32 or "
+                    f"bf16 tile, which converts on the way in."))
 
 
 def check_budgets(ir: KernelIR) -> List[Warning_]:

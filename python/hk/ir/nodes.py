@@ -41,8 +41,15 @@ i32 = DType("i32", 32, "int", "int")
 #: tensor is something you quantize into and dequantize out of, and the
 #: arithmetic in between happens in fp32.
 i8 = DType("i8", 8, "int8", "int")
+#: The two OCP fp8 formats, as WMMA operands. Only gfx1201 has an fp8 WMMA
+#: (v_wmma_f32_16x16x16_{fp8,bf8}_{fp8,bf8}); on gfx1100 these are storage
+#: types at most, and `mma_*` on them says so. Compile-gated, not run: no
+#: gfx12 part was available.
+fp8e4m3 = DType("fp8e4m3", 8, "fp8e4m3", "float")
+fp8e5m2 = DType("fp8e5m2", 8, "fp8e5m2", "float")
+FP8 = (fp8e4m3, fp8e5m2)
 
-DTYPES = {d.name: d for d in (bf16, fp16, fp32, i32, i8)}
+DTYPES = {d.name: d for d in (bf16, fp16, fp32, i32, i8, fp8e4m3, fp8e5m2)}
 
 # ---------------------------------------------------------------- types
 
@@ -91,11 +98,13 @@ class RegTileType(Type):
     def __post_init__(self):
         if self.layout not in ("row", "col"):
             raise ValueError(f"layout must be row or col, got {self.layout!r}")
-        if self.dtype.bits < 16:
+        # fp8 is let through here and judged per kernel by hk.ir.verify, which
+        # knows the target: gfx1201 has fp8 WMMA tiles, gfx1100 has none.
+        if self.dtype.bits < 16 and self.dtype not in FP8:
             raise TypeError(
                 f"there is no {self.dtype} register tile. include/rdna3 defines "
                 f"rt_base only for 16- and 32-bit elements -- gfx1100 has no "
-                f"int8 or fp8 WMMA and no packed narrow ALU -- so a narrow type "
+                f"int8 WMMA and no packed narrow ALU -- so a narrow type "
                 f"is a global you quantize into, not something you compute in. "
                 f"Load it into an fp32 tile; the load converts on the way."
             )

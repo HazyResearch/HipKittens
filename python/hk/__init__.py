@@ -40,7 +40,7 @@ Three entry points, in increasing order of what they need:
 """
 
 from . import autotune, codegen, ir, lang, ops, runtime, target
-from .ir.nodes import DTYPES, DType, bf16, fp16, fp32, i8, i32
+from .ir.nodes import DTYPES, DType, bf16, fp8e4m3, fp8e5m2, fp16, fp32, i8, i32
 from .ir.verify import VerifyError
 from .lang import *  # noqa: F401,F403
 from .lang import __all__ as _lang_all
@@ -54,7 +54,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     *_lang_all,
-    "bf16", "fp16", "fp32", "i8", "i32", "DType", "DTYPES",
+    "bf16", "fp16", "fp32", "i8", "i32", "fp8e4m3", "fp8e5m2", "DType", "DTYPES",
     "VerifyError", "CompileError", "ResourceError", "Build",
     "get_target", "TARGETS", "detect_arch",
     "autotune", "codegen", "ir", "lang", "ops", "runtime", "target",

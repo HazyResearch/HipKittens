@@ -176,7 +176,7 @@ def paged_decode_kernel(name: str, *, head_dim: int = 128,
         "q": GL[bf16], "k_cache": GL[bf16], "v_cache": GL[bf16],
         "block_table": GL[i32], "seq_lens": GL[i32], "o": GL[bf16],
     }
-    return _kernel(body, arch="gfx1100", warps=1, name=name,
+    return _kernel(body, warps=1, name=name,
                    grid=lambda p: (1, p.q.depth, p.q.batch),
                    max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 
@@ -300,7 +300,7 @@ def paged_decode_split_kernel(name: str, *, head_dim: int = 128,
         "block_table": GL[i32], "seq_lens": GL[i32],
         "o_part": GL[fp32], "ml_part": GL[fp32],
     }
-    return _kernel(body, arch="gfx1100", warps=1, name=name,
+    return _kernel(body, warps=1, name=name,
                    grid=lambda p: (splits, p.q.depth, p.q.batch),
                    max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 
