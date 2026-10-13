@@ -59,10 +59,15 @@ class Tensor:
         return GlobalType(dtype)
 
 
-#: Marks a keyword-only parameter as a constexpr. Optional: every keyword-only
-#: parameter is one; the marker documents it at the definition, which matters
-#: when a kernel has a dozen knobs.
-Constexpr = "hk.constexpr"
+class Constexpr:
+    """Marks a constexpr parameter, with its type if you like:
+    `EPS: hk.Constexpr[float] = 1e-6`. Every keyword-only parameter is a
+    constexpr whether or not it says so -- the marker documents it, which
+    matters when a kernel has a dozen knobs -- and a positional one is a
+    constexpr when it is annotated so."""
+
+    def __class_getitem__(cls, _type):
+        return cls
 
 
 def _loc_text(loc) -> str:
@@ -254,23 +259,25 @@ class Kernel:
     def _split_params(self):
         tensors, consts = [], {}
         for p in self.signature.parameters.values():
-            if p.kind is inspect.Parameter.KEYWORD_ONLY:
+            if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                raise TypeError(f"{self.name}: *args / **kwargs are not supported")
+            keyword_only = p.kind is inspect.Parameter.KEYWORD_ONLY
+            ann = None if keyword_only else self._annotation(p)
+            if keyword_only or ann is Constexpr:
                 if p.default is inspect.Parameter.empty:
                     raise TypeError(
                         f"{self.name}: constexpr parameter {p.name!r} needs a default. "
-                        f"Keyword-only parameters are baked into the generated source, "
+                        f"Constexpr parameters are baked into the generated source, "
                         f"so every one of them must have a value to bake."
                     )
                 consts[p.name] = p.default
                 continue
-            if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                raise TypeError(f"{self.name}: *args / **kwargs are not supported")
-            ann = self._annotation(p)
             if not isinstance(ann, GlobalType):
                 raise TypeError(
                     f"{self.name}: parameter {p.name!r} must be annotated "
                     f"hk.Tensor[dtype] (got {ann!r}). Positional parameters are "
-                    f"tensors; put scalars in keyword-only constexpr parameters."
+                    f"tensors; a scalar is a constexpr -- keyword-only, or "
+                    f"annotated hk.Constexpr[int] with a default."
                 )
             tensors.append((p.name, ann))
         return tensors, consts

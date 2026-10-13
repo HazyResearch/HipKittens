@@ -64,10 +64,11 @@ of a 30-second compile.
 ## The language
 
 A kernel is a Python function. Positional parameters are tensors
-(`hk.Tensor[dtype]`, 4-D `(batch, depth, rows, cols)`); keyword-only parameters
-are constexprs, baked into the source and ordinary Python values in the body,
-so `range(D // 16)` unrolls and `if KIND == "softmax"` picks a branch at trace
-time.
+(`hk.Tensor[dtype]`, 4-D `(batch, depth, rows, cols)`). Constexprs are the
+keyword-only parameters, or any parameter annotated `hk.Constexpr[int]` with a
+default. They are baked into the source and are ordinary Python values in the
+body, so `range(D // 16)` unrolls and `if KIND == "softmax"` picks a branch at
+trace time.
 
 ```python
 T = hk.RT(hk.fp32, 16, 64)
@@ -86,7 +87,8 @@ def row_sumsq(x: hk.Tensor[hk.bf16], o: hk.Tensor[hk.fp32]):
   tile, `hk.ST` an LDS tile, `hk.col_vec(t)` / `hk.row_vec(t)` the vectors a
   reduction of `t` gives, `hk.SV` an LDS vector.
 * **Device values are objects with operators.** `a + b`, `t * v` (a vector
-  broadcasts along the axis it came off), `t.exp()`, `t.to(hk.bf16)`,
+  broadcasts along the axis it came off; `v[:, None]` / `v[None, :]` spell
+  that axis out and check it), `t.exp()`, `t.to(hk.bf16)`,
   `t.sum(axis=1)`, `acc += a @ b.T` (one WMMA into `acc`; the variant follows
   from the transposes), `-t`, `hk.min(a, b)`; scalars are `Int`/`Bool` with
   Python arithmetic and comparisons.
@@ -1692,8 +1694,16 @@ the routing counters for exactly this reason. The gate is run with
 through text, each of the four passes on hand-written IR (including the
 workgroup-operation checks and the budget warning), and the translation of
 a kernel and of a `while`. tests/hk/ir and
-tests/hk/codegen: 984, no xfails. tests/hk/gpu: 383 passed on
-gfx1100 (the 379 above and four for `while`).
+tests/hk/codegen: 990, no xfails. tests/hk/gpu: 386 passed on gfx1100: the
+379 above, four for `while`, and three for the RMSNorm the plan for this move
+set as the language's target. That one is written as the plan wrote it,
+except for two spellings, both kept on purpose:
+- a vector type is named by the tile it reduces, `hk.col_vec(T)`, not
+  `hk.ColVec[fp32, 16]`, because the dialect ties a vector's layout to its
+  tile;
+- a load names the register tile it makes, `x.at[r, c].load(T)`, not
+  `x.tile(16, 64)[r, c].load(fp32)`, because `x.tile[r, c]` already means a
+  tile-unit coordinate.
 
 **Wheels.** `scripts/build_wheel.sh` builds one per interpreter, because
 `hk._mlir` is nanobind extension modules for one CPython:

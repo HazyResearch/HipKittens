@@ -561,6 +561,7 @@ class Reduction:
     def __sub__(self, o): return self.value() - o
     def __mul__(self, o): return self.value() * o
     def __truediv__(self, o): return self.value() / o
+    def __getitem__(self, key): return self.value()[key]
 
 
 def _vec_of(x) -> "Vec":
@@ -824,6 +825,30 @@ class Vec(_Elementwise):
         if not isinstance(r, Reduction) or r.kind != "min":
             return binary("min", self, _vec_of(r), into=self)
         r.value(into=self, accumulate=True)
+        return self
+
+    def __getitem__(self, key) -> "Vec":
+        """`v[:, None]` / `v[None, :]`: the axis a broadcast runs along,
+        spelled out. A vector broadcasts along the axis it came off anyway;
+        this says so at the use and checks it."""
+        def whole(k):
+            return isinstance(k, slice) and k == slice(None)
+
+        want = None
+        if isinstance(key, tuple) and len(key) == 2:
+            if whole(key[0]) and key[1] is None:
+                want = "col"
+            elif key[0] is None and whole(key[1]):
+                want = "row"
+        if want is None:
+            raise TypeError("index a register vector only as v[:, None] (one "
+                            "value per row) or v[None, :] (one per column)")
+        if self.ty.kind != want:
+            raise TypeError(
+                f"{'v[:, None]' if want == 'col' else 'v[None, :]'} is a "
+                f"{'column' if want == 'col' else 'row'} vector, and this one is "
+                f"{self.ty} -- one value per "
+                f"{'column' if self.ty.kind == 'row' else 'row'} of its tile.")
         return self
 
     def any_ne(self, other: "Vec") -> Int:
