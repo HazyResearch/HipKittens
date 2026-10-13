@@ -32,7 +32,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from .. import lang as _ops
 from ..lang import GL, kernel as _kernel
-from ..ir.nodes import bf16, fp32
+from ..ir.nodes import bf16, fp32, i32
 from ..target import get_target
 
 _TARGET = get_target("gfx1100")
@@ -40,7 +40,7 @@ _TARGET = get_target("gfx1100")
 
 def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
                        warps: int = 16, combine_depth: int = 0,
-                       resident: int = 0,
+                       resident: int = 0, splits: int = 1,
                        max_vgprs: int = 256, min_occupancy: int = 1):
     """`tokens` 16-row token tiles (M <= 16*tokens), `slices` 16-deep K slices
     per load, `warps` waves sharing each 16-row block of W.
@@ -54,9 +54,16 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
     concurrent streams read faster here: at 16 warps, 2 per WGP beat 4 by 11%
     on a 12288-deep layer and 7% on a 4096-wide one, for the same code.
 
+    `splits` > 1 also cuts K across workgroups: workgroup (b, s) takes the
+    s-th slice, stores its fp32 partial to `ws[s]`, and arrives at `cnt[b]`;
+    the last of the `splits` to arrive sums the slots in order 0..splits-1 --
+    the same order whichever workgroup that is -- and stores the result. The
+    kernel then takes two more tensors, `ws` (splits, 16*tokens, N) fp32 and
+    `cnt` (N/16,) int32, zeroed once; see `scratch_for`.
+
     X and C have the batch's M rows, any M up to 16*tokens: the X loads and
     the store are predicated on rows. K must be a multiple of
-    16*slices*warps.
+    16*slices*warps*splits.
     """
     m_rows = 16 * tokens
     kc = 16 * slices
@@ -71,22 +78,24 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
     slots = warps
     if resident:
         # Largest whole number of partials that still lets only `resident`
-        # workgroups share the pool.
-        slots = max(warps, _TARGET.lds_pool_bytes // resident // st_part.nbytes)
+        # workgroups share the pool -- less the 16 B of static LDS wg_arrive
+        # declares, which counts against the same 64 KB a workgroup may take.
+        budget = _TARGET.lds_pool_bytes // resident - (16 if splits > 1 else 0)
+        slots = max(warps, budget // st_part.nbytes)
         if warps == 1 or slots * st_part.nbytes > _TARGET.lds_per_workgroup:
             raise ValueError(
                 f"resident={resident} needs {slots * st_part.nbytes} B of LDS "
                 f"per workgroup; one may hold {_TARGET.lds_per_workgroup}, "
                 f"and a one-warp workgroup has no combine to size")
 
-    def body(x, w, c):
+    def partial(x, w, k0, rounds, finish):
+        """This workgroup's 16 W rows over K[k0 : k0 + rounds*kc*warps],
+        combined across its warps; `finish` gets the result in warp 0."""
         n0 = _ops.block_idx.x * 16
         wid = _ops.warp_id()
-        rounds = _ops.cols(x) // (kc * warps)
-
         acc = _ops.zeros(ty_acc)
         for t in _ops.range(rounds):
-            k = (t * warps + wid) * kc
+            k = k0 + (t * warps + wid) * kc
             w_t = _ops.load(w, _ops.elem_coord(0, 0, n0, k), ty_w)
             # Bounded: X has the batch's M rows, not a padded 16*tokens, and
             # the rows past M read as zero instead of past its allocation.
@@ -104,15 +113,44 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
                         _ops.sched_barrier()
                     other = _ops.load_shared(_ops.shared_at(parts, i), ty_out)
                     _ops.add(out, other, out=out)
-                _ops.store(c, out, _ops.elem_coord(0, 0, 0, n0), bounded=True)
+                finish(out, n0)
         else:
+            finish(out, n0)
+
+    def body(x, w, c):
+        def finish(out, n0):
             _ops.store(c, out, _ops.elem_coord(0, 0, 0, n0), bounded=True)
+        partial(x, w, 0, _ops.cols(x) // (kc * warps), finish)
 
-    body.__name__ = name
-    body.__annotations__ = {"x": GL[bf16], "w": GL[bf16], "c": GL[bf16]}
+    def body_split(x, w, c, ws, cnt):
+        s = _ops.block_idx.y
+        per = _ops.cols(x) // splits
 
-    return _kernel(body, arch="gfx1100", warps=warps, name=name,
-                   grid=lambda p: (p.w.rows // 16, 1, 1),
+        def finish(out, n0):
+            _ops.store(ws, out, _ops.elem_coord(0, s, 0, n0))
+        partial(x, w, s * per, per // (kc * warps), finish)
+
+        arrived = _ops.wg_arrive(cnt, _ops.elem_coord(0, 0, 0, _ops.block_idx.x), splits)
+        with _ops.if_(_ops.s_eq(arrived, splits - 1)):
+            with _ops.if_(_ops.s_eq(_ops.warp_id(), 0)):
+                n0 = _ops.block_idx.x * 16
+                total = _ops.zeros(ty_out)
+                for j in range(splits):
+                    p = _ops.load(ws, _ops.elem_coord(0, j, 0, n0), ty_out)
+                    _ops.add(total, p, out=total)
+                _ops.store(c, total, _ops.elem_coord(0, 0, 0, n0), bounded=True)
+
+    if splits == 1:
+        fn = body
+        fn.__annotations__ = {"x": GL[bf16], "w": GL[bf16], "c": GL[bf16]}
+    else:
+        fn = body_split
+        fn.__annotations__ = {"x": GL[bf16], "w": GL[bf16], "c": GL[bf16],
+                              "ws": GL[fp32], "cnt": GL[i32]}
+    fn.__name__ = name
+
+    return _kernel(fn, arch="gfx1100", warps=warps, name=name,
+                   grid=lambda p: (p.w.rows // 16, splits, 1),
                    max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 
 
@@ -122,9 +160,9 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
 #: four cannot afford 16 warps at all. The wider two are held to one and two
 #: workgroups per WGP by their registers already.
 SCHEDULES: Dict[int, Dict[str, int]] = {
-    1: dict(slices=4, warps=16, combine_depth=0, resident=2),
-    2: dict(slices=2, warps=16, combine_depth=8, resident=0),
-    4: dict(slices=2, warps=8, combine_depth=4, resident=0),
+    1: dict(slices=4, warps=16, combine_depth=0, resident=2, splits=1),
+    2: dict(slices=2, warps=16, combine_depth=8, resident=0, splits=1),
+    4: dict(slices=2, warps=8, combine_depth=4, resident=0, splits=1),
 }
 
 #: The widest batch, in 16-row token tiles. Every tile is another X operand
@@ -155,6 +193,8 @@ def schedule_for(m: int, k: int) -> Optional[Dict[str, Any]]:
         s["warps"] //= 2
     if k % (16 * s["slices"] * s["warps"]):
         return None
+    if k % (16 * s["slices"] * s["warps"] * s["splits"]):
+        s["splits"] = 1
     return _settle(s)
 
 
@@ -170,15 +210,36 @@ def _settle(s: Dict[str, int]) -> Dict[str, int]:
 
 
 def kernel_for(tokens: int, slices: int, warps: int, combine_depth: int = 0,
-               resident: int = 0):
-    key = (tokens, slices, warps, combine_depth, resident)
+               resident: int = 0, splits: int = 1):
+    key = (tokens, slices, warps, combine_depth, resident, splits)
     if key not in _KERNELS:
         _KERNELS[key] = decode_gemm_kernel(
             f"decode_gemm_t{tokens}_s{slices}_w{warps}_c{combine_depth}"
-            f"_r{resident}",
+            f"_r{resident}" + (f"_k{splits}" if splits > 1 else ""),
             tokens=tokens, slices=slices, warps=warps,
-            combine_depth=combine_depth, resident=resident)
+            combine_depth=combine_depth, resident=resident, splits=splits)
     return _KERNELS[key]
+
+
+_SCRATCH: Dict[Tuple[Any, ...], Any] = {}
+
+
+def scratch_for(device, splits: int, tokens: int, n: int):
+    """The (ws, cnt) pair a split kernel of this shape takes, made once.
+
+    Shared by every launch of the shape: launches on one stream run in order,
+    and the last workgroup of each output block resets its counter, so `cnt`
+    is zero again when the next launch starts. Made on first use -- vLLM's
+    warm-up runs, before any graph is captured, are where that happens.
+    """
+    import torch  # noqa: PLC0415
+
+    key = (str(device), splits, tokens, n)
+    if key not in _SCRATCH:
+        _SCRATCH[key] = (
+            torch.empty((splits, 16 * tokens, n), device=device, dtype=torch.float32),
+            torch.zeros((n // 16,), device=device, dtype=torch.int32))
+    return _SCRATCH[key]
 
 
 def fits(m: int, n: int, k: int) -> bool:
@@ -190,7 +251,7 @@ def matmul(x, w, **override):
     """x @ w.T for a decode batch. `w` is (N, K), as in `gemm.matmul`.
 
     `override` replaces fields of the schedule (slices, warps, combine_depth,
-    resident) -- for measuring, not for use.
+    resident, splits) -- for measuring, not for use.
     """
     import torch  # noqa: PLC0415 -- hk traces and compiles without torch
 
@@ -204,17 +265,21 @@ def matmul(x, w, **override):
     s = schedule_for(m, k)
     if s is not None and override:
         s = _settle({**s, **override})
-    if s is None or n % 16 or k % (16 * s["slices"] * s["warps"]):
+    if s is None or n % 16 or k % (16 * s["slices"] * s["warps"] * s["splits"]):
         raise ValueError(
             f"decode matmul: M={m} must be in [1, {16 * MAX_TOKENS}], N={n} a "
-            f"multiple of 16, and K={k} a multiple of 16 x slices x warps "
-            f"(every warp takes whole rounds)")
+            f"multiple of 16, and K={k} a multiple of 16 x slices x warps x "
+            f"splits (every warp takes whole rounds)")
     if not x.is_contiguous():
         x = x.contiguous()
     out = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
-    kernel_for(**s)(x, w.contiguous(), out)
+    if s["splits"] > 1:
+        kernel_for(**s)(x, w.contiguous(), out,
+                        *scratch_for(x.device, s["splits"], s["tokens"], n))
+    else:
+        kernel_for(**s)(x, w.contiguous(), out)
     return out
 
 
 __all__ = ["MAX_TOKENS", "SCHEDULES", "decode_gemm_kernel", "fits",
-           "kernel_for", "matmul", "schedule_for", "tokens_for"]
+           "kernel_for", "matmul", "schedule_for", "scratch_for", "tokens_for"]

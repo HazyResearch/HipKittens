@@ -73,6 +73,19 @@ right data (HipKittens `tests/hk/gpu/test_bounded.py`). An alignment
 fallback around buffer intrinsics is not free: LLVM cannot merge the
 intrinsics, and reserves the fallback's registers whether it runs or not.
 
+**Static `__shared__` counts against the same 64 KB as dynamic LDS.** A
+library function that declares a `__shared__` slot (HipKittens
+`kittens::wg_arrive`, 16 B) pushed a kernel that reserved exactly 64 KB of
+dynamic LDS to 65,552 B, and the launch failed with
+`HSA_STATUS_ERROR_INVALID_ALLOCATION` -- not at build time, and not with a
+message naming LDS. HipKittens' IR now counts it (`KernelIR.lds_static`).
+
+**Split-K across workgroups did not help a decode GEMV already near the
+read ceiling.** Same decode GEMM, splits 2-4 with a fixed-order last-arrival
+reduction: slower on every Qwen3-8B shape at M=1 and 16, 3-17%. The
+workspace round trip and second pass cost more than the ragged last round
+of a 256-block grid.
+
 **Decode GEMV: W straight to registers, K split across 16 warps,
 interleaved.** Same file: `W*X^T` with W loaded global->register, one 16-row
 block per workgroup, warp w reading K-chunk `t*16 + w` (2 KB contiguous per

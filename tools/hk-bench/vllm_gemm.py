@@ -102,6 +102,7 @@ def main() -> int:
     import torch.nn.functional as F
 
     import hk
+    from hk.ops import decode_gemm as hk_decode
     from hk.ops import gemm as hk_gemm
 
     dev = torch.device("cuda")
@@ -132,6 +133,18 @@ def main() -> int:
         if key not in hk_ops:
             hk_ops[key] = hk.torch_op(hk_gemm.TUNER._kernel_for(s))
         return hk_ops[key]
+
+    decode_ops = {}
+
+    def decode_op(m, n, k):
+        """hk.ops.decode_gemm at the schedule vllm_gemm would route to, or None."""
+        if not hk_decode.fits(m, n, k):
+            return None
+        s = hk_decode.schedule_for(m, k)
+        key = tuple(sorted(s.items()))
+        if key not in decode_ops:
+            decode_ops[key] = hk.torch_op(hk_decode.kernel_for(**s))
+        return decode_ops[key]
 
     def set_blas(name):
         torch.backends.cuda.preferred_blas_library(name)
@@ -173,6 +186,9 @@ def main() -> int:
             op = hk_op(m, n, k)
             if op is not None:
                 variants["hk"] = (None, lambda w: op(x, w, out) or out, None)
+            dop = decode_op(m, n, k)
+            if dop is not None:
+                variants["decode"] = (None, lambda w: dop(x, w, out) or out, None)
             # Upstream's condition, in its names: tokens 0 < n <= 5 and
             # out-features m == 1 or m > 8; every shape here has m > 8.
             if wvsplitk is not None and m <= 5 and k % 8 == 0:
@@ -270,7 +286,10 @@ def main() -> int:
         # unconditionally, and F.linear elsewhere.
         up = sum(v.get("wvSplitK", v["F.linear"]) for v in by.values())
         bo = sum(min(v.values()) for v in by.values())
-        hk_route = sum(min(v["F.linear"], v.get("hk", float("inf")))
+        # What hk/integration/vllm_gemm.py runs: the decode kernel where it
+        # takes the shape, the prefill GEMM where its rule says, else F.linear.
+        hk_route = sum(v["decode"] if "decode" in v else
+                       min(v["F.linear"], v.get("hk", float("inf")))
                        for v in by.values())
         print(f"{m:>7}{fl:11.3f}{rb:10.3f}"
               + (f"{up:10.3f}" if upstream else "")

@@ -171,7 +171,11 @@ def linear(x, weight, bias=None):
         if not x2.is_contiguous():
             x2 = x2.contiguous()
         out = torch.empty((m, n), device=x.device, dtype=x.dtype)
-        _decode_op(s)(x2, weight, out)
+        if s["splits"] > 1:
+            _decode_op(s)(x2, weight, out,
+                          *decode_gemm.scratch_for(x.device, s["splits"], s["tokens"], n))
+        else:
+            _decode_op(s)(x2, weight, out)
         STATS["hk_decode"] += 1
         return out.view(*x.shape[:-1], n)
     STATS["fallback"] += 1

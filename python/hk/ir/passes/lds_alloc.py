@@ -42,3 +42,6 @@ def lds_alloc(ir: KernelIR) -> None:
 
     ir.lds_bytes = offset
     ir.lds_map = allocations
+    # kittens::wg_arrive declares one `__shared__ int` per instantiation;
+    # 16 B is what the static segment rounds it to.
+    ir.lds_static = 16 * len(ir.ops("wg_arrive"))

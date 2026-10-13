@@ -1133,6 +1133,71 @@ and not touched: both the shipped and the new GEMM wait `vmcnt(0)` right
 before every iteration's barrier, so under `write_pos=1` the prefetch for
 tile t+2 never overlaps tile t's math -- a lever for the GEMM itself.
 
+### A reduction across workgroups, and the decode GEMV that did not need it
+
+The IR had no way for workgroups to combine results inside one launch, which
+is what split-K across workgroups needs. `hk.wg_arrive(counter, idx,
+expected)` is that primitive, as a counter rather than fp32 atomics:
+
+* Each workgroup stores its partial and arrives. The one that gets back
+  `expected - 1` arrived last, and finishes by reading the partials in a
+  fixed order. So the answer does not depend on which workgroup that was --
+  20 repeats are bit-identical, which a greedy-token comparison against the
+  engine needs and fp32 atomics would not give.
+* The fences (release before the increment, acquire after) make every store
+  issued before the call visible to the last arrival.
+* The last arrival resets its counter, so one zeroed int32 tensor serves
+  every launch and every replay of a captured graph with no memset.
+* Its broadcast slot is 16 B of static LDS outside the allocator, and the
+  first kernel that used it asked for 65,552 B and failed to launch
+  (`HSA_STATUS_ERROR_INVALID_ALLOCATION`). The IR now counts static LDS and
+  the verifier refuses the sum over 64 KB at build time, with that error in
+  the message.
+
+`decode_gemm(splits=S)` puts it to work: workgroup (b, s) takes the s-th
+slice of K, and the last of the S finishes the block. It is correct, and it
+is slower on every shape at every split, M=1 and M=16 alike (one process,
+>= 1.5 GB of distinct weights per shape):
+
+```
+us at M=1      splits 1    splits 2    splits 3    splits 4
+qkv                66.4        76.9          --        81.8
+o                  46.5        51.4          --        55.0
+gate_up           252.4       271.2          --       294.2
+down              139.5       144.3       153.6       146.9
+lm_head          1515.5      1663.0          --      1768.4
+```
+
+The case for it was `down`: 256 blocks over 96 resident slots leave a
+third-full last round. The workspace round trip and the second pass cost
+more than that tail. So the decode GEMV ships unsplit, and `wg_arrive`
+ships as a capability for kernels whose grid really is too small -- a
+negative result, measured, not a guess.
+
+Where the decode GEMV stands now, in GEMM milliseconds per decode step (36
+layers plus the LM head, `tools/hk-bench/vllm_gemm.py --upstream-skinny`,
+>= 1.5 GB of distinct weights per shape, every variant gated against fp32):
+
+```
+tokens   hipBLASLt   rocBLAS   upstream wvSplitK   hk decode   vs hipBLASLt
+     1       39.98     37.02               19.11       19.66        2.03x
+     2       39.68     37.57               19.87       19.69        2.01x
+     4       39.72     39.02               20.40       19.77        2.01x
+     8       39.50     40.86                  --       19.89        1.99x
+    16       41.00     41.75                  --       20.23        2.03x
+    24       39.74     43.93                  --       20.56        1.93x
+    32       40.48     46.81                  --       20.84        1.94x
+```
+
+Against the ceiling a plain read reaches (`hbm_probe.hip`, one kernel per
+read: 676 GB/s for `o`'s 34 MB up to 821 for 302 MB), at one token: `qkv`
+762 GB/s, `o` 724, `gate_up` 800, `down` 720, LM head 819. Upstream's
+`wvSplitK`, which handles one to five tokens, is level on `qkv`, 1.5-2.6%
+ahead on `o`, `gate_up` and the LM head, and 6.9% ahead on `down` (770
+GB/s). That last one is where what is left lives. The row predicate is
+also worth seeing here: without the pad, two and four tokens now beat
+`wvSplitK` per step, and 32 tokens dropped from 22.3 to 20.8 ms.
+
 Four facts about vLLM's plugin surface are written down in
 `vllm_backend.py` because each cost a run to find: `AttentionBackendEnum` is
 closed and `register_backend` overrides rather than adds; the reserved

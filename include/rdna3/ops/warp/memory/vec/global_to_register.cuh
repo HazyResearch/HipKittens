@@ -182,4 +182,36 @@ __device__ inline static int load_scalar(const GL &src, const COORD &idx) {
     const U *src_ptr = (const U*)&src[(idx.template unit_coord<-1, 3>())];
     return __builtin_amdgcn_readfirstlane((int)(*src_ptr));
 }
+
+/**
+ * @brief Count this workgroup's arrival at the counter `cnt[idx]`, device-wide.
+ *
+ * Returns, in every thread, how many workgroups arrived before this one -- so
+ * the workgroup that sees `expected - 1` is the last, and can finish a
+ * reduction the others contributed to. That one also puts the counter back
+ * to 0, so a counter allocated zeroed stays zeroed across launches and graph
+ * replays without a memset.
+ *
+ * The fences are what make it a reduction primitive rather than a counter:
+ * every global store any thread issued before the call is visible to the
+ * last arrival once its call returns (release before the increment, acquire
+ * after). It contains barriers, so every thread of the workgroup must reach it.
+ */
+template<ducks::gl::all GL, typename COORD=coord<>>
+__device__ inline static int wg_arrive(const GL &cnt, const COORD &idx, int expected) {
+    static_assert(std::is_same_v<typename GL::dtype, int>, "wg_arrive counts in an int32 tensor");
+    __shared__ int arrived_before;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int *p = (int*)&cnt[(idx.template unit_coord<-1, 3>())];
+        const int old = atomicAdd(p, 1);
+        if (old == expected - 1) atomicExch(p, 0);
+        arrived_before = old;
+    }
+    __syncthreads();
+    const int arrived = __builtin_amdgcn_readfirstlane(arrived_before);
+    __threadfence();
+    return arrived;
+}
 } // namespace kittens

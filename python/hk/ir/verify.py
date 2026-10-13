@@ -180,11 +180,15 @@ def check_budgets(ir: KernelIR) -> List[Warning_]:
     tgt = get_target(ir.arch)
     warns: List[Warning_] = []
 
-    if ir.lds_bytes > tgt.lds_per_workgroup:
+    lds_total = ir.lds_bytes + ir.lds_static
+    if lds_total > tgt.lds_per_workgroup:
+        static = (f" ({ir.lds_static} B of it static, declared by the library "
+                  f"for wg_arrive)" if ir.lds_static else "")
         raise VerifyError(
-            f"LDS request is {ir.lds_bytes} B but one workgroup on {tgt.arch} "
-            f"gets at most {tgt.lds_per_workgroup} B. Shrink a staged tile, drop "
-            f"double buffering, or move a tile back into registers."
+            f"LDS request is {lds_total} B{static} but one workgroup on "
+            f"{tgt.arch} gets at most {tgt.lds_per_workgroup} B -- the launch "
+            f"fails with HSA_STATUS_ERROR_INVALID_ALLOCATION. Shrink a staged "
+            f"tile, drop double buffering, or move a tile back into registers."
         )
 
     est = estimate_vgprs(ir)

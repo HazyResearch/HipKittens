@@ -641,6 +641,10 @@ class KernelIR:
     grid: Tuple[Any, Any, Any] = (1, 1, 1)
     #: Bytes of dynamic LDS, filled in by the lds_alloc pass.
     lds_bytes: int = 0
+    #: Bytes of static LDS the library declares on an op's behalf (the slot
+    #: wg_arrive broadcasts through), also from lds_alloc. The hardware
+    #: limit is on the sum of the two.
+    lds_static: int = 0
     #: (name, offset, size) per shared tile, from lds_alloc.
     lds_map: List[Tuple[str, int, int]] = field(default_factory=list)
     #: Non-fatal findings from hk.ir.verify -- things that make the kernel slow

@@ -54,6 +54,41 @@ def test_the_combine_is_the_same_however_much_lds_it_holds(resident, depth):
     _run(9, 4096, 12288, warps=16, resident=resident, combine_depth=depth)
 
 
+@pytest.mark.parametrize("splits", [2, 3, 4])
+@pytest.mark.parametrize("m", [1, 5, 16])
+def test_split_k_across_workgroups(splits, m):
+    _run(m, 4096, 12288, splits=splits)
+
+
+def test_a_split_reduction_is_the_same_bits_every_time():
+    # The last workgroup to arrive sums the slots in a fixed order, so which
+    # one that is cannot change the result. fp32 atomics would.
+    torch.manual_seed(0)
+    x = torch.randn(3, 12288, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(4096, 12288, device="cuda", dtype=torch.bfloat16) * 12288 ** -0.5
+    first = decode_gemm.matmul(x, w, splits=4).clone()
+    for _ in range(20):
+        assert torch.equal(decode_gemm.matmul(x, w, splits=4), first)
+
+
+def test_the_counters_are_zero_after_every_launch():
+    torch.manual_seed(0)
+    x = torch.randn(2, 12288, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(4096, 12288, device="cuda", dtype=torch.bfloat16) * 12288 ** -0.5
+    for _ in range(3):
+        decode_gemm.matmul(x, w, splits=3)
+    torch.cuda.synchronize()
+    _, cnt = decode_gemm.scratch_for(x.device, 3, 1, 4096)
+    assert int(cnt.abs().sum()) == 0
+
+
+def test_a_split_k_does_not_divide_is_refused():
+    x = torch.zeros(2, 4096, device="cuda", dtype=torch.bfloat16)
+    w = torch.zeros(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError):
+        decode_gemm.matmul(x, w, splits=3)          # 4096 / 1024 is not 3k
+
+
 def test_a_strided_activation_is_copied_not_misread():
     torch.manual_seed(0)
     x = torch.randn(8, 2 * 4096, device="cuda", dtype=torch.bfloat16)[:, ::2]

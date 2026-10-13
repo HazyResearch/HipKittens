@@ -511,6 +511,13 @@ class Emitter:
             f"{self.name(src)}, {self.name(idx)});"
         )
 
+    def _op_wg_arrive(self, op: Op) -> None:
+        cnt, idx, expected = op.operands
+        self.w(
+            f"const int {self.name(op.result)} = kittens::wg_arrive("
+            f"{self.name(cnt)}, {self.name(idx)}, {self.name(expected)});"
+        )
+
     def _op_store_shared_vec(self, op: Op) -> None:
         dst, val, index = op.operands
         self.w(f"kittens::store({self._sv_entry(dst, index)}, {self.name(val)});")

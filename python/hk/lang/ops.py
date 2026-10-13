@@ -774,6 +774,33 @@ def vm_wait(keep: int = 0) -> None:
     _b().emit("vm_wait", keep=keep)
 
 
+def wg_arrive(counter: Value, idx: Value, expected: Scalar) -> Value:
+    """Count this workgroup's arrival at `counter[idx]`; return how many
+    workgroups arrived there before it.
+
+    The reduction across workgroups the library otherwise has no way to say:
+    each workgroup stores its partial result, arrives, and the one that gets
+    back `expected - 1` arrived last and finishes -- reading the partials in a
+    fixed order, so the answer does not depend on which workgroup that was.
+    Every store issued before the call is visible to that last arrival
+    (release, then acquire). The last arrival resets the counter to 0, so an
+    int32 tensor allocated zeroed can be handed to every launch, including the
+    replays of a captured CUDA graph, with no memset in between.
+
+    The result is a uniform scalar, for `hk.if_`. It contains barriers: every
+    warp of the workgroup must reach it, which is why it is an op and not
+    something to put inside an `if_` on the warp index.
+    """
+    _expect(counter, GlobalType, "wg_arrive counter")
+    _expect(idx, CoordType, "wg_arrive index")
+    if idx.type.unit != "element":
+        raise TypeError(f"wg_arrive takes an element coordinate, got {idx.type}")
+    if counter.type.dtype not in (i32,):
+        raise TypeError(f"wg_arrive counts in an int32 tensor, not {counter.type.dtype.name}")
+    return _b().emit("wg_arrive", [counter, idx, _as_value(expected, i32)],
+                     ScalarType(i32), name="arrived")
+
+
 def barrier(drain: bool = False) -> None:
     """`s_barrier`. Orders *execution* across the workgroup -- not memory.
 
@@ -1576,7 +1603,7 @@ __all__ = [
     "shared_at", "subtile", "setprio", "lds_loads", "lds_wait_for",
     "stage_buffer", "stage_load", "stage_commit", "vm_wait",
     "shared_vec", "alloc_shared_vec", "load_shared_vec", "store_shared_vec",
-    "barrier", "sched_barrier",
+    "barrier", "sched_barrier", "wg_arrive",
     "zeros", "full", "neg_infty", "cast", "neg",
     "transpose", "transpose_sep", *CAUSAL,
     "zeros_vec", "full_vec", "neg_infty_vec",
