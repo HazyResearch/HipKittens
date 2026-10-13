@@ -386,7 +386,7 @@ def test_an_exact_kernel_does_not_clamp_its_column():
 def test_every_phase2_kernel_traces():
     for mod in (hk.ops.norm, hk.ops.fused, hk.ops.quant):
         for name, k in mod.KERNELS.items():
-            assert k.trace().body, name
+            assert "hk.store" in k.trace().dump(), name
 
 
 def test_specialize_is_memoized():

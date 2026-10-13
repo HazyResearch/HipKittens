@@ -218,10 +218,24 @@ private:
                  !n.empty())
           iv = n;
         bind(f.getInductionVar(), iv);
-        for (BlockArgument a : f.getRegionIterArgs()) {
+        auto carried = f->getAttrOfType<ArrayAttr>("hk.carried_names");
+        for (auto [i, a] : llvm::enumerate(f.getRegionIterArgs())) {
           StringRef n = valueNameOf(a.getLoc());
+          if (carried && i < carried.size())
+            n = cast<StringAttr>(carried[i]).getValue();
           bind(a, n.empty() ? "arg" : n);
         }
+        return;
+      }
+      if (auto i = dyn_cast<scf::IfOp>(op)) {
+        auto rn = i->getAttrOfType<ArrayAttr>("hk.result_names");
+        for (auto [k, r] : llvm::enumerate(i.getResults())) {
+          StringRef n = rn && k < rn.size()
+                            ? cast<StringAttr>(rn[k]).getValue()
+                            : StringRef("v");
+          bind(r, n);
+        }
+        return;
       }
       for (Value r : op->getResults()) {
         StringRef n = valueNameOf(op->getLoc());
@@ -284,6 +298,9 @@ private:
         .Case([](arith::MulIOp) { return "*"; })
         .Case([](arith::DivSIOp) { return "/"; })
         .Case([](arith::RemSIOp) { return "%"; })
+        .Case([](arith::AndIOp) { return "&"; })
+        .Case([](arith::OrIOp) { return "|"; })
+        .Case([](arith::XOrIOp) { return "^"; })
         .Default([](Operation *) { return std::nullopt; });
   }
 
@@ -520,6 +537,9 @@ private:
         .Case([&](arith::MulIOp) { scalarStmt(op, a(0) + " * " + a(1)); })
         .Case([&](arith::DivSIOp) { scalarStmt(op, a(0) + " / " + a(1)); })
         .Case([&](arith::RemSIOp) { scalarStmt(op, a(0) + " % " + a(1)); })
+        .Case([&](arith::AndIOp) { scalarStmt(op, a(0) + " & " + a(1)); })
+        .Case([&](arith::OrIOp) { scalarStmt(op, a(0) + " | " + a(1)); })
+        .Case([&](arith::XOrIOp) { scalarStmt(op, a(0) + " ^ " + a(1)); })
         .Case([&](arith::MinSIOp) {
           scalarStmt(op, "(" + a(0) + " < " + a(1) + ") ? " + a(0) + " : " +
                              a(1));
@@ -545,11 +565,28 @@ private:
         });
   }
 
-  void emitFor(scf::ForOp f) {
-    if (!f.getInitArgs().empty()) {
-      fail(f, "loop-carried values are not supported by this translator yet");
+  /// The C++ type of a mutable local: a scalar is an int, whatever its width.
+  std::string varCpp(Type t) {
+    if (t.isInteger())
+      return "int";
+    return cpp(t);
+  }
+
+  /// `var = value;` for each yielded value that is not already the variable.
+  void assignYield(Block &b, ValueRange vars) {
+    auto y = dyn_cast<scf::YieldOp>(b.getTerminator());
+    if (!y)
       return;
-    }
+    for (auto [var, val] : llvm::zip(vars, y.getOperands()))
+      if (name(var) != name(val))
+        w(name(var) + " = " + name(val) + ";");
+  }
+
+  void emitFor(scf::ForOp f) {
+    // A loop-carried value is a mutable local declared in front of the loop;
+    // the body's block argument and the loop's result are the same local.
+    for (auto [arg, init] : llvm::zip(f.getRegionIterArgs(), f.getInitArgs()))
+      w(varCpp(arg.getType()) + " " + name(arg) + " = " + name(init) + ";");
     std::string n = name(f.getInductionVar());
     int64_t unroll = 1;
     if (auto u = f->getAttrOfType<IntegerAttr>(attrs::kUnroll))
@@ -572,15 +609,16 @@ private:
         " += " + step + ") {");
     indent++;
     emitBlock(*f.getBody());
+    assignYield(*f.getBody(), f.getRegionIterArgs());
     indent--;
     w("}");
   }
 
   void emitIf(scf::IfOp i) {
-    if (i.getNumResults()) {
-      fail(i, "a branch that yields values is not supported by this translator yet");
-      return;
-    }
+    // A branch result is a local declared in front of the branch and
+    // assigned at the end of each arm.
+    for (Value r : i.getResults())
+      w(varCpp(r.getType()) + " " + name(r) + ";");
     std::string c = name(i.getCondition());
     if (i->hasAttr(attrs::kOpaque)) {
       // The condition is `const int` everywhere else, and an "+v" operand has
@@ -594,12 +632,15 @@ private:
     w("if (" + c + ") {");
     indent++;
     emitBlock(i.getThenRegion().front());
+    assignYield(i.getThenRegion().front(), i.getResults());
     indent--;
     if (!i.getElseRegion().empty() &&
-        !i.getElseRegion().front().without_terminator().empty()) {
+        (!i.getElseRegion().front().without_terminator().empty() ||
+         i.getNumResults())) {
       w("} else {");
       indent++;
       emitBlock(i.getElseRegion().front());
+      assignYield(i.getElseRegion().front(), i.getResults());
       indent--;
     }
     w("}");

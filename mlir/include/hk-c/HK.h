@@ -21,6 +21,10 @@ MLIR_CAPI_EXPORTED MlirLogicalResult mlirHKTranslateKernelToCpp(
     MlirStringCallback callback, void *userData,
     MlirStringCallback errorCallback, void *errorUserData);
 
+/// The dialect's semantic version: bumped when what an hk module means, or
+/// the C++ hk-translate writes for it, changes. Part of the compile cache key.
+MLIR_CAPI_EXPORTED MlirStringRef mlirHKDialectVersion(void);
+
 /// One target's facts as "key=value" lines, for the test that keeps the C++
 /// table and python/hk/target in step. Empty for an unknown arch.
 MLIR_CAPI_EXPORTED void mlirHKTargetFacts(MlirStringRef arch,

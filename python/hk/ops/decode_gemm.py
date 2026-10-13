@@ -26,12 +26,9 @@ The warps' partial sums meet once, at the end, through LDS. X is read from
 global every round; it is a few hundred KB and stays in L2.
 """
 
-from __future__ import annotations
-
 from typing import Any, Dict, Optional, Tuple
 
-from .. import lang as _ops
-from ..lang import GL, kernel as _kernel
+from .. import dsl as hk
 from ..ir.nodes import bf16, fp32, i32
 from ..target import current_arch, get_target
 
@@ -67,11 +64,11 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
     kc = 16 * slices
     tgt = get_target(current_arch())
 
-    ty_w = _ops.rt(bf16, 16, kc, "row")
-    ty_x = _ops.rt(bf16, m_rows, kc, "row")
-    ty_acc = _ops.rt(fp32, 16, m_rows, "col")      # C^T: W rows x tokens
-    ty_out = _ops.rt(fp32, m_rows, 16, "row")      # its transpose
-    st_part = _ops.st(fp32, m_rows, 16)
+    ty_w = hk.RT(bf16, 16, kc, "row")
+    ty_x = hk.RT(bf16, m_rows, kc, "row")
+    ty_acc = hk.RT(fp32, 16, m_rows, "col")      # C^T: W rows x tokens
+    ty_out = hk.RT(fp32, m_rows, 16, "row")      # its transpose
+    st_part = hk.ST(fp32, m_rows, 16)
     in_flight = combine_depth or warps
 
     slots = warps
@@ -87,70 +84,67 @@ def decode_gemm_kernel(name: str, *, tokens: int = 1, slices: int = 4,
                 f"per workgroup; one may hold {tgt.lds_per_workgroup}, "
                 f"and a one-warp workgroup has no combine to size")
 
+    @hk.func
     def partial(x, w, k0, rounds, finish):
         """This workgroup's 16 W rows over K[k0 : k0 + rounds*kc*warps],
         combined across its warps; `finish` gets the result in warp 0."""
-        n0 = _ops.block_idx.x * 16
-        wid = _ops.warp_id()
-        acc = _ops.zeros(ty_acc)
-        for t in _ops.range(rounds):
+        n0 = hk.arch.block_idx.x * 16
+        wid = hk.arch.warp_id()
+        acc = hk.zeros(ty_acc)
+        for t in hk.range(rounds):
             k = k0 + (t * warps + wid) * kc
-            w_t = _ops.load(w, _ops.elem_coord(0, 0, n0, k), ty_w)
+            w_t = w[hk.elem_coord(0, 0, n0, k)].load(ty_w)
             # Bounded: X has the batch's M rows, not a padded 16*tokens, and
             # the rows past M read as zero instead of past its allocation.
-            x_t = _ops.load(x, _ops.elem_coord(0, 0, 0, k), ty_x, bounded=True)
-            _ops.mma_ABt(w_t, x_t, acc, out=acc)
+            x_t = x[hk.elem_coord(0, 0, 0, k)].load(ty_x, bounded=True)
+            acc += w_t @ x_t.T
 
-        out = _ops.transpose(acc)
+        out = hk.transpose(acc)
         if warps > 1:
-            parts = _ops.alloc_shared(st_part, count=slots, name="parts")
-            _ops.store_shared(_ops.shared_at(parts, wid), out)
-            _ops.barrier(drain=True)
-            with _ops.if_(_ops.s_eq(wid, 0)):
+            parts = hk.lds.alloc(st_part, count=slots, name="parts")
+            parts[wid].store(out)
+            hk.arch.barrier(drain=True)
+            if wid == 0:
                 for i in range(1, warps):
                     if i > 1 and (i - 1) % in_flight == 0:
-                        _ops.sched_barrier()
-                    other = _ops.load_shared(_ops.shared_at(parts, i), ty_out)
-                    _ops.add(out, other, out=out)
+                        hk.arch.sched_barrier()
+                    out += parts[i].load(ty_out)
                 finish(out, n0)
         else:
             finish(out, n0)
 
-    def body(x, w, c):
+    def body(x: hk.Tensor[bf16], w: hk.Tensor[bf16], c: hk.Tensor[bf16]):
         def finish(out, n0):
-            _ops.store(c, out, _ops.elem_coord(0, 0, 0, n0), bounded=True)
-        partial(x, w, 0, _ops.cols(x) // (kc * warps), finish)
+            c[hk.elem_coord(0, 0, 0, n0)].store(out, bounded=True)
 
-    def body_split(x, w, c, ws, cnt):
-        s = _ops.block_idx.y
-        per = _ops.cols(x) // splits
+        partial(x, w, 0, x.cols // (kc * warps), finish)
+
+    def body_split(x: hk.Tensor[bf16], w: hk.Tensor[bf16], c: hk.Tensor[bf16],
+                   ws: hk.Tensor[fp32], cnt: hk.Tensor[i32]):
+        s = hk.arch.block_idx.y
+        per = x.cols // splits
 
         def finish(out, n0):
-            _ops.store(ws, out, _ops.elem_coord(0, s, 0, n0))
+            ws[hk.elem_coord(0, s, 0, n0)] = out
+
         partial(x, w, s * per, per // (kc * warps), finish)
 
-        arrived = _ops.wg_arrive(cnt, _ops.elem_coord(0, 0, 0, _ops.block_idx.x), splits)
-        with _ops.if_(_ops.s_eq(arrived, splits - 1)):
-            with _ops.if_(_ops.s_eq(_ops.warp_id(), 0)):
-                n0 = _ops.block_idx.x * 16
-                total = _ops.zeros(ty_out)
+        arrived = hk.arch.wg_arrive(cnt[hk.elem_coord(0, 0, 0, hk.arch.block_idx.x)],
+                                    splits)
+        if arrived == splits - 1:
+            if hk.arch.warp_id() == 0:
+                n0 = hk.arch.block_idx.x * 16
+                total = hk.zeros(ty_out)
                 for j in range(splits):
-                    p = _ops.load(ws, _ops.elem_coord(0, j, 0, n0), ty_out)
-                    _ops.add(total, p, out=total)
-                _ops.store(c, total, _ops.elem_coord(0, 0, 0, n0), bounded=True)
+                    total += ws[hk.elem_coord(0, j, 0, n0)].load(ty_out)
+                c[hk.elem_coord(0, 0, 0, n0)].store(total, bounded=True)
 
-    if splits == 1:
-        fn = body
-        fn.__annotations__ = {"x": GL[bf16], "w": GL[bf16], "c": GL[bf16]}
-    else:
-        fn = body_split
-        fn.__annotations__ = {"x": GL[bf16], "w": GL[bf16], "c": GL[bf16],
-                              "ws": GL[fp32], "cnt": GL[i32]}
+    fn = body if splits == 1 else body_split
     fn.__name__ = name
 
-    return _kernel(fn, warps=warps, name=name,
-                   grid=lambda p: (p.w.rows // 16, splits, 1),
-                   max_vgprs=max_vgprs, min_occupancy=min_occupancy)
+    return hk.kernel(fn, warps=warps, name=name,
+                     grid=lambda p: (p.w.rows // 16, splits, 1),
+                     max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 
 
 #: Per token-tile count, measured on Qwen3-8B's decode shapes, timed as a

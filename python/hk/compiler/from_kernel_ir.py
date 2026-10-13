@@ -125,55 +125,19 @@ class _Converter:
 
     def module(self) -> ir.Module:
         kir = self.kir
+        tensors = [p for p in kir.params if isinstance(p.type, GlobalType)]
         with M.context(), ir.Location.unknown():
-            mod = ir.Module.create()
-            tensors = [p for p in kir.params if isinstance(p.type, GlobalType)]
-            arg_types = [mlir_type(p.type) for p in tensors]
-            arg_attrs = ir.ArrayAttr.get([
-                ir.DictAttr.get({"hk.name": ir.StringAttr.get(p.name)})
-                for p in tensors])
-            with ir.InsertionPoint(mod.body):
-                f = func.FuncOp(kir.name, (arg_types, []))
-                f.arg_attrs = arg_attrs
-                f.attributes["hk.kernel"] = ir.UnitAttr.get()
-                f.attributes["hk.arch"] = ir.StringAttr.get(kir.arch)
-                f.attributes["hk.warps"] = ir.IntegerAttr.get(
-                    ir.IntegerType.get_signless(64), kir.warps)
-                f.attributes["hk.consts"] = ir.DictAttr.get(
-                    {k: _const_attr(v) for k, v in kir.consts.items()})
-                entry = f.add_entry_block()
-                for p, a in zip(tensors, entry.arguments):
-                    self.vals[("param", p.name)] = a
-                with ir.InsertionPoint(entry):
-                    self.region(kir.body)
-                    func.ReturnOp([])
-                self.grid(tensors, arg_types, arg_attrs)
+            mod, f, entry = begin_kernel(kir.name, kir.arch, kir.warps,
+                                         kir.consts,
+                                         [(p.name, p.type) for p in tensors])
+            for p, a in zip(tensors, entry.arguments):
+                self.vals[("param", p.name)] = a
+            with ir.InsertionPoint(entry):
+                self.region(kir.body)
+                func.ReturnOp([])
+            build_grid(mod, kir.name, [(p.name, p.type) for p in tensors],
+                       kir.grid)
         return mod
-
-    def grid(self, tensors, arg_types, arg_attrs) -> None:
-        i32 = ir.IntegerType.get_signless(32)
-        g = func.FuncOp(f"{self.kir.name}__grid", (arg_types, [i32] * 3))
-        g.arg_attrs = arg_attrs
-        g.attributes["hk.grid_of"] = ir.FlatSymbolRefAttr.get(self.kir.name)
-        entry = g.add_entry_block()
-        args = {p.name: a for p, a in zip(tensors, entry.arguments)}
-
-        def expr(e):
-            if isinstance(e, int):
-                e = host.HostConst(e)
-            if isinstance(e, host.HostConst):
-                return arith.ConstantOp(i32, e.value).result
-            if isinstance(e, host.HostDim):
-                return hkd.ExtentOp(i32, args[e.tensor],
-                                    getattr(hkd.Extent, e.dim)).result
-            if isinstance(e, host.HostBin):
-                cls = getattr(arith, _HOST_ARITH[e.op])
-                return cls(expr(e.lhs), expr(e.rhs)).result
-            raise TypeError(f"grid dimension {e!r}")
-
-        with ir.InsertionPoint(entry):
-            dims = [expr(d) for d in self.kir.grid]
-            func.ReturnOp(dims)
 
     # -- ops ----------------------------------------------------------
 
@@ -364,9 +328,60 @@ class _Converter:
             scf.YieldOp([])
 
 
+def begin_kernel(name: str, arch: str, warps: int, consts: dict, tensors):
+    """A module holding an empty kernel func: one argument per (name, type)
+    tensor, the hk.* attributes set. Returns (module, func, entry block)."""
+    mod = ir.Module.create()
+    arg_types = [mlir_type(ty) for _, ty in tensors]
+    arg_attrs = ir.ArrayAttr.get([
+        ir.DictAttr.get({"hk.name": ir.StringAttr.get(n)}) for n, _ in tensors])
+    with ir.InsertionPoint(mod.body):
+        f = func.FuncOp(name, (arg_types, []))
+        f.arg_attrs = arg_attrs
+        f.attributes["hk.kernel"] = ir.UnitAttr.get()
+        f.attributes["hk.arch"] = ir.StringAttr.get(arch)
+        f.attributes["hk.warps"] = ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(64), warps)
+        f.attributes["hk.consts"] = ir.DictAttr.get(
+            {k: _const_attr(v) for k, v in consts.items()})
+        entry = f.add_entry_block(arg_locs=[ir.Location.name(n) for n, _ in tensors])
+    return mod, f, entry
+
+
+def build_grid(mod: ir.Module, name: str, tensors, dims) -> None:
+    """`<name>__grid`: the launch grid as a host function of the tensors,
+    built from the grid lambda's host expressions."""
+    i32 = ir.IntegerType.get_signless(32)
+    arg_types = [mlir_type(ty) for _, ty in tensors]
+    arg_attrs = ir.ArrayAttr.get([
+        ir.DictAttr.get({"hk.name": ir.StringAttr.get(n)}) for n, _ in tensors])
+    with ir.InsertionPoint(mod.body):
+        g = func.FuncOp(f"{name}__grid", (arg_types, [i32] * 3))
+    g.arg_attrs = arg_attrs
+    g.attributes["hk.grid_of"] = ir.FlatSymbolRefAttr.get(name)
+    entry = g.add_entry_block()
+    args = {n: a for (n, _), a in zip(tensors, entry.arguments)}
+
+    def expr(e):
+        if isinstance(e, int):
+            e = host.HostConst(e)
+        if isinstance(e, host.HostConst):
+            return arith.ConstantOp(i32, e.value).result
+        if isinstance(e, host.HostDim):
+            return hkd.ExtentOp(i32, args[e.tensor],
+                                getattr(hkd.Extent, e.dim)).result
+        if isinstance(e, host.HostBin):
+            cls = getattr(arith, _HOST_ARITH[e.op])
+            return cls(expr(e.lhs), expr(e.rhs)).result
+        raise TypeError(f"grid dimension {e!r}")
+
+    with ir.InsertionPoint(entry):
+        func.ReturnOp([expr(d) for d in dims])
+
+
 def convert(kir: KernelIR) -> ir.Module:
     """`kir` as an hk module: the kernel func and its grid func."""
     return _Converter(kir).module()
 
 
-__all__ = ["convert", "mlir_type"]
+__all__ = ["convert", "mlir_type", "begin_kernel", "build_grid"]

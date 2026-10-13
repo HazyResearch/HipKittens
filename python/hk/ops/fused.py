@@ -32,15 +32,10 @@ consequence is a real constraint, stated in the wrapper: D/2 must be a multiple
 of the tile width.
 """
 
-from __future__ import annotations
-
 from functools import lru_cache as _lru_cache
 
+from .. import dsl as hk
 from ..ir.nodes import bf16, fp16, fp32
-from ..lang import ops as _ops
-from ..lang.host import cdiv
-from ..lang.kernel import GL
-from ..lang.kernel import kernel as _kernel
 
 ROWS, COLS = 16, 64
 
@@ -63,22 +58,24 @@ def _start(idx, block: int, extent):
     the backed-up overlap is recomputed to the same answer and written twice
     with the same bytes.
     """
-    return _ops.s_min(_ops.s_mul(idx, block), _ops.s_sub(extent, block))
+    return hk.min(idx * block, extent - block)
 
 
 def _silu_mul_grid(p):
-    return (cdiv(p.o.cols, p.COLS * p.WARPS * p.TILES), cdiv(p.o.rows, p.ROWS), 1)
+    return (hk.cdiv(p.o.cols, p.COLS * p.WARPS * p.TILES),
+            hk.cdiv(p.o.rows, p.ROWS), 1)
 
 
 def _silu_mul_kernel(name: str, dtype, warps: int):
-    def body(a, b, o, *, ROWS=ROWS, COLS=COLS, WARPS=warps, TILES=1):
+    def body(a: hk.Tensor[dtype], b: hk.Tensor[dtype], o: hk.Tensor[dtype], *,
+             ROWS=ROWS, COLS=COLS, WARPS=warps, TILES=1):
         # fp32 throughout: base_ops::silu is specialised for float only, and
         # the load converts on the way in for free, so there is nothing to pay
         # for the extra precision but register width.
-        t = _ops.rt(fp32, ROWS, COLS)
-        ncols = _ops.cols(o)
-        row_lo = _start(_ops.block_idx.y, ROWS, _ops.rows(o))
-        base = _ops.s_mul(_ops.block_idx.x, WARPS * TILES)
+        t = hk.RT(fp32, ROWS, COLS)
+        ncols = o.cols
+        row_lo = _start(hk.arch.block_idx.y, ROWS, o.rows)
+        base = hk.arch.block_idx.x * (WARPS * TILES)
 
         def block_of(i):
             """The column block warp `warp_id` covers at step `i`.
@@ -87,25 +84,24 @@ def _silu_mul_kernel(name: str, dtype, warps: int):
             WARPS adjacent blocks, one contiguous run, rather than WARPS places
             a group apart.
             """
-            cb = _ops.s_add(base, i * WARPS) if i else base
-            return _ops.s_add(cb, _ops.warp_id()) if WARPS > 1 else cb
+            cb = base + i * WARPS if i else base
+            return cb + hk.arch.warp_id() if WARPS > 1 else cb
 
-        idx = [_ops.elem_coord(0, 0, row_lo, _start(block_of(i), COLS, ncols))
+        idx = [hk.elem_coord(0, 0, row_lo, _start(block_of(i), COLS, ncols))
                for i in range(TILES)]
         # Both loads of every tile before any of the arithmetic. Written this
         # way rather than as a load/compute/store per tile so that the loads
         # are adjacent in the generated C++ and the scheduler has TILES*2
         # outstanding, not one.
-        xs = [_ops.load(a, i, t) for i in idx]
-        bs = [_ops.load(b, i, t) for i in idx]
+        xs = [a[i].load(t) for i in idx]
+        bs = [b[i].load(t) for i in idx]
         for x, bv, i in zip(xs, bs, idx):
-            _ops.silu(x, out=x)
-            _ops.mul(x, bv, out=x)
-            _ops.store(o, _ops.cast(x, dtype), i)
+            x.silu(into=x)
+            x *= bv
+            o[i] = x.to(dtype)
 
     body.__name__ = name
-    body.__annotations__ = {"a": GL[dtype], "b": GL[dtype], "o": GL[dtype]}
-    return _kernel(body, warps=warps, grid=_silu_mul_grid, name=name)
+    return hk.kernel(body, warps=warps, grid=_silu_mul_grid, name=name)
 
 
 # ---------------------------------------------------------------- rope
@@ -115,7 +111,7 @@ def _rope_grid(p):
     # x is (bh, 1, seq, D); one workgroup per (half-head column block, row
     # block, bh). The column axis only covers D/2 because each workgroup
     # handles a pair of columns j and j + D/2.
-    return (p.HALF // p.COLS, cdiv(p.x.rows, p.ROWS), p.x.batch)
+    return (p.HALF // p.COLS, hk.cdiv(p.x.rows, p.ROWS), p.x.batch)
 
 
 def _rope_kernel(name: str, dtype, half: int):
@@ -130,31 +126,29 @@ def _rope_kernel(name: str, dtype, half: int):
     broadcast along an axis x is not.
     """
 
-    def body(x, cos, sin, o, *, ROWS=ROWS, COLS=COLS, HALF=half):
-        t = _ops.rt(fp32, ROWS, COLS)
-        bh = _ops.block_idx.z
-        r = _ops.block_idx.y
-        c = _ops.block_idx.x
+    def body(x: hk.Tensor[dtype], cos: hk.Tensor[fp32], sin: hk.Tensor[fp32],
+             o: hk.Tensor[dtype], *, ROWS=ROWS, COLS=COLS, HALF=half):
+        t = hk.RT(fp32, ROWS, COLS)
+        bh = hk.arch.block_idx.z
+        r = hk.arch.block_idx.y
+        c = hk.arch.block_idx.x
         # The second half is HALF/COLS tiles further along the row.
-        c2 = _ops.s_add(c, HALF // COLS)
+        c2 = c + HALF // COLS
 
-        lo = _ops.tile_coord(bh, 0, r, c)
-        hi = _ops.tile_coord(bh, 0, r, c2)
-        ang = _ops.tile_coord(0, 0, r, c)
+        lo = hk.tile_coord(bh, 0, r, c)
+        hi = hk.tile_coord(bh, 0, r, c2)
+        ang = hk.tile_coord(0, 0, r, c)
 
-        xl = _ops.load(x, lo, t)
-        xh = _ops.load(x, hi, t)
-        cs = _ops.load(cos, ang, t)
-        sn = _ops.load(sin, ang, t)
+        xl = x[lo].load(t)
+        xh = x[hi].load(t)
+        cs = cos[ang].load(t)
+        sn = sin[ang].load(t)
 
-        _ops.store(o, _ops.cast(_ops.sub(_ops.mul(xl, cs), _ops.mul(xh, sn)), dtype), lo)
-        _ops.store(o, _ops.cast(_ops.add(_ops.mul(xh, cs), _ops.mul(xl, sn)), dtype), hi)
+        o[lo] = (xl * cs - xh * sn).to(dtype)
+        o[hi] = (xh * cs + xl * sn).to(dtype)
 
     body.__name__ = name
-    body.__annotations__ = {
-        "x": GL[dtype], "cos": GL[fp32], "sin": GL[fp32], "o": GL[dtype],
-    }
-    return _kernel(body, warps=1, grid=_rope_grid, name=name)
+    return hk.kernel(body, warps=1, grid=_rope_grid, name=name)
 
 
 _DTYPES = {"bf16": bf16, "fp16": fp16, "fp32": fp32}

@@ -15,6 +15,10 @@
 
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(HK, hk, mlir::hk::HKDialect)
 
+MlirStringRef mlirHKDialectVersion(void) {
+  return mlirStringRefCreateFromCString("hk-dialect-1");
+}
+
 void mlirHKRegisterPasses(void) {
   static std::once_flag once;
   std::call_once(once, [] {

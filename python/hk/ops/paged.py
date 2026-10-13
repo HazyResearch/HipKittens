@@ -30,13 +30,10 @@ no prefill. Both are measurable next steps rather than guesses -- see
 `python/README.md`.
 """
 
-from __future__ import annotations
-
 import math
 from typing import Dict, Optional
 
-from .. import lang as _ops
-from ..lang import GL, const, kernel as _kernel
+from .. import dsl as hk
 from ..ir.nodes import bf16, fp32, i32
 
 #: The cache's page size. Also the kernel's KV block, by construction.
@@ -74,74 +71,72 @@ def paged_decode_kernel(name: str, *, head_dim: int = 128,
     # rather than to Q -- Q is bf16 and scaling it would round the input twice.
     scale_l2e = (scale if scale is not None else head_dim ** -0.5) * math.log2(math.e)
 
-    ty_q = _ops.rt(bf16, 16, 16, "row")        # one d-slice of the Q group
-    ty_k = _ops.rt(bf16, 16, 16, "row")        # one [kv, d] fragment of a page
-    ty_s = _ops.rt(fp32, 16, Q_TILE, "col")    # one [kv, q] fragment of S^T
-    ty_o = _ops.rt(fp32, 16, Q_TILE, "col")    # one [d, q] fragment of O^T
-    ty_v = _ops.rt(bf16, 16, 16, "row")        # a [kv, d] fragment of V
-    ty_vt = _ops.rt(bf16, 16, 16, "row")       # the same, transposed
-    ty_vec = _ops.row_vec(ty_s)                # one entry per query row
+    ty_q = hk.RT(bf16, 16, 16, "row")        # one d-slice of the Q group
+    ty_k = hk.RT(bf16, 16, 16, "row")        # one [kv, d] fragment of a page
+    ty_s = hk.RT(fp32, 16, Q_TILE, "col")    # one [kv, q] fragment of S^T
+    ty_o = hk.RT(fp32, 16, Q_TILE, "col")    # one [d, q] fragment of O^T
+    ty_v = hk.RT(bf16, 16, 16, "row")        # a [kv, d] fragment of V
+    ty_vt = hk.RT(bf16, 16, 16, "row")       # the same, transposed
+    ty_vec = hk.row_vec(ty_s)                # one entry per query row
 
-    def body(q, k_cache, v_cache, block_table, seq_lens, o):
-        req = _ops.block_idx.z
-        kv_head = _ops.block_idx.y
+    def body(q: hk.Tensor[bf16], k_cache: hk.Tensor[bf16], v_cache: hk.Tensor[bf16],
+             block_table: hk.Tensor[i32], seq_lens: hk.Tensor[i32],
+             o: hk.Tensor[bf16]):
+        req = hk.arch.block_idx.z
+        kv_head = hk.arch.block_idx.y
 
         # The only two numbers that are not in the shapes: how long this
         # request is, and where its pages are. Both come out of memory.
-        seq_len = _ops.load_scalar(seq_lens, _ops.elem_coord(0, 0, 0, req))
-        n_pages = _ops.s_cdiv(seq_len, kv_block)
+        seq_len = seq_lens[hk.elem_coord(0, 0, 0, req)].load_scalar()
+        n_pages = hk.cdiv(seq_len, kv_block)
 
-        q_r = [_ops.load(q, _ops.elem_coord(req, kv_head, 0, 16 * kk), ty_q)
+        q_r = [q[hk.elem_coord(req, kv_head, 0, 16 * kk)].load(ty_q)
                for kk in range(d_frags)]
 
-        o_c = [_ops.zeros(ty_o) for _ in range(d_frags)]
-        m_run = _ops.neg_infty_vec(ty_vec)
-        l_run = _ops.zeros_vec(ty_vec)
+        o_c = [hk.zeros(ty_o) for _ in range(d_frags)]
+        m_run = hk.neg_infty(ty_vec)
+        l_run = hk.zeros(ty_vec)
 
-        for pi in _ops.range(n_pages):
-            page = _ops.load_scalar(block_table, _ops.elem_coord(0, 0, req, pi))
+        for pi in range(n_pages):
+            page = block_table[hk.elem_coord(0, 0, req, pi)].load_scalar()
 
-            with _ops.scope():
+            with hk.scope():
                 # S^T = K . Q^T, one [kv, d] fragment of the page at a time.
-                s_f = [_ops.zeros(ty_s) for _ in range(kv_frags)]
+                s_f = [hk.zeros(ty_s) for _ in range(kv_frags)]
                 for kk in range(d_frags):
                     for n in range(kv_frags):
-                        with _ops.scope():
-                            k_f = _ops.load(
-                                k_cache,
-                                _ops.elem_coord(page, kv_head, 16 * n,
-                                                16 * kk),
-                                ty_k)
-                            _ops.mma_ABt(k_f, q_r[kk], s_f[n], out=s_f[n])
+                        with hk.scope():
+                            k_f = k_cache[hk.elem_coord(page, kv_head, 16 * n,
+                                                        16 * kk)].load(ty_k)
+                            s_f[n] += k_f @ q_r[kk].T
 
                 for n in range(kv_frags):
-                    _ops.mul(s_f[n], scale_l2e, out=s_f[n])
+                    s_f[n] *= scale_l2e
 
                 # The tail. A row of S^T is a kv index, so positions at or past
                 # the sequence length are rows to fill -- not a predicate, and
                 # not a backed-up block either: pages are allocated whole and
                 # the slots past the end hold whatever the allocator left.
                 # Counting them would corrupt the softmax sum.
-                valid = _ops.s_sub(seq_len, pi * kv_block)
-                with _ops.if_(_ops.s_lt(valid, kv_block)):
+                valid = seq_len - pi * kv_block
+                if valid < kv_block:
                     for n in range(kv_frags):
-                        _ops.lower_fill(s_f[n], _ops.s_sub(valid, 16 * n),
-                                        NEG_INF, out=s_f[n])
+                        s_f[n].lower_fill_(valid - 16 * n, NEG_INF)
 
                 # ---- online softmax, the dense kernel's, unchanged ----
-                m_old = _ops.copy(m_run)
+                m_old = m_run.copy()
                 for n in range(kv_frags):
-                    _ops.col_max(s_f[n], out=m_run, accumulate=True)
+                    m_run.max_(s_f[n].max(axis=0))
                 for n in range(kv_frags):
-                    _ops.sub_col(s_f[n], m_run, out=s_f[n])
-                    _ops.exp2(s_f[n], out=s_f[n])
-                with _ops.if_(_ops.s_any_ne(m_run, m_old)):
-                    alpha = _ops.exp2(_ops.sub(m_old, m_run))
-                    _ops.mul(l_run, alpha, out=l_run)
+                    s_f[n] -= m_run
+                    s_f[n].exp2_()
+                if m_run.any_ne(m_old):
+                    alpha = (m_old - m_run).exp2()
+                    l_run *= alpha
                     for c in o_c:
-                        _ops.mul_col(c, alpha, out=c)
+                        c *= alpha
                 for n in range(kv_frags):
-                    _ops.col_sum(s_f[n], out=l_run, accumulate=True)
+                    l_run += s_f[n].sum(axis=0)
 
                 # ---- O^T += V^T . P^T ----
                 # V arrives [kv, d] and the matmul reads [d, kv], so each
@@ -149,36 +144,26 @@ def paged_decode_kernel(name: str, *, head_dim: int = 128,
                 # warp there is nobody to share a staged copy with, so it does
                 # not go through LDS at all.
                 for n in range(kv_frags):
-                    p_cvt = _ops.cast(s_f[n], bf16)
+                    p_cvt = s_f[n].to(bf16)
                     for g0 in range(d_frags):
                         # One V fragment live at a time. Without the scope the
                         # allocator keeps all d_frags loads in flight -- eight
                         # at head_dim 128 -- on top of the O and Q tiles that
                         # are pinned for the whole kernel, and that is exactly
                         # the register file.
-                        with _ops.scope():
-                            v_f = _ops.load(
-                                v_cache,
-                                _ops.elem_coord(page, kv_head, 16 * n, 16 * g0),
-                                ty_v)
-                            _ops.mma_AB(_ops.transpose_sep(v_f), p_cvt,
-                                        o_c[g0], out=o_c[g0])
+                        with hk.scope():
+                            v_f = v_cache[hk.elem_coord(page, kv_head, 16 * n,
+                                                        16 * g0)].load(ty_v)
+                            o_c[g0] += hk.transpose_sep(v_f) @ p_cvt
 
         for i, c in enumerate(o_c):
-            _ops.div_col(c, l_run, out=c)
-            _ops.store(o, _ops.transpose(c),
-                       _ops.elem_coord(req, kv_head, 0, 16 * i))
+            c /= l_run
+            o[hk.elem_coord(req, kv_head, 0, 16 * i)] = hk.transpose(c)
 
     body.__name__ = name
-    # Set rather than written in the signature, because the dtypes differ by
-    # parameter and PEP 563 would make them strings resolved in this module.
-    body.__annotations__ = {
-        "q": GL[bf16], "k_cache": GL[bf16], "v_cache": GL[bf16],
-        "block_table": GL[i32], "seq_lens": GL[i32], "o": GL[bf16],
-    }
-    return _kernel(body, warps=1, name=name,
-                   grid=lambda p: (1, p.q.depth, p.q.batch),
-                   max_vgprs=max_vgprs, min_occupancy=min_occupancy)
+    return hk.kernel(body, warps=1, name=name,
+                     grid=lambda p: (1, p.q.depth, p.q.batch),
+                     max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 
 
 def paged_decode_split_kernel(name: str, *, head_dim: int = 128,
@@ -210,99 +195,88 @@ def paged_decode_split_kernel(name: str, *, head_dim: int = 128,
     d_frags, kv_frags = head_dim // 16, kv_block // 16
     scale_l2e = (scale if scale is not None else head_dim ** -0.5) * math.log2(math.e)
 
-    ty_q = _ops.rt(bf16, 16, 16, "row")
-    ty_k = _ops.rt(bf16, 16, 16, "row")
-    ty_s = _ops.rt(fp32, 16, Q_TILE, "col")
-    ty_o = _ops.rt(fp32, 16, Q_TILE, "col")
-    ty_v = _ops.rt(bf16, 16, 16, "row")
-    ty_vec = _ops.row_vec(ty_s)
+    ty_q = hk.RT(bf16, 16, 16, "row")
+    ty_k = hk.RT(bf16, 16, 16, "row")
+    ty_s = hk.RT(fp32, 16, Q_TILE, "col")
+    ty_o = hk.RT(fp32, 16, Q_TILE, "col")
+    ty_v = hk.RT(bf16, 16, 16, "row")
+    ty_vec = hk.row_vec(ty_s)
 
-    def body(q, k_cache, v_cache, block_table, seq_lens, o_part, ml_part):
-        split = _ops.block_idx.x
-        kv_head = _ops.block_idx.y
-        req = _ops.block_idx.z
+    def body(q: hk.Tensor[bf16], k_cache: hk.Tensor[bf16], v_cache: hk.Tensor[bf16],
+             block_table: hk.Tensor[i32], seq_lens: hk.Tensor[i32],
+             o_part: hk.Tensor[fp32], ml_part: hk.Tensor[fp32]):
+        split = hk.arch.block_idx.x
+        kv_head = hk.arch.block_idx.y
+        req = hk.arch.block_idx.z
 
-        seq_len = _ops.load_scalar(seq_lens, _ops.elem_coord(0, 0, 0, req))
-        n_pages = _ops.s_cdiv(seq_len, kv_block)
-        per = _ops.s_cdiv(n_pages, splits)
+        seq_len = seq_lens[hk.elem_coord(0, 0, 0, req)].load_scalar()
+        n_pages = hk.cdiv(seq_len, kv_block)
+        per = hk.cdiv(n_pages, splits)
         lo = split * per
-        hi = _ops.s_min(n_pages, lo + per)
+        hi = hk.min(n_pages, lo + per)
 
-        q_r = [_ops.load(q, _ops.elem_coord(req, kv_head, 0, 16 * kk), ty_q)
+        q_r = [q[hk.elem_coord(req, kv_head, 0, 16 * kk)].load(ty_q)
                for kk in range(d_frags)]
-        o_c = [_ops.zeros(ty_o) for _ in range(d_frags)]
-        m_run = _ops.neg_infty_vec(ty_vec)
-        l_run = _ops.zeros_vec(ty_vec)
+        o_c = [hk.zeros(ty_o) for _ in range(d_frags)]
+        m_run = hk.neg_infty(ty_vec)
+        l_run = hk.zeros(ty_vec)
 
         # A split past the end of a short sequence contributes nothing. It
         # still has to write, because the merge reads every split's slot --
         # m = -inf and l = 0 make it weightless there.
-        for pi in _ops.range(_ops.s_max(hi - lo, 0)):
-            page = _ops.load_scalar(block_table,
-                                    _ops.elem_coord(0, 0, req, lo + pi))
-            with _ops.scope():
-                s_f = [_ops.zeros(ty_s) for _ in range(kv_frags)]
+        for pi in range(hk.max(hi - lo, 0)):
+            page = block_table[hk.elem_coord(0, 0, req, lo + pi)].load_scalar()
+            with hk.scope():
+                s_f = [hk.zeros(ty_s) for _ in range(kv_frags)]
                 for kk in range(d_frags):
                     for n in range(kv_frags):
-                        with _ops.scope():
-                            k_f = _ops.load(
-                                k_cache,
-                                _ops.elem_coord(page, kv_head, 16 * n,
-                                                16 * kk), ty_k)
-                            _ops.mma_ABt(k_f, q_r[kk], s_f[n], out=s_f[n])
+                        with hk.scope():
+                            k_f = k_cache[hk.elem_coord(page, kv_head, 16 * n,
+                                                        16 * kk)].load(ty_k)
+                            s_f[n] += k_f @ q_r[kk].T
                 for n in range(kv_frags):
-                    _ops.mul(s_f[n], scale_l2e, out=s_f[n])
+                    s_f[n] *= scale_l2e
 
-                valid = _ops.s_sub(seq_len, (lo + pi) * kv_block)
-                with _ops.if_(_ops.s_lt(valid, kv_block)):
+                valid = seq_len - (lo + pi) * kv_block
+                if valid < kv_block:
                     for n in range(kv_frags):
-                        _ops.lower_fill(s_f[n], _ops.s_sub(valid, 16 * n),
-                                        NEG_INF, out=s_f[n])
+                        s_f[n].lower_fill_(valid - 16 * n, NEG_INF)
 
-                m_old = _ops.copy(m_run)
+                m_old = m_run.copy()
                 for n in range(kv_frags):
-                    _ops.col_max(s_f[n], out=m_run, accumulate=True)
+                    m_run.max_(s_f[n].max(axis=0))
                 for n in range(kv_frags):
-                    _ops.sub_col(s_f[n], m_run, out=s_f[n])
-                    _ops.exp2(s_f[n], out=s_f[n])
-                with _ops.if_(_ops.s_any_ne(m_run, m_old)):
-                    alpha = _ops.exp2(_ops.sub(m_old, m_run))
-                    _ops.mul(l_run, alpha, out=l_run)
+                    s_f[n] -= m_run
+                    s_f[n].exp2_()
+                if m_run.any_ne(m_old):
+                    alpha = (m_old - m_run).exp2()
+                    l_run *= alpha
                     for c in o_c:
-                        _ops.mul_col(c, alpha, out=c)
+                        c *= alpha
                 for n in range(kv_frags):
-                    _ops.col_sum(s_f[n], out=l_run, accumulate=True)
+                    l_run += s_f[n].sum(axis=0)
 
                 for n in range(kv_frags):
-                    p_cvt = _ops.cast(s_f[n], bf16)
+                    p_cvt = s_f[n].to(bf16)
                     for g0 in range(d_frags):
-                        with _ops.scope():
-                            v_f = _ops.load(
-                                v_cache,
-                                _ops.elem_coord(page, kv_head, 16 * n,
-                                                16 * g0), ty_v)
-                            _ops.mma_AB(_ops.transpose_sep(v_f), p_cvt,
-                                        o_c[g0], out=o_c[g0])
+                        with hk.scope():
+                            v_f = v_cache[hk.elem_coord(page, kv_head, 16 * n,
+                                                        16 * g0)].load(ty_v)
+                            o_c[g0] += hk.transpose_sep(v_f) @ p_cvt
 
         # Unnormalised. The merge divides once, by the sum of the rescaled
         # per-split sums; dividing here would throw away the only thing that
         # makes the splits combinable.
         row = req * splits + split
         for i, c in enumerate(o_c):
-            _ops.store(o_part, _ops.transpose(c),
-                       _ops.elem_coord(row, kv_head, 0, 16 * i))
-        _ops.store(ml_part, m_run, _ops.elem_coord(row, kv_head, 0, 0))
-        _ops.store(ml_part, l_run, _ops.elem_coord(row, kv_head, 1, 0))
+            o_part[hk.elem_coord(row, kv_head, 0, 16 * i)] = hk.transpose(c)
+        ml_part[hk.elem_coord(row, kv_head, 0, 0)] = m_run
+        ml_part[hk.elem_coord(row, kv_head, 1, 0)] = l_run
 
     body.__name__ = name
-    body.__annotations__ = {
-        "q": GL[bf16], "k_cache": GL[bf16], "v_cache": GL[bf16],
-        "block_table": GL[i32], "seq_lens": GL[i32],
-        "o_part": GL[fp32], "ml_part": GL[fp32],
-    }
-    return _kernel(body, warps=1, name=name,
-                   grid=lambda p: (splits, p.q.depth, p.q.batch),
-                   max_vgprs=max_vgprs, min_occupancy=min_occupancy)
+    return hk.kernel(body, warps=1, name=name,
+                     grid=lambda p: (splits, p.q.depth, p.q.batch),
+                     max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 
 
 def merge_splits(o_part, ml_part, splits: int, out):

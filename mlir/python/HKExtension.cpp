@@ -44,6 +44,11 @@ NB_MODULE(_hkDialects, m) {
       nb::arg("context").none() = nb::none(), nb::arg("load") = true,
       "Register (and load) hk, arith, scf and func in a context.");
 
+  hk.def("dialect_version", []() {
+    MlirStringRef v = mlirHKDialectVersion();
+    return std::string(v.data, v.length);
+  }, "The dialect's semantic version, part of the compile cache key.");
+
   hk.def("register_passes", []() { mlirHKRegisterPasses(); },
          "Register the hk passes and hk-kernel-pipeline.");
 

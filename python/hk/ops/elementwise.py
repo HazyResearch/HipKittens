@@ -12,17 +12,13 @@ which reads garbage rather than failing, so `_as_2d` refuses that shape instead
 of masking it. Bounds-checked tails come with the reductions in Phase 2.
 """
 
-from __future__ import annotations
 
 from functools import lru_cache as _lru_cache
 
 from typing import Any, Tuple
 
-from ..ir.nodes import bf16, fp16, fp32
-from ..lang import ops as _ops
-from ..lang.host import cdiv
-from ..lang.kernel import GL
-from ..lang.kernel import kernel as _kernel
+from .. import dsl as hk
+from ..dsl.values import _FP32_ONLY
 
 #: Tile the elementwise kernels work in. 16x64 is 4 base tiles: 32 VGPRs for a
 #: bf16 tile on gfx1100, so three live tiles sit nowhere near the granule
@@ -32,7 +28,15 @@ ROWS, COLS = 16, 64
 
 
 def _grid(p):
-    return (cdiv(p.o.cols, p.COLS), cdiv(p.o.rows, p.ROWS), 1)
+    return (hk.cdiv(p.o.cols, p.COLS), hk.cdiv(p.o.rows, p.ROWS), 1)
+
+
+#: op -> what it does to two tiles, or to one.
+_BINARY_FN = {"add": lambda x, y: x + y, "sub": lambda x, y: x - y,
+              "mul": lambda x, y: x * y, "max": hk.max, "min": hk.min}
+_UNARY_FN = {"exp": lambda x: x.exp(), "exp2": lambda x: x.exp2(),
+             "relu": lambda x: x.relu(), "gelu": lambda x: x.gelu(),
+             "abs": lambda x: x.abs(), "neg": lambda x: -x}
 
 
 def _binary_kernel(name: str, op: str, dtype):
@@ -42,33 +46,33 @@ def _binary_kernel(name: str, op: str, dtype):
     and the only thing that varies is which map it calls, so copies would only
     be a place for them to drift.
     """
+    fn = _BINARY_FN[op]
 
-    def body(a, b, o, *, ROWS=ROWS, COLS=COLS):
-        t = _ops.rt(dtype, ROWS, COLS)
-        idx = _ops.tile_coord(0, 0, _ops.block_idx.y, _ops.block_idx.x)
-        x = _ops.load(a, idx, t)
-        y = _ops.load(b, idx, t)
-        _ops.store(o, getattr(_ops, op)(x, y), idx)
+    def body(a: hk.Tensor[dtype], b: hk.Tensor[dtype], o: hk.Tensor[dtype], *,
+             ROWS=ROWS, COLS=COLS):
+        t = hk.RT(dtype, ROWS, COLS)
+        idx = hk.tile_coord(0, 0, hk.arch.block_idx.y, hk.arch.block_idx.x)
+        x = a[idx].load(t)
+        y = b[idx].load(t)
+        o[idx] = fn(x, y)
 
     body.__name__ = name
-    body.__annotations__ = {
-        "a": GL[dtype], "b": GL[dtype], "o": GL[dtype],
-    }
-    return _kernel(body, warps=1, grid=_grid, name=name)
+    return hk.kernel(body, warps=1, grid=_grid, name=name)
 
 
 def _unary_kernel(name: str, op: str, dtype):
-    def body(a, o, *, ROWS=ROWS, COLS=COLS):
-        t = _ops.rt(dtype, ROWS, COLS)
-        idx = _ops.tile_coord(0, 0, _ops.block_idx.y, _ops.block_idx.x)
-        _ops.store(o, getattr(_ops, op)(_ops.load(a, idx, t)), idx)
+    fn = _UNARY_FN[op]
+
+    def body(a: hk.Tensor[dtype], o: hk.Tensor[dtype], *, ROWS=ROWS, COLS=COLS):
+        t = hk.RT(dtype, ROWS, COLS)
+        idx = hk.tile_coord(0, 0, hk.arch.block_idx.y, hk.arch.block_idx.x)
+        o[idx] = fn(a[idx].load(t))
 
     body.__name__ = name
-    body.__annotations__ = {"a": GL[dtype], "o": GL[dtype]}
-    return _kernel(body, warps=1, grid=_grid, name=name)
+    return hk.kernel(body, warps=1, grid=_grid, name=name)
 
 
-_DTYPES = {"bf16": bf16, "fp16": fp16, "fp32": fp32}
+_DTYPES = {"bf16": hk.bf16, "fp16": hk.fp16, "fp32": hk.fp32}
 _BINARY = ("add", "sub", "mul", "max", "min")
 _UNARY = ("exp", "exp2", "relu", "gelu", "abs", "neg")
 
@@ -76,13 +80,11 @@ _UNARY = ("exp", "exp2", "relu", "gelu", "abs", "neg")
 def _supports(op: str, suffix: str) -> bool:
     """Whether include/rdna3 implements `op` for this element type.
 
-    Asked rather than restated, so the shipped set cannot drift from what the
-    tracer accepts -- gelu is specialised for float only, and instantiating it
-    for bf16 fails at link time. `neg` is a multiply by -1, so it inherits
-    mul's support.
+    gelu is specialised for float only, and instantiating it for bf16 fails at
+    link time; the DSL refuses it at trace time for the same reason. `neg` is
+    a multiply by -1, so it inherits mul's support.
     """
-    m = _ops.UNARY.get(op) or _ops.BINARY.get(op) or _ops.BINARY["mul"]
-    return suffix in m.dtypes
+    return suffix == "fp32" or op not in _FP32_ONLY
 
 
 #: name -> Kernel, e.g. KERNELS["add_bf16"]. Nothing is compiled until called.

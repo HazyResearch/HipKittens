@@ -25,15 +25,10 @@ on an activation is decided by whichever row has the worst outlier, and on a
 4096-wide hidden state that is a real loss.
 """
 
-from __future__ import annotations
 
+from .. import dsl as hk
+from ..dsl.collective import cross_warp, fold_rows
 from ..ir.nodes import bf16, fp16, fp32, i8
-from ..lang import ops as _ops
-from ..lang.collective import cross_warp, fold_rows
-from ..lang.control import range as _range
-from ..lang.host import cdiv
-from ..lang.kernel import GL
-from ..lang.kernel import kernel as _kernel
 from .norm import (COLS, MAX_TPW, ROWS, WARP_COUNTS, _block_start, _ceil,
                    _exact, _split, _view)
 
@@ -45,11 +40,11 @@ _TINY = 1e-12
 
 
 def _grid_q(p):
-    return (1, cdiv(p.x.rows, p.ROWS), 1)
+    return (1, hk.cdiv(p.x.rows, p.ROWS), 1)
 
 
 def _grid_dq(p):
-    return (1, cdiv(p.q.rows, p.ROWS), 1)
+    return (1, hk.cdiv(p.q.rows, p.ROWS), 1)
 
 
 def plan(cols: int, working_set: int | None = None):
@@ -142,28 +137,27 @@ def plan(cols: int, working_set: int | None = None):
 
 
 def _quantize_kernel(name: str, dtype, warps: int):
-    def body(x, q, s, *, ROWS=ROWS, COLS=COLS, WARPS=warps, TPW=0, FOLD=1,
-             EXACT=0):
+    def body(x: hk.Tensor[dtype], q: hk.Tensor[i8], s: hk.Tensor[fp32], *,
+             ROWS=ROWS, COLS=COLS, WARPS=warps, TPW=0, FOLD=1, EXACT=0):
         # The tile is fp32 even though the tensor is bf16, and holding it in
         # bf16 instead is not an optimization on this part -- it is a
         # pessimization, measured. See the note above `visit`.
-        t = _ops.rt(fp32, ROWS, COLS)
-        vt = _ops.col_vec(t)
-        ncols = _ops.cols(x)
-        nblk = _ops.s_cdiv(ncols, COLS)
-        row_lo, _ = _block_start(_ops.block_idx.y, ROWS, _ops.rows(x))
+        t = hk.RT(fp32, ROWS, COLS)
+        vt = hk.col_vec(t)
+        ncols = x.cols
+        nblk = hk.cdiv(ncols, COLS)
+        row_lo, _ = _block_start(hk.arch.block_idx.y, ROWS, x.rows)
 
         def cb_of(step):
-            return _ops.s_add(_ops.s_mul(step, WARPS), _ops.warp_id()) if WARPS > 1 \
-                else step
+            return step * WARPS + hk.arch.warp_id() if WARPS > 1 else step
 
         def tile(cb):
             col_lo, pad = _block_start(cb, COLS, ncols, EXACT)
-            idx = _ops.elem_coord(0, 0, row_lo, col_lo)
-            return _ops.load(x, idx, t), pad, idx
+            idx = hk.elem_coord(0, 0, row_lo, col_lo)
+            return x[idx].load(t), pad, idx
 
         held = [tile(cb_of(i)) for i in range(TPW)] if TPW else None
-        steps = None if TPW else _ops.s_cdiv(nblk, WARPS)
+        steps = None if TPW else hk.cdiv(nblk, WARPS)
 
         def visit(fn):
             """Once per column block this warp owns; see norm.visit."""
@@ -171,10 +165,10 @@ def _quantize_kernel(name: str, dtype, warps: int):
                 for rec in held:
                     fn(*rec)
             else:
-                for step in _range(steps):
+                for step in range(steps):
                     fn(*tile(cb_of(step)))
 
-        amax = _ops.zeros_vec(vt)
+        amax = hk.zeros(vt)
         # Unmasked. Backing the address up re-reads columns of the same row
         # that a neighbouring block already covered, and a max of absolute
         # values cannot be raised by an element it has already seen -- only a
@@ -192,8 +186,7 @@ def _quantize_kernel(name: str, dtype, warps: int):
         # -- and the compiler agrees: at TPW=2, 145 VGPRs held in bf16 against
         # 109 in fp32, because the bf16 version pays for the widening
         # temporary on top. Pinned in tests/hk/ir/test_target.py.
-        visit(lambda v, pad, idx:
-              _ops.row_max(_ops.abs(v), out=amax, accumulate=True))
+        visit(lambda v, pad, idx: amax.max_(v.abs().max(axis=1)))
         amax = cross_warp(amax, "max", WARPS)
         if FOLD != 1:
             # The tile's 16 rows are 16 chunks of one row, so the row's absmax
@@ -203,61 +196,58 @@ def _quantize_kernel(name: str, dtype, warps: int):
             # single-element store be written at all.
             amax = fold_rows(amax, "max", WARPS)
 
-        _ops.max(amax, _TINY, out=amax)
-        scale = _ops.mul(amax, 1.0 / 127.0)
-        inv = _ops.div(_ops.full_vec(vt, 127.0), amax)
+        amax.maximum(_TINY, into=amax)
+        scale = amax * (1.0 / 127.0)
+        inv = hk.full(vt, 127.0) / amax
         if FOLD != 1:
             # One workgroup, one row of the real tensor, one scale. block_idx.y
             # *is* the row index: the folded view has rows*FOLD rows, the grid
             # is one workgroup per FOLD of them, and FOLD == ROWS so
             # _block_start never has to clamp.
-            _ops.store_scalar(s, scale, _ops.elem_coord(0, 0, 0,
-                                                        _ops.block_idx.y))
+            s[hk.elem_coord(0, 0, 0, hk.arch.block_idx.y)].store_scalar(scale)
         else:
             # Every warp writes the same 16 scales to the same 16 slots. That
             # is the benign duplicate write the library already relies on for a
             # backed-up block, and cheaper than branching the whole workgroup
             # on warp 0.
-            _ops.store(s, scale, _ops.elem_coord(0, 0, 0, row_lo))
+            s[hk.elem_coord(0, 0, 0, row_lo)] = scale
 
         def write(v, pad, idx):
-            _ops.mul_row(v, inv, out=v)
+            v *= inv
             # The rounding and the clamp are in convertor<int8, float>, which
             # the store runs per element. Nothing here has to know about them.
-            _ops.store(q, v, idx)
+            q[idx] = v
 
         visit(write)
 
     body.__name__ = name
-    body.__annotations__ = {"x": GL[dtype], "q": GL[i8], "s": GL[fp32]}
-    return _kernel(body, warps=warps, grid=_grid_q, name=name)
+    return hk.kernel(body, warps=warps, grid=_grid_q, name=name)
 
 
 def _dequantize_kernel(name: str, dtype, warps: int):
-    def body(q, s, o, *, ROWS=ROWS, COLS=COLS, WARPS=warps, EXACT=0):
-        t = _ops.rt(fp32, ROWS, COLS)
-        vt = _ops.col_vec(t)
-        ncols = _ops.cols(q)
-        nblk = _ops.s_cdiv(ncols, COLS)
-        row_lo, _ = _block_start(_ops.block_idx.y, ROWS, _ops.rows(q))
+    def body(q: hk.Tensor[i8], s: hk.Tensor[fp32], o: hk.Tensor[dtype], *,
+             ROWS=ROWS, COLS=COLS, WARPS=warps, EXACT=0):
+        t = hk.RT(fp32, ROWS, COLS)
+        vt = hk.col_vec(t)
+        ncols = q.cols
+        nblk = hk.cdiv(ncols, COLS)
+        row_lo, _ = _block_start(hk.arch.block_idx.y, ROWS, q.rows)
 
         # No reduction, so no masking and no cross-warp combine: a backed-up
         # block recomputes a few elements and writes them the same. The warps
         # are here only for the wave count, and each loads its own copy of the
         # 16 scales -- 64 bytes, against the tiles it is about to stream.
-        scale = _ops.load(s, _ops.elem_coord(0, 0, 0, row_lo), vt)
-        for step in _range(_ops.s_cdiv(nblk, WARPS)):
-            cb = _ops.s_add(_ops.s_mul(step, WARPS), _ops.warp_id()) if WARPS > 1 \
-                else step
+        scale = s[hk.elem_coord(0, 0, 0, row_lo)].load(vt)
+        for step in range(hk.cdiv(nblk, WARPS)):
+            cb = step * WARPS + hk.arch.warp_id() if WARPS > 1 else step
             col_lo, _ = _block_start(cb, COLS, ncols, EXACT)
-            idx = _ops.elem_coord(0, 0, row_lo, col_lo)
-            v = _ops.load(q, idx, t)
-            _ops.mul_row(v, scale, out=v)
-            _ops.store(o, _ops.cast(v, dtype), idx)
+            idx = hk.elem_coord(0, 0, row_lo, col_lo)
+            v = q[idx].load(t)
+            v *= scale
+            o[idx] = v.to(dtype)
 
     body.__name__ = name
-    body.__annotations__ = {"q": GL[i8], "s": GL[fp32], "o": GL[dtype]}
-    return _kernel(body, warps=warps, grid=_grid_dq, name=name)
+    return hk.kernel(body, warps=warps, grid=_grid_dq, name=name)
 
 
 _DTYPES = {"bf16": bf16, "fp16": fp16, "fp32": fp32}

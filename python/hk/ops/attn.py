@@ -34,14 +34,11 @@ accumulator's data back to [q, d] with a per-fragment `transpose`; here
 a base tile's storage does not depend on its layout tag.
 """
 
-from __future__ import annotations
-
 import math
 from typing import Any, Dict, Optional
 
 from .. import autotune as _autotune
-from .. import lang as _ops
-from ..lang import GL, const, kernel as _kernel
+from .. import dsl as hk
 from ..target import current_arch, get_target
 from ..ir.nodes import bf16, fp32
 
@@ -123,42 +120,43 @@ def attn_kernel(name: str, *, head_dim: int = 128, q_block: int = 16,
     # and multiplying it by a non-power-of-two would round the inputs twice.
     scale_l2e = (scale if scale is not None else head_dim ** -0.5) * math.log2(math.e)
 
-    st_k = _ops.st(bf16, kv_block, head_dim)
-    st_vt = _ops.st(bf16, head_dim, kv_block)
+    st_k = hk.ST(bf16, kv_block, head_dim)
+    st_vt = hk.ST(bf16, head_dim, kv_block)
 
-    ty_q = _ops.rt(bf16, 16, 16, "row")          # one d-slice of this warp's Q
-    ty_k = _ops.rt(bf16, 16, 16, "row")          # one [kv, d] fragment of K
-    ty_s = _ops.rt(fp32, 16, q_block, "col")     # one [kv, q] fragment of S^T
-    ty_p = _ops.rt(bf16, 16, q_block, "col")     # the same, converted
-    ty_o = _ops.rt(fp32, 16, q_block, "col")     # one [d, q] fragment of O^T
-    ty_v = _ops.rt(bf16, 16, vt_d_chunk, "row")  # a [kv, d] slab of V, in flight
-    ty_vt = _ops.rt(bf16, vt_d_chunk, 16, "row")  # the same slab, transposed
-    ty_vr = _ops.rt(bf16, 16, 16, "row")         # one [d, kv] fragment of V^T
-    ty_vec = _ops.row_vec(ty_s)                  # one entry per query
+    ty_q = hk.RT(bf16, 16, 16, "row")          # one d-slice of this warp's Q
+    ty_k = hk.RT(bf16, 16, 16, "row")          # one [kv, d] fragment of K
+    ty_s = hk.RT(fp32, 16, q_block, "col")     # one [kv, q] fragment of S^T
+    ty_p = hk.RT(bf16, 16, q_block, "col")     # the same, converted
+    ty_o = hk.RT(fp32, 16, q_block, "col")     # one [d, q] fragment of O^T
+    ty_v = hk.RT(bf16, 16, vt_d_chunk, "row")  # a [kv, d] slab of V, in flight
+    ty_vt = hk.RT(bf16, vt_d_chunk, 16, "row")  # the same slab, transposed
+    ty_vr = hk.RT(bf16, 16, 16, "row")         # one [d, kv] fragment of V^T
+    ty_vec = hk.row_vec(ty_s)                  # one entry per query
 
-    def body(q, k, v, o):
-        g = _ops.group(warps)
+    def body(q: hk.Tensor[bf16], k: hk.Tensor[bf16], v: hk.Tensor[bf16],
+             o: hk.Tensor[bf16]):
+        g = hk.group(warps)
 
-        k_s = _ops.alloc_shared(st_k, name="k_s")
-        vt_s = _ops.alloc_shared(st_vt, name="vt_s")
+        k_s = hk.lds.alloc(st_k, name="k_s")
+        vt_s = hk.lds.alloc(st_vt, name="vt_s")
         buf_k = g.stage_buffer(k_s, name="buf_k")
 
         # Every LDS read below goes through a granule set rather than
-        # `subtile` + `load_shared`. The QK and PV loops issue d_frags*kv_frags
+        # `subtile` + `load`. The QK and PV loops issue d_frags*kv_frags
         # + d_frags*kv_frags fragment reads per KV block, and every one of
         # those addresses is loop-invariant -- the compiler hoists them all out
         # of the loop and then spills them (312 B/lane, measured, and a spill
         # here is a wrong answer because the LDS schedule hand-manages
         # s_waitcnt). The granule form holds 8 + 4 = 12 registers for the whole
-        # kernel instead. See hk.lang.ops.granules.
-        gr_k = _ops.granules(k_s, name="gr_k")
-        gr_vt = _ops.granules(vt_s, name="gr_vt")
+        # kernel instead. See SharedTile.granules.
+        gr_k = k_s.granules(name="gr_k")
+        gr_vt = vt_s.granules(name="gr_vt")
 
-        b = _ops.block_idx.z
-        head = _ops.block_idx.y
-        qb = _ops.block_idx.x
-        n_q = _ops.rows(q)
-        n_kv = _ops.rows(k)
+        b = hk.arch.block_idx.z
+        head = hk.arch.block_idx.y
+        qb = hk.arch.block_idx.x
+        n_q = q.rows
+        n_kv = k.rows
 
         if causal:
             # Longest-processing-time-first. Under causal the work per
@@ -172,45 +170,45 @@ def attn_kernel(name: str, *, head_dim: int = 128, q_block: int = 16,
             # rather than read off gridDim because it is the same expression
             # the grid lambda uses, and one of the two would otherwise be
             # free to drift.
-            qb = _ops.s_sub(_ops.s_cdiv(n_q, q_tile) - 1, qb)
+            qb = hk.cdiv(n_q, q_tile) - 1 - qb
 
         # GQA is an addressing change and nothing else: the grid is over *query*
         # heads and several of them read the same K/V head. One scalar divide,
         # hoisted; when the head counts match it is a divide by 1.
-        head_kv = _ops.s_div(head, _ops.s_div(_ops.depth(q), _ops.depth(k)))
+        head_kv = head // (q.depth // k.depth)
 
         # Q remainder by backing the last block up, not by predicating it. Each
         # query row's output depends on nothing but that row, so the overlap is
         # computed twice from identical inputs and written twice with identical
         # values -- idempotent, not a race. Same trick as the GEMM.
-        q_tile_start = _ops.s_max(_ops.s_min(qb * q_tile, n_q - q_tile), 0)
-        wid = _ops.warp_id()
+        q_tile_start = hk.max(hk.min(qb * q_tile, n_q - q_tile), 0)
+        wid = hk.arch.warp_id()
         q_row = q_tile_start + wid * q_block
 
-        q_r = [_ops.load(q, _ops.elem_coord(b, head, q_row, 16 * kk), ty_q)
+        q_r = [q[hk.elem_coord(b, head, q_row, 16 * kk)].load(ty_q)
                for kk in range(d_frags)]
 
-        o_c = [_ops.zeros(ty_o) for _ in range(d_frags)]
-        m_run = _ops.neg_infty_vec(ty_vec)
-        l_run = _ops.zeros_vec(ty_vec)
+        o_c = [hk.zeros(ty_o) for _ in range(d_frags)]
+        m_run = hk.neg_infty(ty_vec)
+        l_run = hk.zeros(ty_vec)
 
         # Declared out here, and *only* these, because only these cross an
         # iteration boundary: the prefetch issues block kb+1's global reads
         # before block kb's math and lands them at kb+1's commit. Everything
         # else the loop uses -- the score tiles, the LDS windows, the bf16 copy
         # of P -- is created inside the body, where its live range ends. Hoisting
-        # those out so that `out=` has somewhere to write costs 56 VGPRs that
+        # those out so that `into=` has somewhere to write costs 56 VGPRs that
         # are pinned across the staging code and read by nothing, which is the
         # difference between 132 B/lane of scratch and none.
-        v_rows = [_ops.zeros(ty_v) for _ in range(v_bands)]
+        v_rows = [hk.zeros(ty_v) for _ in range(v_bands)]
 
         # This warp's V^T chunk: a vt_d_chunk-wide slice of the head dimension.
         # V_ITERS is 1 by construction (see _derive), so it is just the warp id,
         # and the warps past d_chunks stage nothing.
         c_chunk = wid
-        stages_v = _ops.s_lt(c_chunk, d_chunks)
+        stages_v = c_chunk < d_chunks
 
-        kv_blocks = _ops.s_cdiv(n_kv, kv_block)
+        kv_blocks = hk.cdiv(n_kv, kv_block)
         if causal:
             # Stop where the workgroup's *last* query does, not this warp's:
             # staging is a group operation with barriers in it, so the bound
@@ -220,8 +218,7 @@ def attn_kernel(name: str, *, head_dim: int = 128, q_block: int = 16,
             # That is safe because block 0 is never fully masked for any query
             # (kv = 0 <= q always), so the running max is finite from the first
             # block and `exp2(-inf - m)` is 0 rather than NaN.
-            kv_blocks = _ops.s_min(
-                kv_blocks, _ops.s_cdiv(q_tile_start + q_tile, kv_block))
+            kv_blocks = hk.min(kv_blocks, hk.cdiv(q_tile_start + q_tile, kv_block))
 
         def block_start(kb):
             # Clamped, not predicated: past the end this re-reads the last block
@@ -230,48 +227,46 @@ def attn_kernel(name: str, *, head_dim: int = 128, q_block: int = 16,
             # without threading a predicate through the pipeline. The warp-level
             # V load goes through raw pointers, so out-of-range here would be an
             # out-of-bounds read rather than a harmless zero.
-            kb = _ops.s_min(kb, kv_blocks - 1)
-            return _ops.s_min(kb * kv_block, n_kv - kv_block)
+            kb = hk.min(kb, kv_blocks - 1)
+            return hk.min(kb * kv_block, n_kv - kv_block)
 
         def load_kv(kv_start):
             """Issue a block's global reads. Waits for nothing."""
-            g.stage(buf_k, k, _ops.elem_coord(b, head_kv, kv_start, 0))
-            with _ops.if_(stages_v):
+            g.stage(buf_k, k[hk.elem_coord(b, head_kv, kv_start, 0)])
+            if stages_v:
                 for w in range(v_bands):
-                    _ops.load(v, _ops.elem_coord(b, head_kv, kv_start + 16 * w,
-                                                 c_chunk * vt_d_chunk),
-                              ty_v, out=v_rows[w])
+                    v[hk.elem_coord(b, head_kv, kv_start + 16 * w,
+                                    c_chunk * vt_d_chunk)].load(ty_v, into=v_rows[w])
 
         def commit_kv():
             """Land them: K straight into LDS, V transposed."""
-            _ops.vm_wait(0)
+            hk.arch.vm_wait(0)
             g.commit(k_s, buf_k)
             # V^T[d, kv] is what the PV matmul reads. V arrives [kv, d], so the
             # warp read a [16, vt_d_chunk] slice (perfectly coalesced),
             # transposes it in registers, and writes a [vt_d_chunk, 16] block --
             # still row layout, so still a vectorised ds_write.
-            with _ops.if_(stages_v):
+            if stages_v:
                 for w in range(v_bands):
-                    v_t = _ops.transpose_sep(v_rows[w])
+                    v_t = hk.transpose_sep(v_rows[w])
                     for t in range(vt_frags):
-                        _ops.store_frag(gr_vt, v_t,
-                                        c_chunk * vt_frags + t, w)
+                        gr_vt.store_frag(v_t, c_chunk * vt_frags + t, w)
 
         load_kv(block_start(0))
 
-        for kb in _ops.range(kv_blocks):
+        for kb in range(kv_blocks):
             kv_lo = kb * kv_block
-            kv_start = _ops.s_min(kv_lo, n_kv - kv_block)
+            kv_start = hk.min(kv_lo, n_kv - kv_block)
             skip = kv_lo - kv_start         # rows this block does not own
 
             # The previous iteration's reads must retire before this one
             # overwrites the buffers. Single-buffered, so this is the whole
             # write-after-read hazard.
-            _ops.barrier()
+            hk.arch.barrier()
             commit_kv()
             # s_barrier orders execution, not memory: the ds_writes above have
             # to be retired explicitly or the next warp's ds_reads race them.
-            _ops.barrier(drain=True)
+            hk.arch.barrier(drain=True)
             # Issue the next block's globals *after* the barrier that published
             # this one. Nothing below touches them until the next commit, so
             # they have the whole math body to land in.
@@ -280,25 +275,24 @@ def attn_kernel(name: str, *, head_dim: int = 128, q_block: int = 16,
             # Everything above is workgroup-wide; everything below is this
             # warp's. Without the boundary the allocator holds both live sets at
             # once -- see hk.scope.
-            with _ops.scope():
+            with hk.scope():
                 # The score tile is per block, not running: everything else in
                 # this region accumulates across blocks and this does not.
-                s_f = [_ops.zeros(ty_s) for _ in range(kv_frags)]
+                s_f = [hk.zeros(ty_s) for _ in range(kv_frags)]
 
                 # ---- S^T = K . Q^T ---------------------------------------
                 for kk in range(d_frags):
                     for n0 in range(0, kv_frags, qk_tiles):
-                        k_win = [_ops.load_frag(gr_k, n0 + i, kk, ty_k)
+                        k_win = [gr_k.load_frag(n0 + i, kk, ty_k)
                                  for i in range(qk_tiles)]
-                        _ops.lds_wait_for(*k_win)
-                        _ops.setprio(1)
+                        hk.lds.wait_for(*k_win)
+                        hk.arch.setprio(1)
                         for i in range(qk_tiles):
-                            _ops.mma_ABt(k_win[i], q_r[kk], s_f[n0 + i],
-                                         out=s_f[n0 + i])
-                        _ops.setprio(0)
+                            s_f[n0 + i] += k_win[i] @ q_r[kk].T
+                        hk.arch.setprio(0)
 
                 for n in range(kv_frags):
-                    _ops.mul(s_f[n], scale_l2e, out=s_f[n])
+                    s_f[n] *= scale_l2e
 
                 # Neither mask below is behind a branch, and that took two
                 # tries to get right. Both of them used to hold one register
@@ -321,10 +315,9 @@ def attn_kernel(name: str, *, head_dim: int = 128, q_block: int = 16,
                     # traffic and no materialized mask tile -- the dividend of
                     # keeping the scores transposed.
                     #
-                    d = _ops.s_sub(q_row, kv_start)
+                    d = q_row - kv_start
                     for n in range(kv_frags):
-                        _ops.triu(s_f[n], _ops.s_sub(d, 16 * n), NEG_INF,
-                                  out=s_f[n])
+                        s_f[n].triu_(d - 16 * n, NEG_INF)
 
                 # This one *is* behind a branch, and the asymmetry is real.
                 # `skip` is nonzero on exactly one KV block in the whole loop
@@ -335,42 +328,41 @@ def attn_kernel(name: str, *, head_dim: int = 128, q_block: int = 16,
                 # 224 VGPRs and no spill with the branch, 116 B/lane of spill
                 # without it. The causal mask above runs on nearly every block
                 # and gets the opposite answer for the same reason.
-                with _ops.if_(_ops.s_gt(skip, 0)):
+                if skip > 0:
                     for n in range(kv_frags):
                         # A row of S^T is a kv index, so the overlap with the
                         # previous block is an `upper_fill` and not a
                         # predicate: rows below `skip` belong to that block
                         # and would be counted twice by the softmax sum.
-                        _ops.upper_fill(s_f[n], _ops.s_sub(skip, 16 * n),
-                                        NEG_INF, out=s_f[n])
+                        s_f[n].upper_fill_(skip - 16 * n, NEG_INF)
 
                 # ---- online softmax --------------------------------------
                 # Every reduction is over kv, which is the element axis of a
                 # col-layout accumulator: register-local steps plus one
                 # cross-half exchange.
-                m_old = _ops.copy(m_run)
+                m_old = m_run.copy()
                 for n in range(kv_frags):
-                    _ops.col_max(s_f[n], out=m_run, accumulate=True)
+                    m_run.max_(s_f[n].max(axis=0))
                 for n in range(kv_frags):
-                    _ops.sub_col(s_f[n], m_run, out=s_f[n])
-                    _ops.exp2(s_f[n], out=s_f[n])     # s_f is P^T from here
+                    s_f[n] -= m_run
+                    s_f[n].exp2_()     # s_f is P^T from here
                 # The rescale is behind a branch and this one earns it. After
                 # the first few KV blocks the running max is already the global
-                # max, alpha is 1, and every one of the mul_col below is a
-                # v_mul_f32 against nothing -- 64 of them per block at
+                # max, alpha is 1, and every one of the column multiplies below
+                # is a v_mul_f32 against nothing -- 64 of them per block at
                 # head_dim 128, against the block's 32 WMMAs. The predicate is
                 # wave-uniform (every lane holds the whole q range of this
                 # warp's tile in m_*), so it is an s_cbranch and not a divergent
                 # region, and the branch is taken rarely enough that the
                 # register cost the causal mask could not afford is paid back
                 # here many times over.
-                with _ops.if_(_ops.s_any_ne(m_run, m_old)):
-                    alpha = _ops.exp2(_ops.sub(m_old, m_run))
-                    _ops.mul(l_run, alpha, out=l_run)
+                if m_run.any_ne(m_old):
+                    alpha = (m_old - m_run).exp2()
+                    l_run *= alpha
                     for c in o_c:
-                        _ops.mul_col(c, alpha, out=c)
+                        c *= alpha
                 for n in range(kv_frags):
-                    _ops.col_sum(s_f[n], out=l_run, accumulate=True)
+                    l_run += s_f[n].sum(axis=0)
 
                 # ---- O^T += V^T . P^T ------------------------------------
                 # The kv fragment is the outer loop so that only one 16x16 block
@@ -380,16 +372,15 @@ def attn_kernel(name: str, *, head_dim: int = 128, q_block: int = 16,
                 # and a spill here is wrong, not slow, because the LDS schedule
                 # hand-manages s_waitcnt.
                 for n in range(kv_frags):
-                    p_cvt = _ops.cast(s_f[n], bf16)
+                    p_cvt = s_f[n].to(bf16)
                     for g0 in range(0, d_frags, pv_tiles):
-                        v_win = [_ops.load_frag(gr_vt, g0 + i, n, ty_vr)
+                        v_win = [gr_vt.load_frag(g0 + i, n, ty_vr)
                                  for i in range(pv_tiles)]
-                        _ops.lds_wait_for(*v_win)
-                        _ops.setprio(1)
+                        hk.lds.wait_for(*v_win)
+                        hk.arch.setprio(1)
                         for i in range(pv_tiles):
-                            _ops.mma_AB(v_win[i], p_cvt, o_c[g0 + i],
-                                        out=o_c[g0 + i])
-                        _ops.setprio(0)
+                            o_c[g0 + i] += v_win[i] @ p_cvt
+                        hk.arch.setprio(0)
 
         # Normalise and go back to [q, d] for the store. The C++ moves the data
         # here, one fragment at a time; `hk.transpose` relabels, which is the
@@ -397,18 +388,16 @@ def attn_kernel(name: str, *, head_dim: int = 128, q_block: int = 16,
         # depends on its dtype and not on its layout tag, so reading a [d, q]
         # col fragment as a [q, d] row fragment *is* the transpose.
         for i, c in enumerate(o_c):
-            _ops.div_col(c, l_run, out=c)
-            _ops.store(o, _ops.transpose(c),
-                       _ops.elem_coord(b, head, q_row, 16 * i))
+            c /= l_run
+            o[hk.elem_coord(b, head, q_row, 16 * i)] = hk.transpose(c)
 
     body.__name__ = name
-    body.__annotations__ = {x: GL[bf16] for x in ("q", "k", "v", "o")}
 
     def _grid(p):
-        return (_ops.cdiv(p.q.rows, q_tile), p.q.depth, p.q.batch)
+        return (hk.cdiv(p.q.rows, q_tile), p.q.depth, p.q.batch)
 
-    return _kernel(body, warps=warps, grid=_grid, name=name,
-                   max_vgprs=max_vgprs, min_occupancy=min_occupancy)
+    return hk.kernel(body, warps=warps, grid=_grid, name=name,
+                     max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 
 
 #: The tiling the C++'s sweep.sh picked, and the one every shape gets until a

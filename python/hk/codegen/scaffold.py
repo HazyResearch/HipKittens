@@ -42,10 +42,18 @@ def _members(ir: KernelIR) -> str:
     return ", ".join(f"&globals::{p.name}" for p in ir.tensors())
 
 
+def _emitter(ir, emit):
+    if emit is not None:
+        return emit
+    if hasattr(ir, "cpp"):
+        return lambda traced, includes: traced.cpp(includes)
+    return cpp.emit
+
+
 def pybind_module(ir: KernelIR, emit=None) -> str:
     """A self-contained pybind11 extension exporting one function, `ir.name`,
     that takes the tensor parameters positionally in declaration order."""
-    src = (emit or cpp.emit)(ir, includes=('"kittens.cuh"', '"pyutils/hk_bind.cuh"'))
+    src = _emitter(ir, emit)(ir, includes=('"kittens.cuh"', '"pyutils/hk_bind.cuh"'))
     lines = [
         src,
         f"#ifndef {MODULE_NAME_MACRO}",
@@ -72,7 +80,7 @@ def pybind_module(ir: KernelIR, emit=None) -> str:
 def bare(ir: KernelIR, emit=None) -> str:
     """Kernel and `launch`, no module boundary. For AOT objects and for reading
     the generated code when debugging a schedule."""
-    return (emit or cpp.emit)(ir, includes=('"kittens.cuh"',))
+    return _emitter(ir, emit)(ir, includes=('"kittens.cuh"',))
 
 
 def written_tensors(ir: KernelIR) -> List[str]:
@@ -85,6 +93,8 @@ def written_tensors(ir: KernelIR) -> List[str]:
     asking the kernel author, who would have to repeat themselves and could
     disagree with their own kernel.
     """
+    if hasattr(ir, "written_tensors"):
+        return ir.written_tensors()
     out = []
     for op in ir.walk():
         if op.opcode in GLOBAL_WRITERS and op.operands:
@@ -179,7 +189,7 @@ def torch_library(ir: KernelIR, ns: str = "hk", op_name: str = "",
         for p in tensors
     )
 
-    src = (emit or cpp.emit)(ir, includes=('"kittens.cuh"',))
+    src = _emitter(ir, emit)(ir, includes=('"kittens.cuh"',))
     return "\n".join([
         src,
         "#include <torch/library.h>",

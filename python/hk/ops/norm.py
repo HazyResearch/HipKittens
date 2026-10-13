@@ -83,17 +83,12 @@ softmax wants it folded at the same width, by half again. The reason is in
 `_FOLD_FIRST_KINDS`, with the measurement.
 """
 
-from __future__ import annotations
 
 from typing import Any
 
+from .. import dsl as hk
+from ..dsl.collective import cross_warp, fold_rows
 from ..ir.nodes import bf16, fp16, fp32
-from ..lang import ops as _ops
-from ..lang.collective import cross_warp, fold_rows
-from ..lang.control import range as _range
-from ..lang.host import cdiv
-from ..lang.kernel import GL
-from ..lang.kernel import kernel as _kernel
 
 #: 16 rows x 64 columns of fp32 is 32 VGPRs. 64 bf16 columns is also what makes
 #: the global load issue 16-byte accesses instead of going elementwise.
@@ -143,7 +138,7 @@ def _grid(p):
     # normalization is a reduction along the row, so the whole row has to be
     # seen by one workgroup, and splitting it across workgroups would need a
     # second pass through memory to combine the partials.
-    return (1, cdiv(p.x.rows, p.ROWS), 1)
+    return (1, hk.cdiv(p.x.rows, p.ROWS), 1)
 
 
 def _block_start(idx, block: int, extent, exact: bool = False):
@@ -164,11 +159,11 @@ def _block_start(idx, block: int, extent, exact: bool = False):
     because the only reason that copy exists is to have something maskable that
     is not the held tile. See `_mask` and `_exact`.
     """
-    want = _ops.s_mul(idx, block)
+    want = idx * block
     if exact:
         return want, None
-    lo = _ops.s_min(want, _ops.s_sub(extent, block))
-    return lo, lambda: _ops.s_sub(want, lo)
+    lo = hk.min(want, extent - block)
+    return lo, lambda: want - lo
 
 
 def _mask(tile, pad, ident):
@@ -179,7 +174,7 @@ def _mask(tile, pad, ident):
     divides.
     """
     if pad is not None:
-        _ops.left_fill(tile, pad(), ident)
+        tile.left_fill_(pad(), ident)
     return tile
 
 
@@ -391,17 +386,17 @@ def _row_reduce_kernel(name: str, dtype, kind: str, warps: int):
       layer  -- y = (x - mean(x)) * rsqrt(var(x) + eps)
       softmax-- y = exp(x - max(x)) / sum(exp(x - max(x)))
     """
-    def body(x, o, *, ROWS=ROWS, COLS=COLS, WARPS=warps, TPW=0, FOLD=1,
-             EXACT=0, EPS=1e-6):
-        t = _ops.rt(fp32, ROWS, COLS)
-        vt = _ops.col_vec(t)
-        ncols = _ops.cols(x)
-        nblk = _ops.s_cdiv(ncols, COLS)
-        row_lo, _ = _block_start(_ops.block_idx.y, ROWS, _ops.rows(x))
+    def body(x: hk.Tensor[dtype], o: hk.Tensor[dtype], *, ROWS=ROWS, COLS=COLS,
+             WARPS=warps, TPW=0, FOLD=1, EXACT=0, EPS=1e-6):
+        t = hk.RT(fp32, ROWS, COLS)
+        vt = hk.col_vec(t)
+        ncols = x.cols
+        nblk = hk.cdiv(ncols, COLS)
+        row_lo, _ = _block_start(hk.arch.block_idx.y, ROWS, x.rows)
         # How many elements of the *original* row this workgroup covers. With
         # FOLD the tensor has been reshaped, so the tensor's column count is a
         # sixteenth of the row length and the means below would be 16x too big.
-        rowlen = _ops.s_mul(ncols, FOLD) if FOLD != 1 else ncols
+        rowlen = ncols * FOLD if FOLD != 1 else ncols
 
         def cb_of(step):
             """The column block this warp handles at `step`.
@@ -410,13 +405,12 @@ def _row_reduce_kernel(name: str, dtype, kind: str, warps: int):
             workgroup are reading 16 adjacent blocks -- one contiguous 4 KB
             run per row -- instead of 16 places a row apart.
             """
-            return _ops.s_add(_ops.s_mul(step, WARPS), _ops.warp_id()) if WARPS > 1 \
-                else step
+            return step * WARPS + hk.arch.warp_id() if WARPS > 1 else step
 
         def tile(cb):
             col_lo, pad = _block_start(cb, COLS, ncols, EXACT)
-            idx = _ops.elem_coord(0, 0, row_lo, col_lo)
-            return _ops.load(x, idx, t), pad, idx
+            idx = hk.elem_coord(0, 0, row_lo, col_lo)
+            return x[idx].load(t), pad, idx
 
         # Over-provisioned blocks -- WARPS*TPW can exceed nblk, and a warp
         # whose step runs past the end gets cb >= nblk -- are not a special
@@ -426,7 +420,7 @@ def _row_reduce_kernel(name: str, dtype, kind: str, warps: int):
         # to the same place. Both are exactly what backing up already does for
         # a non-dividing tail.
         held = [tile(cb_of(s)) for s in range(TPW)] if TPW else None
-        steps = None if TPW else _ops.s_cdiv(nblk, WARPS)
+        steps = None if TPW else hk.cdiv(nblk, WARPS)
 
         def visit(fn):
             """Call `fn(v, pad, idx)` once per column block this warp owns.
@@ -439,18 +433,18 @@ def _row_reduce_kernel(name: str, dtype, kind: str, warps: int):
             The one rule `fn` has to obey: **do not write to `v` except in the
             last pass.** In the streaming variant `v` is a fresh load and
             scribbling on it is harmless; in the persistent variant it is the
-            tile the write pass will store. `left_fill` writes in place -- it
-            has to, see lang.ops._fill -- so masking `v` directly would zero
-            the overlap columns of the *output*, and another warp's copy of
-            those same columns would then race with them. A shape that divides
-            never shows it, because there the mask is empty. Mask a derived
-            tile instead; every reduction below already makes one.
+            tile the write pass will store. `left_fill_` writes in place -- it
+            has to, see hk.dsl.values.Tile._fill -- so masking `v` directly
+            would zero the overlap columns of the *output*, and another warp's
+            copy of those same columns would then race with them. A shape that
+            divides never shows it, because there the mask is empty. Mask a
+            derived tile instead; every reduction below already makes one.
             """
             if TPW:
                 for rec in held:
                     fn(*rec)
             else:
-                for s in _range(steps):
+                for s in range(steps):
                     fn(*tile(cb_of(s)))
 
         def combine(vec, op):
@@ -470,22 +464,24 @@ def _row_reduce_kernel(name: str, dtype, kind: str, warps: int):
             # Only the sum below needs the overlap masked, because a sum is not
             # idempotent. Not masking also means nothing here writes to `v`,
             # which is the rule visit() states.
-            m = _ops.full_vec(vt, _NEG_INF)
-            visit(lambda v, pad, idx: _ops.row_max(v, out=m, accumulate=True))
+            m = hk.full(vt, _NEG_INF)
+            visit(lambda v, pad, idx: m.max_(v.max(axis=1)))
             m = combine(m, "max")
 
             # Pass 2: sum of exp. The mask carries through: m is finite, so a
             # masked element is exp(-inf) = 0, the identity for sum.
-            s = _ops.zeros_vec(vt)
+            s = hk.zeros(vt)
 
             def accumulate_exp(v, pad, idx):
-                # Shift first, mask second. `sub_row` already allocates the
-                # tile, so the mask lands on a temporary for free and `v`
+                nonlocal s
+                # Shift first, mask second. The broadcast already allocates
+                # the tile, so the mask lands on a temporary for free and `v`
                 # stays untouched. The order is not arbitrary either way:
                 # masking after the shift writes -inf, and exp(-inf) is 0,
                 # the identity for the sum.
-                p = _mask(_ops.sub_row(v, m), pad, _NEG_INF)
-                _ops.row_sum(_ops.exp(p, out=p), out=s, accumulate=True)
+                p = _mask(v - m, pad, _NEG_INF)
+                p.exp_()
+                s += p.sum(axis=1)
 
             visit(accumulate_exp)
             s = combine(s, "add")
@@ -493,17 +489,18 @@ def _row_reduce_kernel(name: str, dtype, kind: str, warps: int):
             # Pass 3: write. Unmasked -- a repeated column is written twice
             # with the same value, which is the point of backing up.
             def write(v, pad, idx):
-                p = _ops.exp(_ops.sub_row(v, m))
-                _ops.div_row(p, s, out=p)
-                _ops.store(o, _ops.cast(p, dtype), idx)
+                p = (v - m).exp()
+                p /= s
+                o[idx] = p.to(dtype)
 
             visit(write)
             return
 
-        sq = _ops.zeros_vec(vt)
-        mean = _ops.zeros_vec(vt) if kind == "layer" else None
+        sq = hk.zeros(vt)
+        mean = hk.zeros(vt) if kind == "layer" else None
 
         def accumulate(v, pad, idx):
+            nonlocal sq, mean
             # A sum is not idempotent, so unlike the max above this one does
             # have to mask the overlap. What it must not do is mask `v` -- see
             # visit() -- so the mask lands on a tile derived from it. The two
@@ -513,22 +510,21 @@ def _row_reduce_kernel(name: str, dtype, kind: str, warps: int):
                 # LayerNorm needs the plain sum as well, so it needs a
                 # maskable copy of the held tile: mask it, sum it, then square
                 # it in place and sum that.
-                m_t = _mask(_ops.copy(v), pad, 0.0)
-                _ops.row_sum(m_t, out=mean, accumulate=True)
-                _ops.mul(m_t, m_t, out=m_t)
-                _ops.row_sum(m_t, out=sq, accumulate=True)
+                m_t = _mask(v.copy(), pad, 0.0)
+                mean += m_t.sum(axis=1)
+                m_t *= m_t
+                sq += m_t.sum(axis=1)
             else:
-                # No copy. RMSNorm never needed one -- `mul` allocates the tile
-                # it writes to, so the mask lands on a temporary for free, and
-                # masking after squaring is the same sum because 0 squared is
-                # 0. LayerNorm gets here too when EXACT says there is nothing
-                # to mask, and then its plain sum can read the held tile
-                # directly; that copy is the whole cost of the `else` branch
-                # not being taken, 32 VGPRs and 32 moves per tile.
+                # No copy. RMSNorm never needed one -- the multiply allocates
+                # the tile it writes to, so the mask lands on a temporary for
+                # free, and masking after squaring is the same sum because 0
+                # squared is 0. LayerNorm gets here too when EXACT says there
+                # is nothing to mask, and then its plain sum can read the held
+                # tile directly; that copy is the whole cost of the `else`
+                # branch not being taken, 32 VGPRs and 32 moves per tile.
                 if kind == "layer":
-                    _ops.row_sum(v, out=mean, accumulate=True)
-                _ops.row_sum(_mask(_ops.mul(v, v), pad, 0.0), out=sq,
-                             accumulate=True)
+                    mean += v.sum(axis=1)
+                sq += _mask(v * v, pad, 0.0).sum(axis=1)
 
         visit(accumulate)
         sq = combine(sq, "add")
@@ -545,24 +541,23 @@ def _row_reduce_kernel(name: str, dtype, kind: str, warps: int):
         # normalized activation with a large offset -- that a LayerNorm is
         # placed to prevent. If a model ever needs it, the fix is the third
         # pass, not a wider accumulator.
-        _ops.div(sq, rowlen, out=sq)
+        sq /= rowlen
         if kind == "layer":
-            _ops.div(mean, rowlen, out=mean)
-            _ops.sub(sq, _ops.mul(mean, mean), out=sq)
-        _ops.add(sq, EPS, out=sq)
-        scale = _ops.rsqrt(sq)
+            mean /= rowlen
+            sq -= mean * mean
+        sq += EPS
+        scale = sq.rsqrt()
 
         def write(v, pad, idx):
             if kind == "layer":
-                _ops.sub_row(v, mean, out=v)
-            _ops.mul_row(v, scale, out=v)
-            _ops.store(o, _ops.cast(v, dtype), idx)
+                v -= mean
+            v *= scale
+            o[idx] = v.to(dtype)
 
         visit(write)
 
     body.__name__ = name
-    body.__annotations__ = {"x": GL[dtype], "o": GL[dtype]}
-    return _kernel(body, warps=warps, grid=_grid, name=name)
+    return hk.kernel(body, warps=warps, grid=_grid, name=name)
 
 
 _DTYPES = {"bf16": bf16, "fp16": fp16, "fp32": fp32}

@@ -12,7 +12,6 @@ import pytest
 pytest.importorskip("hk._mlir")
 
 from hk.compiler import gate_a, mlir as M  # noqa: E402
-from hk.compiler.from_kernel_ir import convert  # noqa: E402
 from hk.target import TARGETS  # noqa: E402
 
 
@@ -58,30 +57,28 @@ def _shipped():
     return jobs
 
 
-def test_every_shipped_kernel_translates_byte_identically():
-    """Gate A: the C++ passes and translation agree with the Python ones."""
+def test_every_shipped_kernel_round_trips_through_text():
+    """The printed module is the whole kernel: parsed back, it translates to
+    the same C++, value names included."""
     differ = []
     for label, k in _shipped():
-        kir = k.trace()
-        try:
-            gate_a.check(kir, python_warnings=kir.warnings)
-        except gate_a.GateError as e:
-            differ.append(f"{label}: {str(e)[:400]}")
-    assert not differ, "\n".join(differ[:5])
+        t = k.trace()
+        before = t.cpp(['"kittens.cuh"'])
+        with M.context():
+            again = M.ir.Module.parse(
+                t.module.operation.get_asm(enable_debug_info=True))
+        if M.translate(again, ['"kittens.cuh"']) != before:
+            differ.append(label)
+    assert not differ, differ[:5]
 
 
 def test_the_textual_ir_round_trips_with_its_names():
     from hk.ops import norm
 
-    kir = norm.KERNELS["rms_bf16_w4"].trace(TPW=2, EXACT=1)
-    mod = convert(kir)
-    M.run_pipeline(mod)
-    before = M.translate(mod, ['"kittens.cuh"'])
-    with M.context():
-        text = mod.operation.get_asm(enable_debug_info=True)
-        again = M.ir.Module.parse(text)
-    assert M.translate(again, ['"kittens.cuh"']) == before
+    t = norm.KERNELS["rms_bf16_w4"].trace(TPW=2, EXACT=1)
+    text = t.module.operation.get_asm(enable_debug_info=True)
     assert "hk.row_sum" in text and "!hk.rt<f32, 16x64, row>" in text
+    assert 'loc("x")' in text and 'loc("rsqrt"' in text
 
 
 def test_a_pass_error_reads_as_the_python_one(monkeypatch):

@@ -189,6 +189,23 @@ def toolchain_fingerprint() -> str:
 _KEY_MODULE = "<module>"
 
 
+_dialect_version: list = []
+
+
+def dialect_version() -> str:
+    """The hk dialect's semantic version, or "none" without hk._mlir. Not a
+    hash of the library: a rebuild that changes nothing it means must not
+    throw the compile cache away."""
+    if not _dialect_version:
+        try:
+            from .._mlir.dialects import hk as hkd  # noqa: PLC0415
+
+            _dialect_version.append(hkd.dialect_version())
+        except Exception:  # noqa: BLE001
+            _dialect_version.append("none")
+    return _dialect_version[0]
+
+
 def cache_key(source: str, target: Target, extra: Sequence[str] = ()) -> str:
     """Everything that can change the compiled bytes.
 
@@ -199,6 +216,7 @@ def cache_key(source: str, target: Target, extra: Sequence[str] = ()) -> str:
     """
     h = hashlib.sha256()
     h.update(toolchain_fingerprint().encode())
+    h.update(dialect_version().encode())
     h.update("\0".join(flags(target, _KEY_MODULE, extra)).encode())
     h.update(source.encode())
     return h.hexdigest()[:32]

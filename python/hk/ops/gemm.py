@@ -36,13 +36,10 @@ the operand tiles are both row-layout and therefore both on the ds_read_b128
 fast path.
 """
 
-from __future__ import annotations
-
 from typing import Any, Dict, Tuple
 
 from .. import autotune as _autotune
-from .. import lang as _ops
-from ..lang import GL, const, kernel as _kernel
+from .. import dsl as hk
 from ..target import current_arch, get_target
 from ..ir.nodes import bf16, fp32
 
@@ -98,34 +95,35 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
     warp_cols, reg_m, reg_n = d["warp_cols"], d["reg_m"], d["reg_n"]
     split_n, slices = d["split_n"], d["slices"]
 
-    st_a = _ops.st(bf16, block_m, k_step)
-    st_b = _ops.st(bf16, block_n, k_step)
+    st_a = hk.ST(bf16, block_m, k_step)
+    st_b = hk.ST(bf16, block_n, k_step)
 
-    def body(a, b, c, *, WGM: const = wgm):
-        g = _ops.group(warps)
+    def body(a: hk.Tensor[bf16], b: hk.Tensor[bf16], c: hk.Tensor[bf16], *,
+             WGM: hk.Constexpr = wgm):
+        g = hk.group(warps)
 
-        As = _ops.alloc_shared(st_a, count=2, name="As")
-        Bs = _ops.alloc_shared(st_b, count=2, name="Bs")
+        As = hk.lds.alloc(st_a, count=2, name="As")
+        Bs = hk.lds.alloc(st_b, count=2, name="Bs")
         buf_a = g.stage_buffer(As, name="buf_a")
         buf_b = g.stage_buffer(Bs, name="buf_b")
 
-        A_tile = _ops.zeros(_ops.rt(bf16, reg_m, dot_slice, "row"))
-        B_tile = [_ops.zeros(_ops.rt(bf16, split_n, dot_slice, "row"))
+        A_tile = hk.zeros(hk.RT(bf16, reg_m, dot_slice, "row"))
+        B_tile = [hk.zeros(hk.RT(bf16, split_n, dot_slice, "row"))
                   for _ in range(n_split)]
-        C_acc = [_ops.zeros(_ops.rt(fp32, reg_m, split_n, "col"))
+        C_acc = [hk.zeros(hk.RT(fp32, reg_m, split_n, "col"))
                  for _ in range(n_split)]
 
-        M = _ops.rows(a)
-        m_blocks = _ops.s_cdiv(M, block_m)
-        n_blocks = _ops.rows(b) // block_n
+        M = a.rows
+        m_blocks = hk.cdiv(M, block_m)
+        n_blocks = b.rows // block_n
 
         # L2 swizzle: walk WGM block-rows at a time so the B panel a group of
         # workgroups reads stays resident. One XCD here, so no chiplet term.
-        wgid = _ops.block_idx.x
+        wgid = hk.arch.block_idx.x
         per_group = WGM * n_blocks
         group_id = wgid // per_group
         first_m = group_id * WGM
-        group_m = _ops.s_min(m_blocks - first_m, WGM)
+        group_m = hk.min(m_blocks - first_m, WGM)
         row = first_m + ((wgid % per_group) % group_m)
         col = (wgid % per_group) // group_m
 
@@ -136,26 +134,26 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
         # what lets M be smaller than one block.
         m_base = row * block_m
 
-        wid = _ops.warp_id()
+        wid = hk.arch.warp_id()
         warp_row = wid // warp_cols
         warp_col = wid % warp_cols
 
-        n_tiles = _ops.cols(a) // k_step
+        n_tiles = a.cols // k_step
 
         def a_coord(t):
-            return _ops.elem_coord(0, 0, m_base, t * k_step)
+            return hk.elem_coord(0, 0, m_base, t * k_step)
 
         def b_coord(t):
-            return _ops.tile_coord(0, 0, col, t)
+            return hk.tile_coord(0, 0, col, t)
 
         def stage(t):
             # Clamped rather than predicated: past the end this re-reads the
             # last tile into staging registers that are never committed, which
             # is a handful of L2-hot loads, and it keeps exactly one batch in
             # flight at all times so vmcnt stays a compile-time immediate.
-            tt = _ops.s_min(t, n_tiles - 1)
-            g.stage(buf_a, a, a_coord(tt))
-            g.stage(buf_b, b, b_coord(tt))
+            tt = hk.min(t, n_tiles - 1)
+            g.stage(buf_a, a[a_coord(tt)])
+            g.stage(buf_b, b[b_coord(tt)])
 
         def dot_tile(buf, tail=None):
             """One K-tile of math out of LDS buffer `buf`, with `tail` woven in.
@@ -167,17 +165,16 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
             the operand tiles instead was tried in the C++ and is slower -- the
             second set costs 48 VGPRs and takes occupancy from 9 to 7.
             """
-            A_s = _ops.shared_at(As, buf)
-            B_s = _ops.shared_at(Bs, buf)
+            A_s = As[buf]
+            B_s = Bs[buf]
 
             def load_A(k):
-                _ops.load_shared(_ops.subtile(A_s, reg_m, dot_slice, warp_row, k),
-                                 A_tile.type, wait=False, out=A_tile)
+                A_s.subtile(reg_m, dot_slice, warp_row, k).load(
+                    A_tile.ty, wait=False, into=A_tile)
 
             def load_B(k, s):
-                _ops.load_shared(
-                    _ops.subtile(B_s, split_n, dot_slice, warp_col * n_split + s, k),
-                    B_tile[s].type, wait=False, out=B_tile[s])
+                B_s.subtile(split_n, dot_slice, warp_col * n_split + s, k).load(
+                    B_tile[s].ty, wait=False, into=B_tile[s])
 
             def run_tail():
                 if tail is not None:
@@ -193,10 +190,10 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
 
             for k in range(slices):
                 for s in range(n_split):
-                    _ops.lds_wait_for(A_tile, B_tile[s])
-                    _ops.setprio(1)
-                    _ops.mma_ABt(A_tile, B_tile[s], C_acc[s], out=C_acc[s])
-                    _ops.setprio(0)
+                    hk.lds.wait_for(A_tile, B_tile[s])
+                    hk.arch.setprio(1)
+                    C_acc[s] += A_tile @ B_tile[s].T
+                    hk.arch.setprio(0)
                     # B_tile[s] is dead the instant this chunk's WMMAs have
                     # issued, so the next slice's read of it goes in flight
                     # here, a full chunk of math early, at no register cost.
@@ -216,12 +213,12 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
                             run_tail()
 
         # Prologue: tile 0 resident, tile 1 in flight.
-        g.load(_ops.shared_at(As, 0), a, a_coord(0))
-        g.load(_ops.shared_at(Bs, 0), b, b_coord(0))
+        g.load(As[0], a[a_coord(0)])
+        g.load(Bs[0], b[b_coord(0)])
         stage(1)
-        _ops.barrier()
+        hk.arch.barrier()
 
-        for t in _ops.range(n_tiles - 1):
+        for t in range(n_tiles - 1):
             tic = t % 2
             toc = 1 - tic
 
@@ -229,9 +226,9 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
                 # Land the batch issued an iteration ago, drain it into the
                 # buffer nobody is reading, and refill the registers at once so
                 # they are never idle. GPREFETCH is 1, so vmcnt keeps nothing.
-                _ops.vm_wait(0)
-                g.commit(_ops.shared_at(As, toc), buf_a)
-                g.commit(_ops.shared_at(Bs, toc), buf_b)
+                hk.arch.vm_wait(0)
+                g.commit(As[toc], buf_a)
+                g.commit(Bs[toc], buf_b)
                 stage(t + 2)
 
             if write_pos == 0:
@@ -248,7 +245,7 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
             # not order memory. Nearly free here -- a whole K-slice of WMMAs
             # has run since they issued -- and the pass refuses the barrier
             # without it, so it cannot be dropped by accident.
-            _ops.barrier(drain=True)
+            hk.arch.barrier(drain=True)
 
         # Epilogue: the last tile is already resident and there is nothing left
         # to stage, so no tail -- and therefore no write for the waits to
@@ -261,21 +258,19 @@ def gemm_kernel(name: str, *, block_m: int = 128, block_n: int = 128,
         m_row = m_base + warp_row * reg_m
         col_tile = (col * warp_cols + warp_col) * n_split
         for s in range(n_split):
-            _ops.store(c, C_acc[s],
-                       _ops.elem_coord(0, 0, m_row, (col_tile + s) * split_n),
-                       bounded=True)
+            c[hk.elem_coord(0, 0, m_row, (col_tile + s) * split_n)].store(
+                C_acc[s], bounded=True)
 
     body.__name__ = name
-    body.__annotations__ = {"a": GL[bf16], "b": GL[bf16], "c": GL[bf16]}
 
     def _grid(p):
-        return (_ops.cdiv(p.a.rows, block_m) * (p.b.rows // block_n), 1, 1)
+        return (hk.cdiv(p.a.rows, block_m) * (p.b.rows // block_n), 1, 1)
 
     if write_pos not in (0, 1, 2):
         raise ValueError(f"write_pos={write_pos} must be 0, 1 or 2")
 
-    return _kernel(body, warps=warps, grid=_grid, name=name,
-                   max_vgprs=max_vgprs, min_occupancy=min_occupancy)
+    return hk.kernel(body, warps=warps, grid=_grid, name=name,
+                     max_vgprs=max_vgprs, min_occupancy=min_occupancy)
 
 
 #: The tiling the C++ calls `big_config`, and the one every shape gets until a

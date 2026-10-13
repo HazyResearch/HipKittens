@@ -114,8 +114,18 @@ class Kernel:
         if not isinstance(ann, str):
             return ann
         g = getattr(self.fn, "__globals__", {})
+        # A kernel built by a factory names the factory's arguments in its
+        # annotations -- `x: hk.Tensor[dtype]` -- so the closure is in scope.
+        code = getattr(self.fn, "__code__", None)
+        cells = getattr(self.fn, "__closure__", None) or ()
+        local = {}
+        for n, c in zip(code.co_freevars if code else (), cells):
+            try:
+                local[n] = c.cell_contents
+            except ValueError:  # an empty cell
+                pass
         try:
-            return eval(ann, g, None)  # noqa: S307 -- the module's own source
+            return eval(ann, g, local)  # noqa: S307 -- the module's own source
         except Exception as e:
             raise TypeError(
                 f"{self.name}: cannot resolve the annotation {ann!r} on "
@@ -309,7 +319,7 @@ class Kernel:
         """
         key = self._key(self._resolve_consts(const_overrides))
         if key not in self._spec_cache:
-            k = Kernel(
+            k = type(self)(
                 self.fn, arch=self._arch, warps=self.warps, grid=self.grid_fn,
                 name=self.name, max_vgprs=self.max_vgprs,
                 min_occupancy=self.min_occupancy,
