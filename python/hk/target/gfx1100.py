@@ -25,8 +25,13 @@ GFX1100 = Target(
 
     # common/util.cuh MAX_SHARED_MEMORY.
     lds_per_workgroup=65536,
-    # A WGP is 2 CUs / 4 SIMD32 and the usable pool is 64 KB.
-    lds_pool_bytes=65536,
+    # A WGP is 2 CUs / 4 SIMD32 sharing 128 KB, of which one workgroup may
+    # take 64. Measured on hk.ops.decode_gemm (16-wave workgroups, occupancy
+    # 16 by registers): reserving 32 KB per workgroup left the timing at the
+    # 4-per-WGP figure; 48 KB and 64 KB both dropped it to the 2-per-WGP one,
+    # identical to each other and to a build held to 2 by registers. Only a
+    # 128 KB pool gives that pattern.
+    lds_pool_bytes=131072,
     simds_per_lds_pool=4,
 
     mma={

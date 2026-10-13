@@ -103,9 +103,10 @@ class Target:
         GEMM in this repo it was this one -- which is why a kernel is never
         judged on the compiler's register-only occupancy alone.
 
-        Worked example, the shipped attention config: two 8 KB tiles double
-        buffered is 32 KB, so two workgroups of 12 waves fit the 64 KB pool ->
-        24 waves / 4 SIMDs = 6 waves/SIMD, exactly what its 238 VGPRs allow.
+        Worked example, the shipped attention config on gfx1100: two 8 KB
+        tiles double buffered is 32 KB, so four workgroups of 12 waves fit the
+        128 KB pool -> 48 waves / 4 SIMDs = 12 waves/SIMD, so its 238 VGPRs (6
+        waves/SIMD) are what bind, not the LDS.
         """
         if lds_bytes <= 0:
             return self.max_waves_per_simd
