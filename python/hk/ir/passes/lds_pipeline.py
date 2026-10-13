@@ -60,19 +60,23 @@ class _State:
     in flight, still missing the register dependence, still unusable.
     """
 
-    #: Outstanding LDS ops in issue order: (id, count, value, kind, cond).
+    #: Outstanding LDS ops in issue order: (id, count, value, kind, scope).
     #: `kind` is "read" or "write" -- lgkmcnt counts both, and a schedule that
     #: leaves ds_writes in flight across a wait has to carry them in the
     #: immediate or it retires more reads than it meant to. The handwritten
     #: GEMM calls that term TAIL_OPS and computes it by hand; here it is just a
     #: queue entry.
     #:
-    #: `cond` records that the op was issued inside an `hk.if_`, so some lanes
-    #: of the wave may not have issued it at all. That is fine until a *counted*
-    #: wait has one in its tail: `lgkmcnt(n)` is a number, not a set, so a wave
-    #: that took the other side of the branch waits down to the wrong depth.
-    #: Only the tail matters -- see the wait handler.
-    queue: List[Tuple[int, int, Value, str, bool]] = field(default_factory=list)
+    #: `scope` is the stack of `hk.if_` regions the op was issued in -- () for
+    #: unconditional -- or None once one of those regions has closed. A wave
+    #: that took the other side of a closed branch never issued the op, and
+    #: `lgkmcnt(n)` is a number, not a set, so a *counted* wait with such an op
+    #: in its tail waits down to the wrong depth on that wave. An op whose
+    #: regions are all still open around the wait is different: every wave
+    #: that reaches the wait entered them and issued it. Only the tail matters
+    #: -- see the wait handler.
+    queue: List[Tuple[int, int, Value, str, Optional[tuple]]] = field(
+        default_factory=list)
     #: Tiles a wait has retired *and* named, so their register dependence is
     #: in place. Naming one again is legal and free; see the wait handler.
     bound: Dict[int, Value] = field(default_factory=dict)
@@ -114,10 +118,14 @@ def _check_reads(op: Op, st: _State) -> None:
             )
 
 
-def _walk(ops: List[Op], st: _State, second: bool, cond: bool = False) -> _State:
+def _live(issued: Optional[tuple], scope: tuple) -> bool:
+    """Whether every wave that reaches `scope` issued an op issued in `issued`."""
+    return issued is not None and scope[:len(issued)] == issued
+
+
+def _walk(ops: List[Op], st: _State, second: bool, scope: tuple = ()) -> _State:
     for op in ops:
         if op.body is not None:
-            inner = cond or op.opcode == "if"
             if op.opcode == "if":
                 # Once. A branch body runs at most once per encounter, so the
                 # steady state a loop has to converge to does not exist here,
@@ -126,14 +134,18 @@ def _walk(ops: List[Op], st: _State, second: bool, cond: bool = False) -> _State
                 # reported as "writes a tile whose reads are in flight", a
                 # confident diagnosis of something the kernel never does. The
                 # tail rule below is what actually covers a branch: ops issued
-                # inside one are marked, and a *counted* wait that would have
-                # to count them is the error.
-                st = _walk(op.body, st, second, inner)
+                # inside one carry it in their scope, and once it closes, a
+                # *counted* wait that would have to count them is the error.
+                region = id(op)
+                st = _walk(op.body, st, second, scope + (region,))
+                st.queue = [(vid, c, v, kind,
+                             None if s is None or region in s else s)
+                            for vid, c, v, kind, s in st.queue]
             else:
                 # A loop. Run it twice and require agreement; see the module
                 # docstring.
-                after_first = _walk(op.body, st.copy(), second, inner)
-                st = _walk(op.body, after_first, True, inner)
+                after_first = _walk(op.body, st.copy(), second, scope)
+                st = _walk(op.body, after_first, True, scope)
             continue
 
         if op.opcode == "lds_wait_for":
@@ -178,8 +190,8 @@ def _walk(ops: List[Op], st: _State, second: bool, cond: bool = False) -> _State
             cut = max(positions) if positions else -1
             # Everything issued after the last-named tile stays in flight, and
             # its read count is exactly the lgkmcnt to wait down to.
-            n = sum(c for _, c, _, _, _cc in st.queue[cut + 1:])
-            if n and any(c for _, _, _, _, c in st.queue[cut + 1:]):
+            n = sum(c for _, c, _, _, _s in st.queue[cut + 1:])
+            if n and not all(_live(s, scope) for _, _, _, _, s in st.queue[cut + 1:]):
                 raise VerifyError(
                     f"this lds_wait_for needs lgkmcnt({n}), but some of the "
                     f"LDS ops it is counting were issued inside an hk.if_. A "
@@ -277,7 +289,7 @@ def _walk(ops: List[Op], st: _State, second: bool, cond: bool = False) -> _State
                 st.unbound.pop(id(dst), None)
                 st.bound.pop(id(dst), None)
                 st.queue.append((id(dst), op.attrs["lds_loads"], dst,
-                                 "read", cond))
+                                 "read", scope))
             continue
 
         if op.opcode == "store_frag":
@@ -285,7 +297,7 @@ def _walk(ops: List[Op], st: _State, second: bool, cond: bool = False) -> _State
             # kittens::store, which ends in lgkmcnt(0). Nothing ever names them
             # in a wait; they are here only to raise the immediate of every
             # wait issued while they are in flight.
-            st.queue.append((id(op), 2, op.operands[0], "write", cond))
+            st.queue.append((id(op), 2, op.operands[0], "write", scope))
             continue
 
         if op.opcode == "stage_commit":
@@ -300,7 +312,7 @@ def _walk(ops: List[Op], st: _State, second: bool, cond: bool = False) -> _State
                         st.unbound[vid] = op
                 st.queue = []
             else:
-                st.queue.append((id(op), buf.type.calls, dst, "write", cond))
+                st.queue.append((id(op), buf.type.calls, dst, "write", scope))
             continue
 
         _check_reads(op, st)

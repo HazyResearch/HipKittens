@@ -407,6 +407,75 @@ def test_a_conditional_op_the_wait_does_not_count_is_fine():
     _trace(conditional_head)
 
 
+def test_a_counted_wait_inside_the_branch_may_count_that_branch():
+    """Every wave that reaches a wait inside an `hk.if_` entered it and issued
+    what came before the wait in it, so counting those is the same number on
+    every wave. This is the batched read of a combine done by one warp."""
+    def same_branch(o: hk.GL[fp32]):
+        sa, ta = _pair(32, 64)
+        sb, tb = _pair(16, 32)
+        with hk.if_(ops.s_gt(ops.block_idx.x, 0)):
+            a = ops.load_shared(sa, ta, wait=False)
+            b = ops.load_shared(sb, tb, wait=False)
+            ops.lds_wait_for(a)          # lgkmcnt(4): b, issued in this branch
+            ops.copy(a, out=a)
+            ops.lds_wait_for(b)
+            ops.copy(b, out=b)
+
+    ir = _trace(same_branch)
+    assert [w.attrs["n"] for w in _waits(ir)] == [4, 0]
+
+
+def test_an_enclosing_branch_that_is_still_open_counts_too():
+    def nested(o: hk.GL[fp32]):
+        sa, ta = _pair(32, 64)
+        sb, tb = _pair(16, 32)
+        with hk.if_(ops.s_gt(ops.block_idx.x, 0)):
+            a = ops.load_shared(sa, ta, wait=False)
+            b = ops.load_shared(sb, tb, wait=False)
+            with hk.if_(ops.s_gt(ops.block_idx.y, 0)):
+                ops.lds_wait_for(a)      # b came from the enclosing branch
+                ops.copy(a, out=a)
+            ops.lds_wait_for(a, b)
+            ops.copy(b, out=b)
+
+    _trace(nested)
+
+
+def test_a_branch_that_has_closed_may_not_be_counted_from_its_parent():
+    def closed_inner(o: hk.GL[fp32]):
+        sa, ta = _pair(32, 64)
+        sb, tb = _pair(16, 32)
+        with hk.if_(ops.s_gt(ops.block_idx.x, 0)):
+            a = ops.load_shared(sa, ta, wait=False)
+            with hk.if_(ops.s_gt(ops.block_idx.y, 0)):
+                ops.load_shared(sb, tb, wait=False)
+            ops.lds_wait_for(a)          # would count b, which only some issued
+            ops.copy(a, out=a)
+
+    with pytest.raises(VerifyError, match="issued inside an hk.if_"):
+        _trace(closed_inner)
+
+
+def test_last_iterations_branch_is_closed_even_if_it_is_the_same_branch():
+    """The same static `hk.if_` inside a loop is a new branch every iteration.
+    Reads it left in flight last time are from a branch that has closed."""
+    def across_iterations(o: hk.GL[fp32]):
+        sa, ta = _pair(32, 64)
+        sb, tb = _pair(16, 32)
+        a = ops.load_shared(sa, ta, wait=False)
+        b = ops.zeros(tb)
+        for i in hk.range(4):
+            with hk.if_(ops.s_gt(i, 0)):
+                ops.lds_wait_for(a)
+                ops.copy(a, out=a)
+                ops.load_shared(sa, ta, wait=False, out=a)
+                ops.load_shared(sb, tb, wait=False, out=b)
+
+    with pytest.raises(VerifyError, match="issued inside an hk.if_"):
+        _trace(across_iterations)
+
+
 def test_a_draining_barrier_does_not_count_and_so_is_allowed():
     """`barrier(drain=True)` is lgkmcnt(0), which is the same instruction on
     every wave however many ops it issued."""
