@@ -741,6 +741,24 @@ was not the kernel that was hardest to beat, it was the one with 39% of the
 time in front of it, and finding that took a profile rather than an argument.
 The remaining 57.6% is GEMM, which is where the next look goes.
 
+Four facts about vLLM's plugin surface are written down in
+`vllm_backend.py` because each cost a run to find: `AttentionBackendEnum` is
+closed and `register_backend` overrides rather than adds; the reserved
+`CUSTOM` member is rejected by `RocmPlatform`'s allowlist, so the override has
+to target a member the platform accepts (`TRITON_ATTN`, which is also ROCm's
+default -- hence the separate `HK_VLLM_BACKEND=1` opt-in); `get_name()` must
+answer with the member it overrides because vLLM round-trips the name through
+the enum; and short prompts cannot use the dense kernel and cannot be padded
+into it, because zero-padded keys are not masked out, they are keys with score
+zero and `exp(0)` is a real weight in the softmax sum.
+
+Scope, stated rather than discovered: no paged *prefill* kernel, so prefix
+caching and chunked prefill are refused rather than silently attending over
+part of a context. The backend also declares that it cannot run inside a full
+CUDA graph -- it plans its KV split on the host from `max_seq_len`, which a
+graph would freeze at the capture batch -- so with graphs on, vLLM captures
+the model piecewise and runs this attention eagerly between the pieces.
+
 ### The other 57.6%: the linear layers
 
 On gfx1100 every one of those GEMMs ends in `torch.nn.functional.linear`, i.e.
@@ -1198,22 +1216,46 @@ GB/s). That last one is where what is left lives. The row predicate is
 also worth seeing here: without the pad, two and four tokens now beat
 `wvSplitK` per step, and 32 tokens dropped from 22.3 to 20.8 ms.
 
-Four facts about vLLM's plugin surface are written down in
-`vllm_backend.py` because each cost a run to find: `AttentionBackendEnum` is
-closed and `register_backend` overrides rather than adds; the reserved
-`CUSTOM` member is rejected by `RocmPlatform`'s allowlist, so the override has
-to target a member the platform accepts (`TRITON_ATTN`, which is also ROCm's
-default -- hence the separate `HK_VLLM_BACKEND=1` opt-in); `get_name()` must
-answer with the member it overrides because vLLM round-trips the name through
-the enum; and short prompts cannot use the dense kernel and cannot be padded
-into it, because zero-padded keys are not masked out, they are keys with score
-zero and `exp(0)` is a real weight in the softmax sum.
+### Strided globals, and the two patches they were for that lost
 
-Scope, stated rather than discovered: no paged *prefill* kernel, so prefix
-caching and chunked prefill are refused rather than silently attending over
-part of a context. The backend also declares that it cannot run inside a full
-CUDA graph -- it plans its KV split on the host from `max_seq_len`, which a
-graph would freeze at the capture batch -- so with graphs on, vLLM captures
-the model piecewise and runs this attention eagerly between the pieces.
+A global used to be a base pointer plus the strides implied by its shape, so
+any non-contiguous tensor was refused, and an engine's views had to be
+copied first. The case that motivated the change is vLLM's fused gate/up
+output (M, 2I), whose two halves `x[:, :I]` and `x[:, I:]` are what SiLU-mul
+reads.
+
+A global now carries one runtime row stride. It defaults to the column count,
+and `operator[]` and `stride<axis>()` use it, which every load and store goes
+through. Both entry points -- the pybind launcher and the torch-op scaffold
+-- accept a slice of the last axis: contiguous along it, rows evenly strided,
+outer axes compact over the rows. Anything else is refused with a message
+saying why, rather than read as if it were that. Contiguous tensors take the
+same path and pay the same one call as before. Rebuilt against the previous
+commit, 63 of 66 kernel families are identical; dequantize is +1 VGPR at the
+same rounded count and occupancy.
+
+What it was for did not survive measurement. The plan was SiLU-mul and a
+weighted RMSNorm in vLLM, each opt-in and kept only if the end-to-end did not
+lose. Before writing either, the kernels were timed against what the engine
+runs instead. In the mode vLLM ships, that is not its HIP kernels: under
+torch.compile both ops come from Inductor, fused with their neighbours.
+Kernel time on Qwen3-8B shapes, one process:
+
+```
+                               Inductor    hk
+SiLU-mul (4096, 2*12288)        409.5 us   429.7 us   (contiguous halves)
+RMSNorm  (4096, 4096)            38.8 us    55.8 us   (hk unweighted)
+RMSNorm  q/k heads (163840, 128) 42.9 us    70.4 us   (hk unweighted)
+```
+
+The library's RMSNorm loses by 44-64% before it even has a weight to
+multiply. An opaque op in that position would also cost Inductor the fusion
+of the residual add and the weight. Replacing it could only make the request
+slower, so both integrations were dropped rather than built and then
+measured losing. (At M=16-64 hk looks 2x faster in the same table; that is
+the compiled function's Python overhead, which does not exist inside vLLM's
+graph.) Not measured: vLLM's own eager kernels, the baseline only in
+`enforce_eager` mode. The strided global stays: it is what the next patch
+that receives a view instead of a tensor needs.
 
 See `.claude/plans/` for the full plan and its gates.

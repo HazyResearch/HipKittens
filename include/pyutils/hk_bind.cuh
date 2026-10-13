@@ -54,12 +54,13 @@ namespace fast {
  * as long as the module does. Constructed on the first launch, which is under
  * the GIL. */
 struct attr_keys {
-    PyObject *shape, *data_ptr, *is_contiguous, *is_cuda;
+    PyObject *shape, *data_ptr, *is_contiguous, *is_cuda, *stride;
     attr_keys()
         : shape(PyUnicode_InternFromString("shape")),
           data_ptr(PyUnicode_InternFromString("data_ptr")),
           is_contiguous(PyUnicode_InternFromString("is_contiguous")),
-          is_cuda(PyUnicode_InternFromString("is_cuda")) {}
+          is_cuda(PyUnicode_InternFromString("is_cuda")),
+          stride(PyUnicode_InternFromString("stride")) {}
 };
 inline const attr_keys &keys() { static const attr_keys k; return k; }
 
@@ -90,7 +91,40 @@ inline bool truthy(PyObject *obj, PyObject *name, const char *what) {
 }
 
 static constexpr const char *NOT_A_TENSOR =
-    "hk: expected a contiguous torch.Tensor on the GPU";
+    "hk: expected a torch.Tensor on the GPU";
+
+/* The row stride of a non-contiguous tensor `gl` can describe, or a throw.
+ *
+ * A gl is a base pointer, the four extents, and one row stride: elements are
+ * contiguous along the last axis, rows are `row stride` apart, and the outer
+ * axes are compact over the rows. That is exactly a slice of the last axis --
+ * x[..., I:] of an (M, 2I) tensor -- which is the view an engine hands over
+ * without a copy. Anything else would be read as if it were that, wrongly,
+ * so it is refused here rather than returned as plausible numbers. Only the
+ * non-contiguous path pays for the `stride()` call. */
+inline int strided_rows(PyObject *o, Py_ssize_t dims, const int s[4]) {
+    PyObject *st = call0(o, keys().stride, NOT_A_TENSOR);
+    if (!PyTuple_Check(st) || PyTuple_GET_SIZE(st) != dims) {
+        Py_DECREF(st);
+        fail(NOT_A_TENSOR);
+    }
+    long t[4] = {0, 0, 0, 1};
+    for (Py_ssize_t i = 0; i < dims; ++i)
+        t[4 - dims + i] = PyLong_AsLong(PyTuple_GET_ITEM(st, i));
+    Py_DECREF(st);
+    if (PyErr_Occurred()) fail(NOT_A_TENSOR);
+    const long row = dims >= 2 ? t[2] : s[3];
+    const bool ok = (s[3] == 1 || t[3] == 1)
+                 && row >= s[3]
+                 && (dims < 3 || s[1] == 1 || t[1] == s[2] * row)
+                 && (dims < 4 || s[0] == 1 || t[0] == s[1] * t[1]);
+    if (!ok)
+        fail("hk: a non-contiguous tensor is taken only as a slice of its last "
+             "axis -- contiguous along it, rows evenly strided, outer axes "
+             "compact over the rows (x[..., a:b] of a contiguous tensor). "
+             "This one is not; call .contiguous().");
+    return (int)row;
+}
 
 template<ducks::gl::all GL> GL to_gl(pybind11::handle h) {
     PyObject *o = h.ptr();
@@ -120,17 +154,14 @@ template<ducks::gl::all GL> GL to_gl(pybind11::handle h) {
     PyObject *cont = call0(o, k.is_contiguous, NOT_A_TENSOR);
     const int ok = PyObject_IsTrue(cont);
     Py_DECREF(cont);
-    if (ok != 1)
-        fail("hk: tensor must be contiguous -- a global is a base pointer "
-             "plus the strides implied by its shape, and a non-contiguous "
-             "view does not have the strides it claims. Call .contiguous().");
+    const int row_stride = ok == 1 ? -1 : strided_rows(o, dims, s);
 
     PyObject *p = call0(o, k.data_ptr, NOT_A_TENSOR);
     const uint64_t ptr = (uint64_t)PyLong_AsUnsignedLongLong(p);
     Py_DECREF(p);
     if (PyErr_Occurred()) fail(NOT_A_TENSOR);
 
-    return make_gl<GL>(ptr, s[0], s[1], s[2], s[3]);
+    return make_gl<GL>(ptr, s[0], s[1], s[2], s[3], row_stride);
 }
 
 template<typename T> struct from_object {

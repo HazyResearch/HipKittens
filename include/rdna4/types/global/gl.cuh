@@ -46,6 +46,13 @@ struct gl {
     ducks::gl::make_dim_t<d> depth_internal;
     ducks::gl::make_dim_t<r> rows_internal;
     ducks::gl::make_dim_t<c> cols_internal;
+    // Elements from one row to the next. cols() for a contiguous tensor; more
+    // for a column slice of a wider one -- x[..., I:] of an (M, 2I) tensor has
+    // cols() == I and a row stride of 2I. The outer axes stay compact over the
+    // rows (depth stride = rows * row stride), which is what a slice of the
+    // last axis is.
+    int row_stride_internal;
+    __device__ __host__ inline int row_stride() const { return row_stride_internal; }
 
     template <int B=__b__> __device__ __host__ static constexpr std::enable_if_t<(B > 0), int> batch() { return B; }
     template <int B=__b__> __device__ __host__ std::enable_if_t<(B == -1), int> batch() const { return batch_internal; }
@@ -62,14 +69,17 @@ struct gl {
                         ducks::gl::make_arg_t<b> _batch,
                         ducks::gl::make_arg_t<d> _depth,
                         ducks::gl::make_arg_t<r> _rows,
-                        ducks::gl::make_arg_t<c> _cols) :
-            raw_ptr(_data), batch_internal(_batch), depth_internal(_depth), rows_internal(_rows), cols_internal(_cols) {
+                        ducks::gl::make_arg_t<c> _cols,
+                        int _row_stride = -1) :
+            raw_ptr(_data), batch_internal(_batch), depth_internal(_depth), rows_internal(_rows), cols_internal(_cols),
+            row_stride_internal(_row_stride < 0 ? int(cols()) : _row_stride) {
         tma_descs = detail::descriptor_dict<TMA_Types...>(raw_ptr, batch_internal, depth_internal, rows_internal, cols_internal);
     }
     __host__ __device__ inline gl(const gl &other) :
-            raw_ptr(other.raw_ptr), batch_internal(other.batch_internal), depth_internal(other.depth_internal), rows_internal(other.rows_internal), cols_internal(other.cols_internal), tma_descs(other.tma_descs) {}
+            raw_ptr(other.raw_ptr), batch_internal(other.batch_internal), depth_internal(other.depth_internal), rows_internal(other.rows_internal), cols_internal(other.cols_internal),
+            row_stride_internal(other.row_stride_internal), tma_descs(other.tma_descs) {}
     __device__ inline T& operator[](const coord<ducks::default_type> &idx) const { // yes I am abusing the const qualifier here a bit.
-        return raw_ptr[((idx.b*depth() + idx.d)*rows() + idx.r)*cols() + idx.c];
+        return raw_ptr[((idx.b*depth() + idx.d)*rows() + idx.r)*row_stride() + idx.c];
     }
     template<int axis> __device__ inline size_t shape() const {
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
@@ -80,9 +90,9 @@ struct gl {
     }
     template<int axis> __device__ inline size_t stride() const { 
         static_assert(axis==0 || axis==1 || axis==2 || axis==3, "Axis must be 0, 1, 2, or 3.");
-        if      constexpr (axis==0) { return depth()*rows()*cols(); }
-        else if constexpr (axis==1) { return rows()*cols(); }
-        else if constexpr (axis==2) { return cols(); }
+        if      constexpr (axis==0) { return depth()*rows()*row_stride(); }
+        else if constexpr (axis==1) { return rows()*row_stride(); }
+        else if constexpr (axis==2) { return row_stride(); }
         else if constexpr (axis==3) { return 1; }
     }
 };
@@ -112,7 +122,8 @@ template<int N> auto make_unsafe_gl_arg(int param) { // typename std::conditiona
     if constexpr (N > 0) { return nullptr; }
     else                 { return param;   }
 }
-template<ducks::gl::all GL, bool safe=true> __host__ inline GL make_gl(uint64_t data, int b, int d, int r, int c) {
+template<ducks::gl::all GL, bool safe=true> __host__ inline GL make_gl(uint64_t data, int b, int d, int r, int c,
+                                                                       int row_stride = -1) {
     if constexpr (safe) {
         if(GL::__b__ > 0 && b != GL::__b__) {
             throw std::runtime_error("Batch dimension mismatch.");
@@ -127,12 +138,16 @@ template<ducks::gl::all GL, bool safe=true> __host__ inline GL make_gl(uint64_t 
             throw std::runtime_error("Column dimension mismatch.");
         }
     }
+    if (row_stride >= 0 && row_stride < c) {
+        throw std::runtime_error("Row stride shorter than a row.");
+    }
     return GL(
         reinterpret_cast<typename GL::dtype*>(data),
         make_unsafe_gl_arg<GL::__b__>(b),
         make_unsafe_gl_arg<GL::__d__>(d),
         make_unsafe_gl_arg<GL::__r__>(r),
-        make_unsafe_gl_arg<GL::__c__>(c)
+        make_unsafe_gl_arg<GL::__c__>(c),
+        row_stride
     );
 }
 
