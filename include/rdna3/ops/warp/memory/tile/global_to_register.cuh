@@ -41,9 +41,11 @@ using nt_vec4 = unsigned int __attribute__((ext_vector_type(4)));
  * run. They write identical bytes, which is the same benign duplicate the
  * mirrored operand path already relies on.
  *
- * `__shfl_xor(..., 16, 32)` is the exchange; on gfx11 wave32 that is the two
- * halves of the wave, which is exactly the pairing `halves_interleave`
- * describes.
+ * The exchange is lane l with lane l^16 -- on gfx11 wave32 the two halves of
+ * the wave, which is exactly the pairing `halves_interleave` describes -- and
+ * it is v_permlanex16 with identity selects, a VALU op. `__shfl_xor` computes
+ * the same thing as a ds_bpermute through the LDS crossbar, with a wait on it:
+ * 32 of them, and 51 s_waitcnt, in a kernel that stores one 16x64 tile.
  *
  * @tparam U Destination element type (narrower than, or equal to, the tile's).
  * @tparam E Elements one lane holds per base tile.
@@ -67,7 +69,9 @@ __device__ inline void pack_interleaved_run(const U (&val)[E], int half,
         w[byte >> 2] |= bits << ((byte & 3) * 8);
     }
     #pragma unroll
-    for(int k = 0; k < NW; k++) w[k] |= __shfl_xor(w[k], 16, 32);
+    for(int k = 0; k < NW; k++)
+        w[k] |= __builtin_amdgcn_permlanex16(w[k], w[k], 0x76543210u, 0xfedcba98u,
+                                             false, false);
 }
 }
 
@@ -495,9 +499,8 @@ __device__ inline void buffer_store_elem(i32x4 srsrc, uint32_t off, U v) {
  * @brief load(), predicated on the tensor's rows: rows of the tile past the
  * last row of `src` read as zero, and their memory is never touched.
  *
- * Same lane mapping and the same two 16-byte accesses per base tile as load()
- * on its vectorised path; everything else goes element by element, including
- * the widening case load() vectorises.
+ * Same lane mapping and the same 16-byte accesses per base tile as load() on
+ * its vectorised and widening paths; everything else goes element by element.
  */
 template<int axis, ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
 __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &idx,
@@ -511,6 +514,13 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
     constexpr int  E      = base::elements_per_thread;
     constexpr bool vectorizable = is_row && base::element_stride == 1
                                          && std::is_same_v<T, U> && sizeof(U) == 2;
+    // load()'s widening read (see there): the lane's whole run, then its own
+    // entries of it. Element by element, a bf16 row into an fp32 tile was 32
+    // buffer_load_u16 a 16x64 tile, and the alternative -- a bf16 tile and a
+    // copy() -- moves every element across the wave halves twice.
+    constexpr int  RUN  = base::tile_size_col;
+    constexpr bool widening = is_row && !vectorizable && sizeof(U) < sizeof(T)
+                                     && (RUN * sizeof(U)) % 16 == 0;
 
     // The buffer starts at the tile's first row, column 0, and the column
     // offset rides in soffset. In a K loop that makes the descriptor and every
@@ -527,6 +537,7 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
     const i32x4 srsrc = detail::row_bounded_srsrc<axis, RT::rows>(src, unit, row_ptr, limit);
     const int lane = laneid();
     const int l16  = lane & 15;
+    const int half = lane >> 4;
 
     auto elementwise = [&](int i, int j, int row_base, int col_base) {
         #pragma unroll
@@ -535,6 +546,30 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
             const uint32_t off = ((row_base + c.x)*row_stride + col_base + c.y) * sizeof(U);
             const T val = base_types::convertor<T, U>::convert(
                 detail::buffer_load_elem<U>(srsrc, off, col0));
+            if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
+            else       dst.tiles[i][j].data[e>>1].x = val;
+        }
+    };
+
+    // Constant indices into `run` and a select, as in load()'s widened(): an
+    // index that depends on the half would put `run` in scratch.
+    auto widened = [&](int i, int j, int row_base, int col_base) {
+        constexpr int NV  = RUN * sizeof(U) / 16;
+        constexpr int PER = 16 / sizeof(U);
+        const uint32_t off = ((row_base + l16)*row_stride + col_base) * sizeof(U);
+        U run[RUN];
+        #pragma unroll
+        for(int k = 0; k < NV; k++) {
+            const __uint128_t raw = llvm_amdgcn_raw_buffer_load_b128(srsrc, off + 16*k, col0, 0);
+            __builtin_memcpy(&run[k*PER], &raw, sizeof(raw));
+        }
+        #pragma unroll
+        for(int e = 0; e < E; e++) {
+            const int c0 = rt_base_coord<T, L>(e, 0).y;
+            const int c1 = rt_base_coord<T, L>(e, 16).y;
+            const T v0 = base_types::convertor<T, U>::convert(run[c0]);
+            const T v1 = base_types::convertor<T, U>::convert(run[c1]);
+            const T val = half ? v1 : v0;
             if (e & 1) dst.tiles[i][j].data[e>>1].y = val;
             else       dst.tiles[i][j].data[e>>1].x = val;
         }
@@ -561,6 +596,7 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
                     __builtin_memcpy((void*)&dst.tiles[i][j].data[4*h], &raw, sizeof(raw));
                 }
             }
+            else if constexpr (widening) widened(i, j, row_base, col_base);
             else elementwise(i, j, row_base, col_base);
         }
     }
