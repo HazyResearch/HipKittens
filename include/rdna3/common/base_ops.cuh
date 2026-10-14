@@ -217,6 +217,17 @@ template<> __device__ inline half   relu::op<half>  (const half &x  ) { return _
 template<> __device__ inline half_2 relu::op<half_2>(const half_2 &x) { return half_2{__hmax(x.x, base_types::constants<half>::zero()),
                                                                                      __hmax(x.y, base_types::constants<half>::zero())}; }
 
+/**
+ * @brief The unit step: 1 where x > 0, else 0. With a subtraction in front it
+ * is a comparison as a multiplier -- a dropout's keep mask, x * step(r - p).
+ */
+struct step {
+    template<typename T> static __device__ inline T op(const T &x);
+};
+template<> __device__ inline float  step::op<float> (const float &x ) { return x > 0.f ? 1.f : 0.f; }
+template<> __device__ inline float2 step::op<float2>(const float2 &x) { return float2{x.x > 0.f ? 1.f : 0.f,
+                                                                                     x.y > 0.f ? 1.f : 0.f}; }
+
 constexpr float SQRT_2_OVER_PI   = 0.7978845608028654f;
 constexpr float GELU_COEFF       = 0.044715f;
 constexpr float GELU_INNER_COEFF = GELU_COEFF * SQRT_2_OVER_PI;

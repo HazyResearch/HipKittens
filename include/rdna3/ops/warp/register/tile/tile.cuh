@@ -9,6 +9,7 @@
 #include "maps.cuh"
 #include "reductions.cuh"
 #include "mma.cuh"
+#include "random.cuh"
 
 
 

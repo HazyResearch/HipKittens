@@ -509,6 +509,14 @@ __device__ static inline void silu(T &dst, const T &src) {
     unary_map<base_ops::silu, T>(dst, src);
 }
 /**
+ * @brief The unit step of each element: 1 where it is positive, else 0.
+ * Float tiles only.
+ */
+template<ducks::rt::all T>
+__device__ static inline void step(T &dst, const T &src) {
+    unary_map<base_ops::step, T>(dst, src);
+}
+/**
  * @brief Applies the GELU function (tanh approximation) to each element of a tile.
  *
  * @tparam T Tile type.
