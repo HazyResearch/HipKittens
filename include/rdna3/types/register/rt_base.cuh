@@ -142,6 +142,28 @@ __device__ static inline int rv_align_elem(int p, int lane) {
     else                                   return p; // replication 2: every lane holds every entry
 }
 
+/**
+ * @brief The other direction: how many entries of a 16-entry align_l block a
+ * lane holds, and which entry its `e`-th slot is.
+ *
+ * Accesses are written as a loop over these slots, not over all sixteen
+ * entries with rv_align_elem's -1 skipped: the skip depends on the lane, so
+ * that form compiles to one divergent branch -- and one serialized memory
+ * round trip -- per entry, where this one is a straight run of loads whose
+ * address merely differs by half.
+ */
+template<typename T>
+__device__ static inline constexpr int rv_align_held() {
+    using base = rt_base<T, ducks::rt_layout::row>;
+    return base::halves_interleave ? TILE_ROW_DIM<T> / 2 : TILE_ROW_DIM<T>;
+}
+template<typename T>
+__device__ static inline int rv_align_entry(int e, int lane) {
+    using base = rt_base<T, ducks::rt_layout::row>;
+    if constexpr (base::halves_interleave) return 2 * e + (lane >> 4);
+    else                                   return e;
+}
+
 /* ----------  CONCEPTS  ---------- */
 
 namespace ducks {

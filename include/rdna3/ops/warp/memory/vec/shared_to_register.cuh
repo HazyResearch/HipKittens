@@ -30,7 +30,38 @@ namespace kittens {
  * None of these are bandwidth-critical (a vector is 1/16 of a tile), so they are
  * all plain elementwise accesses. Lanes that map to the same entry issue the
  * same address and LDS broadcasts them.
+ *
+ * They do go through an address_space(3) pointer rather than src.data: a
+ * shared vector reached through shared_allocator is a generic pointer (see
+ * util.cuh), and generic accesses compile to flat_load/flat_store, which count
+ * against vmcnt as well as lgkmcnt -- every wait on one becomes a wait on all
+ * outstanding global traffic too. LDS completes in order, so the compiler's
+ * own waits for these stay correct beside the library's inline-asm LDS ops.
  */
+namespace detail {
+// Moved as raw bits: bf16 and half are class types, and neither a reference
+// nor `this` can bind to an address_space(3) object.
+template<typename U>
+using lds_bits = std::conditional_t<sizeof(U) == 2, uint16_t,
+                 std::conditional_t<sizeof(U) == 4, uint32_t, uint64_t>>;
+template<typename U>
+__device__ inline U lds_read(const U *p) {
+    static_assert(sizeof(U) == 2 || sizeof(U) == 4 || sizeof(U) == 8);
+    using B = lds_bits<U>;
+    const B b = *(__attribute__((address_space(3))) const B*)(uint32_t)(uintptr_t)p;
+    U u;
+    __builtin_memcpy(&u, &b, sizeof(U));
+    return u;
+}
+template<typename U>
+__device__ inline void lds_write(U *p, const U &u) {
+    static_assert(sizeof(U) == 2 || sizeof(U) == 4 || sizeof(U) == 8);
+    using B = lds_bits<U>;
+    B b;
+    __builtin_memcpy(&b, &u, sizeof(U));
+    *(__attribute__((address_space(3))) B*)(uint32_t)(uintptr_t)p = b;
+}
+} // namespace detail
 
 /**
  * @brief Load data from a shared vector into a register vector.
@@ -54,10 +85,10 @@ __device__ inline static void load(RV &dst, const SV &src) {
         #pragma unroll
         for(int w = 0; w < dst.outer_dim; w++) {
             #pragma unroll
-            for(int p = 0; p < kittens::TILE_ROW_DIM<T>; p++) {
-                const int e = rv_align_elem<T>(p, lane);
-                if(e < 0) continue;
-                const T val = base_types::convertor<T, U>::convert(src.data[w*kittens::TILE_ROW_DIM<T> + p]);
+            for(int e = 0; e < rv_align_held<T>(); e++) {
+                const int p = rv_align_entry<T>(e, lane);
+                const T val = base_types::convertor<T, U>::convert(
+                    detail::lds_read(&src.data[w*kittens::TILE_ROW_DIM<T> + p]));
                 if(e & 1) dst.data[w][e>>1].y = val;
                 else      dst.data[w][e>>1].x = val;
             }
@@ -67,7 +98,7 @@ __device__ inline static void load(RV &dst, const SV &src) {
         #pragma unroll
         for(int w = 0; w < dst.outer_dim; w++) {
             dst[w][0] = base_types::convertor<T, U>::convert(
-                src.data[w*kittens::TILE_ROW_DIM<T> + (lane & 15)]);
+                detail::lds_read(&src.data[w*kittens::TILE_ROW_DIM<T> + (lane & 15)]));
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, naive_l>) {
@@ -75,7 +106,7 @@ __device__ inline static void load(RV &dst, const SV &src) {
         for(int w = 0; w < dst.outer_dim; w++) {
             const int idx = w*WARP_THREADS + lane;
             if(idx < dst.length) {
-                dst[w][0] = base_types::convertor<T, U>::convert(src.data[idx]);
+                dst[w][0] = base_types::convertor<T, U>::convert(detail::lds_read(&src.data[idx]));
             }
         }
     }
@@ -105,19 +136,19 @@ __device__ inline static void store(SV &dst, const RV &src) {
         #pragma unroll
         for(int w = 0; w < src.outer_dim; w++) {
             #pragma unroll
-            for(int p = 0; p < kittens::TILE_ROW_DIM<T>; p++) {
-                const int e = rv_align_elem<T>(p, lane);
-                if(e < 0) continue;
+            for(int e = 0; e < rv_align_held<T>(); e++) {
+                const int p = rv_align_entry<T>(e, lane);
                 const T val = (e & 1) ? src.data[w][e>>1].y : src.data[w][e>>1].x;
-                dst.data[w*kittens::TILE_ROW_DIM<T> + p] = base_types::convertor<U, T>::convert(val);
+                detail::lds_write(&dst.data[w*kittens::TILE_ROW_DIM<T> + p],
+                                  base_types::convertor<U, T>::convert(val));
             }
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, ortho_l>) {
         #pragma unroll
         for(int w = 0; w < src.outer_dim; w++) {
-            dst.data[w*kittens::TILE_ROW_DIM<T> + (lane & 15)] =
-                base_types::convertor<U, T>::convert(src[w][0]);
+            detail::lds_write(&dst.data[w*kittens::TILE_ROW_DIM<T> + (lane & 15)],
+                              base_types::convertor<U, T>::convert(src[w][0]));
         }
     }
     else if constexpr (std::is_same_v<typename RV::layout, naive_l>) {
@@ -125,7 +156,7 @@ __device__ inline static void store(SV &dst, const RV &src) {
         for(int w = 0; w < src.outer_dim; w++) {
             const int idx = w*WARP_THREADS + lane;
             if(idx < src.length) {
-                dst.data[idx] = base_types::convertor<U, T>::convert(src[w][0]);
+                detail::lds_write(&dst.data[idx], base_types::convertor<U, T>::convert(src[w][0]));
             }
         }
     }
