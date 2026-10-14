@@ -31,6 +31,10 @@ We support CDNA3 and CDNA 4.
 > `include/rdna4` is written but has never run on hardware.
 > See **[RDNA.md](RDNA.md)** for the state of it, what is verified and what is
 > not, and the three hardware facts the whole port is derived from.
+>
+> The Python language and compiler built on this port, `hk`, is its own
+> repository, **[hk-dsl](https://github.com/vivienfanghuagood/hk-dsl)**, which
+> uses this branch as its backend.
 
 
 

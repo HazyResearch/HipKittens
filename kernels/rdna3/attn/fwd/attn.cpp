@@ -278,8 +278,8 @@ template<int N, typename F> __device__ inline void static_for(F &&f) {
 
 // The LDS addressing for the two hot matmuls (lds_granules / lds_read_frag /
 // lds_write_frag) now lives in include/rdna3/ops/warp/memory/util/granule.cuh.
-// It was found here; it is in the library because the generated kernels in
-// python/hk need it for exactly the same reason.
+// It was found here; it is in the library because the kernels hk-dsl
+// generates need it for exactly the same reason.
 using kittens::lds_granules;
 using kittens::lds_read_frag;
 using kittens::lds_write_frag;

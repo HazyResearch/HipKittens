@@ -69,7 +69,7 @@ lighter from this alone).
 **gfx11 runs with unaligned global/buffer access enabled.** LLVM merges a
 loop of 16-bit loads at unknown alignment into `global_load_b128`, and a
 `buffer_load_b128` from a tensor 2 bytes off a 16-byte boundary returns the
-right data (HipKittens `tests/hk/gpu/test_bounded.py`). An alignment
+right data (hk-dsl `tests/hk/gpu/test_bounded.py`). An alignment
 fallback around buffer intrinsics is not free: LLVM cannot merge the
 intrinsics, and reserves the fallback's registers whether it runs or not.
 
@@ -117,7 +117,7 @@ differences. See `measurement.md` §1.
 build, in an eager vLLM step whose launches run ahead of the GPU, the chrome
 trace's kernel durations summed to 4.4x the step's wall time (a 3-call H2D
 memcpy "took" 618 ms). They measure from enqueue, not from start. Time steps
-or calls with a synchronize on each side instead (HipKittens
+or calls with a synchronize on each side instead (hk-dsl
 `tools/hk-bench/vllm_steps.py --time-linear`).
 
 **A library GEMM's speed can depend on the process it runs in.** Measured
@@ -133,7 +133,7 @@ measures cache bandwidth and reports figures above the card's memory peak.
 Rotate buffers.
 
 **Rotating a few copies is not enough either; time a pass over distinct
-weights.** Measured 2026-10-12 (HipKittens `tools/hk-bench/vllm_gemm.py`,
+weights.** Measured 2026-10-12 (hk-dsl `tools/hk-bench/vllm_gemm.py`,
 Qwen3-8B shapes): per-call event timing over 3 rotating copies of a 100.7 MB
 matrix (302 MB, 3x the cache) had upstream vLLM's `wvSplitK` reading "at"
 1917 GB/s, 2.2x HBM peak; 6 copies of a 50 MB matrix gave 1639. Over 36

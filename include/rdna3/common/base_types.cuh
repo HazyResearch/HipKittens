@@ -334,7 +334,7 @@ template<> struct convertor<float, bf16> {
 //: through this on every KV block while summing the fp32 ones for the
 //: denominator, so the bias does not cancel, it accumulates into the ratio.
 //:
-//: What it cost, measured (tools/hk-bench/attn_precision.py --exact): set V
+//: What it cost, measured (hk-dsl tools/hk-bench/attn_precision.py --exact): set V
 //: to all ones and the softmax weights sum to one, so attention must return
 //: exactly 1.0 for every element whatever Q and K were. torch returned
 //: exactly 1.0. This kernel returned 1.0 off by 2^-8 -- one whole bf16 ulp --
@@ -344,7 +344,7 @@ template<> struct convertor<float, bf16> {
 //: other.
 //:
 //: Four settings, so the trade can be measured in one process
-//: (tools/hk-bench/bf16_round_cost.py) rather than argued about. Cost is
+//: (hk-dsl tools/hk-bench/bf16_round_cost.py) rather than argued about. Cost is
 //: attention at head_dim 128 / head_dim 64; GEMM is 0.2% for all of them,
 //: because its conversion is once per output element and not once per
 //: probability:

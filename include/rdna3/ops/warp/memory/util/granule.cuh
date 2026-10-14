@@ -124,7 +124,7 @@ __device__ inline void lds_read_frag(BT &dst, const lds_granules<ST> &gr) {
 // The same two, taking a whole 1x1 register tile rather than its base. A
 // caller that already has the fragment decomposed (the handwritten attention
 // kernel indexes `dst.tiles[r][c]`) wants the base overloads above; a caller
-// whose unit of value *is* one 16x16 tile (anything generated from python/hk,
+// whose unit of value *is* one 16x16 tile (anything hk-dsl generates,
 // where every fragment is its own IR value) wants these. The static_assert is
 // the whole implementation: a wider tile has more than one base and the
 // fragment coordinate would be ambiguous.

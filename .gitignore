@@ -15,7 +15,6 @@ tests/unit/*/unit_tests
 hsakmt_counters.csv
 *.o
 build/
-dist/
 *.egg-info/
 *.pyc
 *.pyo
@@ -51,6 +50,3 @@ kernels/cdna5/gemm/bf16fp32/gfx1250/archive/*.sbatch
 kernels/cdna5/gemm/bf16fp32/gfx1250/archive/*.out
 
 !CMakeLists.txt
-# The hk MLIR dialect: CMake files are source, the built package is not.
-!CMakeLists.txt
-python/hk/_mlir/

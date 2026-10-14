@@ -1,6 +1,0 @@
-add_subdirectory(Dialect/HK/IR)
-add_subdirectory(Support)
-add_subdirectory(Target)
-add_subdirectory(Dialect/HK/Transforms)
-add_subdirectory(Target/Cpp)
-add_subdirectory(CAPI)
