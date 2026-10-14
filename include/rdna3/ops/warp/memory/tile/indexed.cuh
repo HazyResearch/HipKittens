@@ -29,13 +29,15 @@ __device__ inline i32x4 whole_srsrc(const GL &g, uint32_t &oob, int &nrows) {
     return make_srsrc(g.raw_ptr, oob);
 }
 
-/// This lane's row index for base-tile row `i`: idx[at + 16*i + lane%16],
+/// This lane's row index for base-tile row `i`: idx[at + 16*i + lane%16] / div,
 /// or -1 at or past `count`.
 template<ducks::gl::all IL>
-__device__ inline int gather_index(const IL &idx, int at, int count, int i) {
+__device__ inline int gather_index(const IL &idx, int at, int count, int i, int div = 1) {
     static_assert(std::is_same_v<typename IL::dtype, int>, "row indices are int32");
     const int pos = at + 16 * i + (laneid() & 15);
-    return pos < count ? idx.raw_ptr[pos] : -1;
+    if (pos >= count) return -1;
+    const int v = idx.raw_ptr[pos];
+    return div == 1 ? v : v / div;
 }
 
 } // namespace detail
@@ -53,10 +55,14 @@ __device__ inline int gather_index(const IL &idx, int at, int count, int i) {
  *
  * Row layout only: a lane's elements of a base tile are all in its row,
  * which is what lets the row's address be a per-lane value.
+ *
+ * `div` divides each index: vLLM's MoE sort lists (token, choice) pairs as
+ * token * top_k + choice, and the token's row is the pair over top_k. Its
+ * padding, top_k * tokens, lands on row `tokens`, past the end.
  */
 template<ducks::rt::all RT, ducks::gl::all GL, ducks::gl::all IL>
 __device__ inline static void load_gather(RT &dst, const GL &src, const IL &idx,
-                                          int at, int count, int col) {
+                                          int at, int count, int col, int div = 1) {
     using T  = typename base_types::packing<typename RT::dtype>::unpacked_type;
     using U  = typename GL::dtype;
     using L  = typename RT::layout;
@@ -76,7 +82,7 @@ __device__ inline static void load_gather(RT &dst, const GL &src, const IL &idx,
 
     #pragma unroll
     for (int i = 0; i < dst.height; i++) {
-        const int r = detail::gather_index(idx, at, count, i);
+        const int r = detail::gather_index(idx, at, count, i, div);
         const uint32_t row_off = (r >= 0 && r < nrows)
             ? uint32_t(r) * row_bytes + uint32_t(col) * sizeof(U) : oob;
         #pragma unroll
