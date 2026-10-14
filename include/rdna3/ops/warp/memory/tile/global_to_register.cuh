@@ -452,8 +452,12 @@ __device__ inline static void store(const GL &dst, const RT &src, const COORD &i
 namespace detail {
 
 template<int axis, int ROWS, typename GL, typename COORD>
-__device__ inline i32x4 row_bounded_srsrc(const GL &g, const COORD &unit, const void *base) {
-    const int valid = rows_in_bounds<axis, ROWS>(g, unit);
+__device__ inline i32x4 row_bounded_srsrc(const GL &g, const COORD &unit, const void *base,
+                                          int limit = ROWS) {
+    // `limit` clips further, for a caller whose rows end before the
+    // tensor's do: a query tile that runs into the next request's tokens.
+    const int in = rows_in_bounds<axis, ROWS>(g, unit);
+    const int valid = limit < 0 ? 0 : (limit < in ? limit : in);
     const uint32_t bytes = uint32_t(valid) * uint32_t(g.template stride<axis>()) *
                            uint32_t(sizeof(typename GL::dtype));
     return make_srsrc(base, bytes);
@@ -496,7 +500,8 @@ __device__ inline void buffer_store_elem(i32x4 srsrc, uint32_t off, U v) {
  * the widening case load() vectorises.
  */
 template<int axis, ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
-__device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &idx) {
+__device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &idx,
+                                           int limit = RT::rows) {
     using T  = typename base_types::packing<typename RT::dtype>::unpacked_type;
     using U  = typename GL::dtype;
     using L    = typename RT::layout;
@@ -519,7 +524,7 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
     // An SGPR operand, and uniform by the same argument as the descriptor.
     const uint32_t col0 = __builtin_amdgcn_readfirstlane(uint32_t(unit.c) * sizeof(U));
     const int row_stride = src.template stride<axis>();
-    const i32x4 srsrc = detail::row_bounded_srsrc<axis, RT::rows>(src, unit, row_ptr);
+    const i32x4 srsrc = detail::row_bounded_srsrc<axis, RT::rows>(src, unit, row_ptr, limit);
     const int lane = laneid();
     const int l16  = lane & 15;
 
@@ -561,8 +566,9 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
     }
 }
 template<ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
-__device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &idx) {
-    load_bounded<2, RT, GL, COORD>(dst, src, idx);
+__device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &idx,
+                                           int limit = RT::rows) {
+    load_bounded<2, RT, GL, COORD>(dst, src, idx, limit);
 }
 
 /**
@@ -573,7 +579,8 @@ __device__ inline static void load_bounded(RT &dst, const GL &src, const COORD &
  * are store_at()'s, writing through the buffer; the rest go element by element.
  */
 template<int axis, ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
-__device__ inline static void store_bounded(const GL &dst, const RT &src, const COORD &idx) {
+__device__ inline static void store_bounded(const GL &dst, const RT &src, const COORD &idx,
+                                            int limit = RT::rows) {
     using T  = typename base_types::packing<typename RT::dtype>::unpacked_type;
     using U  = typename GL::dtype;
     using L    = typename RT::layout;
@@ -592,7 +599,7 @@ __device__ inline static void store_bounded(const GL &dst, const RT &src, const 
     const auto unit = idx.template unit_coord<axis, 3>();
     U *dst_ptr = (U*)&dst[unit];
     const int row_stride = dst.template stride<axis>();
-    const i32x4 srsrc = detail::row_bounded_srsrc<axis, RT::rows>(dst, unit, dst_ptr);
+    const i32x4 srsrc = detail::row_bounded_srsrc<axis, RT::rows>(dst, unit, dst_ptr, limit);
     const int lane = laneid();
     const int l16  = lane & 15;
     const int half = lane >> 4;
@@ -655,8 +662,9 @@ __device__ inline static void store_bounded(const GL &dst, const RT &src, const 
     }
 }
 template<ducks::rt::all RT, ducks::gl::all GL, ducks::coord::tile COORD=coord<RT>>
-__device__ inline static void store_bounded(const GL &dst, const RT &src, const COORD &idx) {
-    store_bounded<2, RT, GL, COORD>(dst, src, idx);
+__device__ inline static void store_bounded(const GL &dst, const RT &src, const COORD &idx,
+                                            int limit = RT::rows) {
+    store_bounded<2, RT, GL, COORD>(dst, src, idx, limit);
 }
 
 }
