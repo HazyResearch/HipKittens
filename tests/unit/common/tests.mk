@@ -52,8 +52,10 @@ ifeq ($(GPU_TARGET),CDNA4)
 HIPFLAGS += -DKITTENS_CDNA4 --offload-arch=gfx950 -DHIP_ENABLE_WARP_SYNC_BUILTINS
 else ifeq ($(GPU_TARGET),CDNA5)
 HIPFLAGS += -DKITTENS_CDNA5 --offload-arch=gfx1250
+else ifeq ($(GPU_TARGET),RDNA4)
+HIPFLAGS += -DKITTENS_RDNA4 --offload-arch=gfx1201
 else
-$(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA4, CDNA5)
+$(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA4, CDNA5, RDNA4)
 endif
 
 # Suppress warnings

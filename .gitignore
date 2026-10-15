@@ -50,3 +50,9 @@ kernels/cdna5/gemm/bf16fp32/gfx1250/archive/*.sbatch
 kernels/cdna5/gemm/bf16fp32/gfx1250/archive/*.out
 
 !CMakeLists.txt
+# rdna4 kernel build outputs
+kernels/rdna4/gemm/bf16fp32/128_512_64_16_ws8p16c
+kernels/rdna4/gemm/bf16fp32/128_192_64_64_pingpong
+kernels/rdna4/gemm/int8/gemm_i8
+kernels/rdna4/gemm/int8/mma_i8_test
+kernels/rdna4/attn/attn_fwd

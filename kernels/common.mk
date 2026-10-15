@@ -22,8 +22,11 @@ else ifeq ($(GPU_TARGET),CDNA3)
 else ifeq ($(GPU_TARGET),CDNA5)
   KITTENS_ARCH_DEFINE := -DKITTENS_CDNA5
   KITTENS_OFFLOAD_ARCH := gfx1250
+else ifeq ($(GPU_TARGET),RDNA4)
+  KITTENS_ARCH_DEFINE := -DKITTENS_RDNA4
+  KITTENS_OFFLOAD_ARCH := gfx1201
 else
-  $(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA3, CDNA4, CDNA5)
+  $(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA3, CDNA4, CDNA5, RDNA4)
 endif
 
 PYTHON ?= python3
