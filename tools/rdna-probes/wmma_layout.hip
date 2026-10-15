@@ -1,4 +1,4 @@
-// Empirically determine the register layouts of RDNA3/RDNA4 WMMA.
+// Empirically determine the register layouts of RDNA3 WMMA.
 //
 // Method (gauge-aware): the absolute labelling of A's rows, B's cols and the
 // reduction index k is a gauge freedom -- what a GEMM actually needs is a

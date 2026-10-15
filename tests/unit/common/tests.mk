@@ -26,7 +26,7 @@ COMP_LEVEL     ?= profile
 TEST_INTENSITY ?= 2
 
 ifndef GPU_TARGET
-$(error GPU_TARGET is not set. Expected CDNA4, CDNA5, RDNA3 or RDNA4)
+$(error GPU_TARGET is not set. Expected CDNA4, CDNA5 or RDNA3)
 endif
 ifndef TEST_DEFINES
 $(error TEST_DEFINES is not set, e.g. -DTEST_WARP_MEMORY_TILE_GLOBAL_TO_REGISTER)
@@ -55,10 +55,8 @@ else ifeq ($(GPU_TARGET),CDNA5)
 HIPFLAGS += -DKITTENS_CDNA5 --offload-arch=gfx1250
 else ifeq ($(GPU_TARGET),RDNA3)
 HIPFLAGS += -DKITTENS_RDNA3 --offload-arch=gfx1100
-else ifeq ($(GPU_TARGET),RDNA4)
-HIPFLAGS += -DKITTENS_RDNA4 --offload-arch=gfx1201
 else
-$(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA4, CDNA5, RDNA3, RDNA4)
+$(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA4, CDNA5, RDNA3)
 endif
 
 # Suppress warnings

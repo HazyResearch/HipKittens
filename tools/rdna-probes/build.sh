@@ -6,7 +6,6 @@ arch="${2:-gfx1100}"
 mode="${3:-}"
 case "$arch" in
     gfx1100) def=-DKITTENS_RDNA3 ;;
-    gfx1201) def=-DKITTENS_RDNA4 ;;
     *) echo "unknown arch $arch" >&2; exit 1 ;;
 esac
 cd "$(dirname "$0")"

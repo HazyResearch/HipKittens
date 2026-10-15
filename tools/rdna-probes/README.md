@@ -1,10 +1,9 @@
 # RDNA hardware probes
 
-Standalone HIP programs that measure what the RDNA3 / RDNA4 port is built on.
+Standalone HIP programs that measure what the RDNA3 port is built on.
 They do not use the library (except where noted) and they do not need it to be
-correct — that is the point. When something in `include/rdna3` or
-`include/rdna4` disagrees with the hardware, these are what tell you which side
-is wrong.
+correct — that is the point. When something in `include/rdna3` disagrees with
+the hardware, these are what tell you which side is wrong.
 
 ```bash
 ./build.sh wmma_layout.hip gfx1100        # compile
@@ -14,7 +13,7 @@ is wrong.
 ```
 
 `build.sh <file.hip> [arch] [--asm]` — `arch` is `gfx1100` or `gfx1201` and sets
-`-DKITTENS_RDNA3` / `-DKITTENS_RDNA4`. `--asm` stops at assembly, which is how
+`-DKITTENS_RDNA3`. `--asm` stops at assembly, which is how
 the gfx12 claims were checked without a gfx12 card.
 
 ## What each one establishes

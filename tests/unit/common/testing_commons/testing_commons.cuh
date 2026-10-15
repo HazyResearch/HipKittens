@@ -41,7 +41,7 @@ template<typename T2, typename U2> std::string generate_copy_name() {
 // the MFMA instruction geometries, while RDNA's WMMA has exactly one -- so the
 // lookup is written once here and guarded, rather than repeated at each use.
 template<kittens::ducks::rt_shape::all RT_SHAPE> std::string rt_shape_name() {
-#if defined(KITTENS_RDNA3) || defined(KITTENS_RDNA4)
+#if defined(KITTENS_RDNA3)
     static_assert(std::is_same_v<typename kittens::ducks::rt_shape::rt_16x16, RT_SHAPE>, "Unknown shape");
     return "_[rt_16x16]";
 #else
@@ -56,7 +56,7 @@ template<kittens::ducks::rt_shape::all RT_SHAPE> std::string rt_shape_name() {
 #endif
 }
 template<kittens::ducks::st_shape::all ST_SHAPE> std::string st_shape_name() {
-#if defined(KITTENS_RDNA3) || defined(KITTENS_RDNA4)
+#if defined(KITTENS_RDNA3)
     static_assert(std::is_same_v<typename kittens::ducks::st_shape::st_16x16, ST_SHAPE>, "Unknown shape");
     return "_[st_16x16]";
 #else
@@ -205,7 +205,7 @@ template<typename T> using gmem_dtype = typename gmem_wrapper<T>::dtype;
 
 // The default shape a test falls back to when it does not name one. RDNA has a
 // single shape, so there is nothing else it could be.
-#if defined(KITTENS_RDNA3) || defined(KITTENS_RDNA4)
+#if defined(KITTENS_RDNA3)
 #define TK_DEFAULT_RT_SHAPE kittens::ducks::rt_shape::rt_16x16
 #define TK_DEFAULT_ST_SHAPE kittens::ducks::st_shape::st_16x16
 #else

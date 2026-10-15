@@ -59,11 +59,6 @@ then never pushes it, so an mma failure prints but is missing from the tally at
 the end. This tree pushes it. If you diff the two files, that is one of the
 changes.
 
-**One block here is gfx12-only.** The fp8 section at the bottom of
-`warp/register/tile/mma.cu` is behind `#ifdef KITTENS_RDNA4` and compiles away
-in this tree. It lives here anyway so that `tests/unit/rdna3` and
-`tests/unit/rdna4` stay the same sources -- see that tree's README.
-
 ### Adding a test
 
 Each `.cu` here wraps its scaffolding in an anonymous namespace. That is not

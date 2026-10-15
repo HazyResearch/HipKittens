@@ -13,8 +13,6 @@
 #include "cdna3/includes.cuh"
 #elif defined(KITTENS_RDNA3)
 #include "rdna3/includes.cuh"
-#elif defined(KITTENS_RDNA4)
-#include "rdna4/includes.cuh"
 #endif
 
 #include "pyutils/util.cuh"

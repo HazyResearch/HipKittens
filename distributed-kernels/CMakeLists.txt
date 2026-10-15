@@ -36,7 +36,7 @@ message(STATUS "Using hipcc: ${CMAKE_CXX_COMPILER}")
 # ---------------------------
 # GPU target flags
 # ---------------------------
-set(GPU_TARGET "CDNA4" CACHE STRING "GPU target: CDNA2|CDNA3|CDNA4|RDNA3|RDNA4")
+set(GPU_TARGET "CDNA4" CACHE STRING "GPU target: CDNA2|CDNA3|CDNA4|RDNA3")
 
 if(GPU_TARGET STREQUAL "CDNA2")
   set(GPU_FLAGS "-DKITTENS_CDNA2" "--offload-arch=gfx90a")
@@ -46,8 +46,6 @@ elseif(GPU_TARGET STREQUAL "CDNA4")
   set(GPU_FLAGS "-DKITTENS_CDNA4" "--offload-arch=gfx950" "-DHIP_ENABLE_WARP_SYNC_BUILTINS" "-ffast-math")
 elseif(GPU_TARGET STREQUAL "RDNA3")
   set(GPU_FLAGS "-DKITTENS_RDNA3" "--offload-arch=gfx1100")
-elseif(GPU_TARGET STREQUAL "RDNA4")
-  set(GPU_FLAGS "-DKITTENS_RDNA4" "--offload-arch=gfx1201")
 else()
   message(FATAL_ERROR "Unknown GPU_TARGET: ${GPU_TARGET}")
 endif()

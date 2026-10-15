@@ -4,8 +4,8 @@ C = A · Bᵀ, bf16 in, fp32 accumulate, bf16 out. B is passed pre-transposed as
 `(n, k)`, which keeps both shared loads contiguous and makes `mma_ABt` the right
 primitive.
 
-This is the kernel the RDNA3 port was validated against. Unlike
-`kernels/rdna4/`, everything below is measured.
+This is the kernel the RDNA3 port was validated against. Everything below is
+measured.
 
 ## Measured
 
@@ -277,8 +277,8 @@ ablation builds below exist because of this.
 
 **So the wall is architectural**, and it is the 2× operand mirroring: a gfx11
 `bf16` `rt_base` costs the same 8 VGPRs — and the same LDS bytes — as an `fp32`
-one. gfx12 splits K across the halves instead and halves both, which is why
-`kernels/rdna4/` has headroom this kernel does not.
+one. gfx12 splits K across the halves instead and halves both, so a gfx12 port
+would have headroom this kernel does not.
 
 ### The LDS reads run underneath the WMMAs, for free
 

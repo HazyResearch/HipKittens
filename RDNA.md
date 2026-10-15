@@ -1,26 +1,22 @@
-# HipKittens on RDNA3 / RDNA4
+# HipKittens on RDNA3
 
-A port of HipKittens to AMD's consumer / workstation architectures — gfx11
-(RDNA3: RX 7900, W7900) and gfx12 (RDNA4: RX 9070, W9000-class). Upstream
-supports CDNA3/4/5 only.
+A port of HipKittens to AMD's consumer / workstation architecture — gfx11
+(RDNA3: RX 7900, W7900). Upstream supports CDNA3/4/5 only.
 
-This is a fork. Upstream is [HazyResearch/HipKittens](https://github.com/HazyResearch/HipKittens);
-the work here lives on the `rdna` branch, on top of `de0cddbd`.
+| | RDNA3 (gfx1100) |
+|---|---|
+| core library | `include/rdna3`, 68 files |
+| unit tests | **1659 passed, 0 failed** on a W7900D |
+| bf16 GEMM | **77.2 TFLOPs** peak, 77% of the measured WMMA ceiling. 107-119% of the best AMD library *in HipKittens' own layout*; 85-93% of that library when it is free to pick its own |
+| distributed | fused GEMM→all-reduce / reduce-scatter, as a torch operator: **1.22-1.31x** and **1.31-1.59x** over hipBLASLt + RCCL at prefill, on 2x W7900D. [Full writeup](kernels/rdna3/distributed/README.md) |
+| attention | single-GPU SDPA forward, as a torch operator and an `F.scaled_dot_product_attention` drop-in: **64-65 TFLOPs**, **2.8-3.3x** the aotriton kernel every Radeon framework actually reaches, and 4-14% ahead of a hand-written Triton FA-2 (causal: 4.4x and 3-12%). [Full writeup](kernels/rdna3/attn/README.md) |
+| fp8 | not available in gfx11 hardware |
 
-| | RDNA3 (gfx1100) | RDNA4 (gfx1201) |
-|---|---|---|
-| core library | `include/rdna3`, 68 files | `include/rdna4`, 68 files |
-| unit tests | **1659 passed, 0 failed** on a W7900D | compiles; **never executed** |
-| bf16 GEMM | **77.2 TFLOPs** peak, 77% of the measured WMMA ceiling. 107-119% of the best AMD library *in HipKittens' own layout*; 85-93% of that library when it is free to pick its own | compiles; never executed |
-| distributed | fused GEMM→all-reduce / reduce-scatter, as a torch operator: **1.22-1.31x** and **1.31-1.59x** over hipBLASLt + RCCL at prefill, on 2x W7900D. [Full writeup](kernels/rdna3/distributed/README.md) | not attempted |
-| attention | single-GPU SDPA forward, as a torch operator and an `F.scaled_dot_product_attention` drop-in: **64-65 TFLOPs**, **2.8-3.3x** the aotriton kernel every Radeon framework actually reaches, and 4-14% ahead of a hand-written Triton FA-2 (causal: 4.4x and 3-12%). [Full writeup](kernels/rdna3/attn/README.md) | not attempted |
-| fp8 | not available in hardware | implemented, all four opcodes, untested |
-
-**Read the second column as "written, not verified."** No gfx12 part was
-available. Every gfx12 claim about *where a value physically lives* is inferred
-from builtin signatures, not measured. See
-[`tests/unit/rdna4/README.md`](tests/unit/rdna4/README.md) for exactly which
-claims are which, and run `./unit_tests` there first if you have the hardware.
+RDNA4 (gfx12) is **not** part of this; it is being added separately in
+[#91](https://github.com/HazyResearch/HipKittens/pull/91). Where gfx12 differs
+in a way that shaped a gfx11 decision, this document says so and marks it as
+unverified — no gfx12 part was available here, and nothing in `include/rdna3`
+depends on one.
 
 ## Why this is a separate tree and not a `#ifdef`
 
@@ -50,8 +46,9 @@ back undefined behaviour that looked like a coherent — and wrong — layout.)
 
 **2. gfx12 splits K between the halves instead.** Operands are `v8bf16`, 4
 VGPRs, no redundancy: lane `l` holds `k = 8·(l/16) … +7` of row `l%16`. Half the
-operand registers for the same tile. That is the point of RDNA4 for this
-library. It also makes accumulator↔operand conversion *more* expensive, not
+operand registers for the same tile — which is why the gfx11 layout below is
+gfx11's and not a shared one. It also makes accumulator↔operand conversion
+*more* expensive, not
 less — on gfx11 one direction was a free discard because the operand halves
 already held everything; on gfx12 neither half does, so both directions cross
 the halves at 8 `permlanex16` each.
@@ -67,19 +64,17 @@ is reachable, and the GEMM numbers should be read with that in mind.
 
 ## Coverage
 
-**Library** (`include/rdna3`, `include/rdna4` — 68 files each, the same shape as
-`include/cdna3`):
+**Library** (`include/rdna3` — 68 files, the same shape as `include/cdna3`):
 
 - Types: `rt_base` / `rt` / `st` / `st_subtile` / `sv` / `rv` / `gl`, both
   layouts, all three `rv_layout`s, `shared_allocator`, `group<N>`.
 - Ops: warp and group, register and shared and global, tile and vector — maps,
   reductions, conversions, `mma_{AB,ABt,AtB,AtBt}`, and every
   `{global,shared}_to_{shared,register}` transfer.
-- gfx11 WMMA (`f16`, `bf16`), gfx12 WMMA (`f16`, `bf16`, and all four fp8
-  opcodes: `fp8_fp8`, `fp8_bf8`, `bf8_fp8`, `bf8_bf8`).
+- gfx11 WMMA (`f16`, `bf16`). gfx11 has no fp8 matrix instruction.
 
-**Tests** (`tests/unit/rdna3`, `tests/unit/rdna4` — 64 files each, ported from
-`tests/unit/cdna4`). RDNA3 at `TEST_INTENSITY=2`, on a W7900D:
+**Tests** (`tests/unit/rdna3` — 64 files, ported from `tests/unit/cdna4`), at
+`TEST_INTENSITY=2`, on a W7900D:
 
 ```
 1659 tests passed
@@ -87,14 +82,9 @@ is reachable, and the GEMM numbers should be read with that in mind.
 509 tests skipped (invalid template parameters)
 ```
 
-The two test trees are the *same sources* — `diff -r` returns only the Makefile
-and the README. That is deliberate and worth preserving: it tells a reader that
-if gfx12 fails, the bug is in `include/rdna4`, not in the tests.
-
 **Kernels**: `kernels/rdna3/gemm/bf16fp32` (measured, see its README),
 `kernels/rdna3/distributed` (measured on two GPUs, see its README),
-`kernels/rdna3/attn/fwd` (measured on one GPU, see its README), and
-`kernels/rdna4/gemm/bf16fp32` (same source, gfx1201 target, untuned).
+and `kernels/rdna3/attn/fwd` (measured on one GPU, see its README).
 
 ### Not covered
 
@@ -118,7 +108,6 @@ if gfx12 fails, the bug is in `include/rdna4`, not in the tests.
 - **MoE, fp8 and column-parallel** in the distributed path; and its vLLM /
   SGLang patches are written against the upstream APIs but **never run inside a
   server**.
-- **RDNA4 on hardware**, at all.
 
 ## Performance
 
@@ -294,13 +283,6 @@ is bimodal per process launch**, which forbids comparing any two numbers
 measured in different runs. Full derivation, measurements and the register-spill
 trap that silently NaNs one accumulator tile:
 [`kernels/rdna3/distributed/README.md`](kernels/rdna3/distributed/README.md).
-
-RDNA4 has not been run. What is known is a register count: the operand tiles
-cost 24 VGPRs there against 48 on gfx1100, and the ported kernel sits at 128
-VGPRs where 10 waves/SIMD holds to 144 — so there is headroom the gfx1100 shape
-could not use, and double-buffering costs one occupancy step there instead of
-two. fp8 will *not* help the math rate: gfx12's fp8 WMMA is 16×16×16, the same
-shape as bf16, not CDNA's K=32. One WMMA is one WMMA.
 
 ## Attention
 
