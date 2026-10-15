@@ -22,8 +22,11 @@ else ifeq ($(GPU_TARGET),CDNA3)
 else ifeq ($(GPU_TARGET),CDNA5)
   KITTENS_ARCH_DEFINE := -DKITTENS_CDNA5
   KITTENS_OFFLOAD_ARCH := gfx1250
+else ifeq ($(GPU_TARGET),RDNA3)
+  KITTENS_ARCH_DEFINE := -DKITTENS_RDNA3
+  KITTENS_OFFLOAD_ARCH := gfx1100
 else
-  $(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA3, CDNA4, CDNA5)
+  $(error Unsupported GPU_TARGET '$(GPU_TARGET)'. Supported: CDNA3, CDNA4, CDNA5, RDNA3)
 endif
 
 PYTHON ?= python3
@@ -58,7 +61,13 @@ ILDLIBS += $(LDLIBS) $(EXTRA_LDLIBS)
 
 PY_LDFLAGS := $(shell $(PYTHON)-config --ldflags 2>/dev/null | sed 's/-lcrypt//g')
 PY_EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX') or '')" 2>/dev/null)
-PY_INCLUDES := $(shell $(PYTHON) -m pybind11 --includes)
+PY_INCLUDES := $(shell $(PYTHON) -m pybind11 --includes 2>/dev/null)
+# Standalone pybind11 is not always installed, but torch vendors the same
+# headers under torch/include. Fall back to those rather than failing on a
+# missing pybind11/pybind11.h.
+ifeq ($(strip $(PY_INCLUDES)),)
+  PY_INCLUDES := $(shell $(PYTHON) -c "import sysconfig,os,torch; print('-I'+sysconfig.get_path('include'), '-I'+os.path.join(os.path.dirname(torch.__file__),'include'))" 2>/dev/null)
+endif
 
 ifeq ($(BUILD_MODE),pyext)
   ICXXFLAGS += $(PY_LDFLAGS)

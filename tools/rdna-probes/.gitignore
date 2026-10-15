@@ -1,0 +1,11 @@
+*.s
+conv_gate
+empty
+features
+mem_gate
+mma_gate
+red_gate
+srsrc
+srsrc2
+srsrc3
+wmma_layout

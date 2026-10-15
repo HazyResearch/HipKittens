@@ -1,0 +1,12 @@
+#include "group.cuh"
+
+#ifdef TEST_GROUP
+
+void group::tests(test_data &results) {
+    std::cout << "\n ------------------------------     Starting ops/group tests!     ------------------------------\n" << std::endl;
+#ifdef TEST_GROUP_MEMORY
+    group::memory::tests(results);
+#endif
+}
+
+#endif

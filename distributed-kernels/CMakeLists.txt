@@ -36,7 +36,7 @@ message(STATUS "Using hipcc: ${CMAKE_CXX_COMPILER}")
 # ---------------------------
 # GPU target flags
 # ---------------------------
-set(GPU_TARGET "CDNA4" CACHE STRING "GPU target architecture: CDNA2|CDNA3|CDNA4")
+set(GPU_TARGET "CDNA4" CACHE STRING "GPU target: CDNA2|CDNA3|CDNA4|RDNA3")
 
 if(GPU_TARGET STREQUAL "CDNA2")
   set(GPU_FLAGS "-DKITTENS_CDNA2" "--offload-arch=gfx90a")
@@ -44,6 +44,8 @@ elseif(GPU_TARGET STREQUAL "CDNA3")
   set(GPU_FLAGS "-DKITTENS_CDNA3" "--offload-arch=gfx942")
 elseif(GPU_TARGET STREQUAL "CDNA4")
   set(GPU_FLAGS "-DKITTENS_CDNA4" "--offload-arch=gfx950" "-DHIP_ENABLE_WARP_SYNC_BUILTINS" "-ffast-math")
+elseif(GPU_TARGET STREQUAL "RDNA3")
+  set(GPU_FLAGS "-DKITTENS_RDNA3" "--offload-arch=gfx1100")
 else()
   message(FATAL_ERROR "Unknown GPU_TARGET: ${GPU_TARGET}")
 endif()
@@ -77,6 +79,18 @@ include(${CPM_DOWNLOAD_LOCATION})
 set(IRIS_BUILD_EXAMPLES OFF CACHE BOOL "Build iris examples" FORCE)
 set(IRIS_BUILD_BENCHMARKS OFF CACHE BOOL "Build iris benchmarks" FORCE)
 set(IRIS_BUILD_TESTS OFF CACHE BOOL "Build iris tests" FORCE)
+
+# Offline builds: point IRIS_SOURCE_DIR at a checkout of ROCm/iris and CPM will
+# use it instead of reaching for GitHub. Needed on air-gapped nodes, which is
+# also where this is most likely to be run.
+set(IRIS_SOURCE_DIR "" CACHE PATH "Local checkout of ROCm/iris (skips the download)")
+if(IRIS_SOURCE_DIR)
+  if(NOT EXISTS "${IRIS_SOURCE_DIR}/irisx/CMakeLists.txt")
+    message(FATAL_ERROR "IRIS_SOURCE_DIR=${IRIS_SOURCE_DIR} has no irisx/CMakeLists.txt")
+  endif()
+  message(STATUS "Using local iris: ${IRIS_SOURCE_DIR}")
+  set(CPM_iris_SOURCE "${IRIS_SOURCE_DIR}")
+endif()
 
 CPMAddPackage(
   NAME iris
