@@ -22,13 +22,10 @@ We find that core tile and bulk compute interfaces carry over from TK to HK, but
 We support CDNA3, CDNA4 and RDNA3.
 
 > **RDNA3 (gfx11) support.** `include/rdna3` is a full port of the library to
-> AMD's consumer / workstation architecture — 1659 unit tests green on a W7900,
-> a bf16 GEMM at 77% of the measured WMMA ceiling, a single-GPU SDPA forward at
-> 2.8-3.3x the aotriton kernel every Radeon framework reaches, and fused
-> GEMM→all-reduce / reduce-scatter at 1.22-1.59x over hipBLASLt + RCCL, the last
-> two shipped as torch operators. See **[RDNA.md](RDNA.md)** for what is
-> verified and what is not, and for the three hardware facts the port is derived
-> from.
+> AMD's consumer / workstation architecture — 1659 unit tests green on a W7900
+> and a bf16 GEMM at 77% of the measured WMMA ceiling. See **[RDNA.md](RDNA.md)**
+> for what is verified and what is not, and for the three hardware facts the
+> port is derived from.
 
 
 
