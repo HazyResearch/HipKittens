@@ -216,6 +216,48 @@ template<> __device__ inline bf16_2 relu::op<bf16_2>(const bf16_2 &x) { return _
 template<> __device__ inline half   relu::op<half>  (const half &x  ) { return __hmax(x, base_types::constants<half>::zero());    }
 template<> __device__ inline half_2 relu::op<half_2>(const half_2 &x) { return half_2{__hmax(x.x, base_types::constants<half>::zero()), 
                                                                                      __hmax(x.y, base_types::constants<half>::zero())}; }
+
+constexpr float NEG_ONE_OVER_LN2 = -1.4426950408889634f;  // -(1 / ln(2))
+static __device__ inline float fast_sigmoid(float x) {
+    float e2x = __builtin_amdgcn_exp2f(x * NEG_ONE_OVER_LN2);
+    return __frcp_rn(e2x + 1.0f);
+}
+/**
+ * @brief Sigmoid activation on f32.
+ *
+ * Computes sigmoid: 1 / (1 + 2^(-(1 / ln(2)) * x)).
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return Sigmoid activation applied to the input.
+ */
+ struct sigmoid {
+    template<typename T> static __device__ inline T op(const T &x);
+ };
+ template<> __device__ inline float sigmoid::op<float>(const float &x) {
+    return fast_sigmoid(x);
+}
+template<> __device__ inline float2 sigmoid::op<float2>(const float2 &x) {
+    return float2{sigmoid::op<float>(x.x), sigmoid::op<float>(x.y)};
+}
+/**
+ * @brief SiLU activation on f32.
+ *
+ * Computes SiLU: x * sigmoid(x).
+ *
+ * @tparam T The data type of the input and output values.
+ * @param x[in] The input value.
+ * @return SiLU activation applied to the input.
+ */
+ struct silu {
+    template<typename T> static __device__ inline T op(const T &x);
+ };
+ template<> __device__ inline float silu::op<float>(const float &x) {
+    return x * sigmoid::op<float>(x);
+}
+template<> __device__ inline float2 silu::op<float2>(const float2 &x) {
+    return float2{silu::op<float>(x.x), silu::op<float>(x.y)};
+}
 /**
  * @brief Copy operation.
  *
