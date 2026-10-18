@@ -80,10 +80,10 @@ class Layer:
         self.cs_qkv = hk.prepare_qkv_rope_table(self.cs.repeat(1, self.H), self.cs.repeat(1, self.H_KV))
         self.r_attn = common.inv_rms(self.x)
         self.gqa, self.native_gqa = gqa, native_gqa
-        # Fusion-only control: the same HK GEMMs with the noop epilogue, gamma folded, natural column order;
-        # the epilogue work then runs as eager torch on the same inputs HK gets.
-        self.Pf = dict(qkv=hk.prepare(torch.cat([W["q"], W["k"], W["v"]], dim=1), gamma=ga),
-                       gu=hk.prepare(W["gu"], gamma=gm))
+        # Fusion-only control: the same HK GEMMs with the noop epilogue (plain weights, natural column order);
+        # the epilogue work, including the RMSNorm scale with the same precomputed r, runs as eager torch on the
+        # inputs HK gets. This is the unfused form bench_epilogues.py uses for its rmsnorm_* rows.
+        self.Pf = dict(qkv=hk.prepare(torch.cat([W["q"], W["k"], W["v"]], dim=1)), gu=hk.prepare(W["gu"]))
 
     # ---- HK phases ----
     def hk_qkv(self, x, r):
@@ -109,9 +109,12 @@ class Layer:
     def eager_inv_rms(self, t):
         return torch.rsqrt(torch.linalg.vector_norm(t, dim=-1, dtype=torch.float32).square() / self.d + common.EPS)
 
+    def rms_scale(self, t, r, g):
+        return t * r.to(common.BF16)[:, None] * g                   # eager RMSNorm with a given r
+
     def f_qkv(self, x, r):
         M, Dh, nq, nkv = self.M, self.Dh, self.d, self.H_KV * self.Dh
-        c = hk.matmul(x, self.Pf["qkv"]) * r.to(common.BF16)[:, None]   # one launch over [Wq | Wk | Wv]
+        c = hk.matmul(self.rms_scale(x, r, self.g_attn), self.Pf["qkv"])   # one launch over [Wq | Wk | Wv]
         cs = self.cs.view(M, 1, Dh)
         q = common.rope(c[:, :nq].view(M, self.H, Dh), cs).reshape(M, nq)
         k = common.rope(c[:, nq:nq + nkv].view(M, self.H_KV, Dh), cs).reshape(M, nkv)
@@ -122,7 +125,7 @@ class Layer:
         return h, self.eager_inv_rms(h)                             # h, r_mlp
 
     def f_gate_up(self, h, r):
-        gu = hk.matmul(h, self.Pf["gu"]) * r.to(common.BF16)[:, None]
+        gu = hk.matmul(self.rms_scale(h, r, self.g_mlp), self.Pf["gu"])
         return F.silu(gu[:, :self.d_ff]) * gu[:, self.d_ff:]
 
     def f_down(self, g, h):

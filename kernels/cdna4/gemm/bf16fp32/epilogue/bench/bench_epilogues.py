@@ -136,13 +136,16 @@ def run_row(name, gemm, M, K, N, Dh, timer):
     comp = lambda: compiled(x, W)
     fusion = lambda: post(hk.matmul(pre(x), plain))
     want = c["ref"]()
-    ok_hk, rel = common.check(hk_fn(), want, c["tol"])
-    ok_eager, _ = common.check(eager(), want, c["tol"])
-    ok_comp, _ = common.check(comp(), want, c["tol"])                 # first call compiles + autotunes, untimed
-    ok_fusion, _ = common.check(fusion(), want, c["tol"])
-    ok = ok_hk and ok_eager and ok_comp and ok_fusion
-    row = dict(epilogue=name, gemm=gemm, M=M, K=K, N=N, rel=rel, status="PASS" if ok else "FAIL")
-    if not ok:
+    arms = dict(hk=hk_fn, eager=eager, compile=comp, fusion=fusion)   # compile's first call compiles + autotunes
+    checks = {arm: common.check(fn(), want, c["tol"]) for arm, fn in arms.items()}
+    failed = [arm for arm, (ok, _) in checks.items() if not ok]
+    row = dict(epilogue=name, gemm=gemm, M=M, K=K, N=N, rel=checks["hk"][1],
+               **{f"rel_{arm}": rel for arm, (_, rel) in checks.items()},
+               status="FAIL" if failed else "PASS")
+    if failed:
+        row["failed_arms"] = failed
+        print(f"  FAIL {name} on {gemm} M={M}: arms {failed}, rel " +
+              ", ".join(f"{a}={checks[a][1]:.2e}" for a in arms), flush=True)
         return row
     row["saved_MB"] = c["saved"] / 1e6
     t_hk, t_eager, t_comp, t_fusion = timer(hk_fn), timer(eager), timer(comp), timer(fusion)
