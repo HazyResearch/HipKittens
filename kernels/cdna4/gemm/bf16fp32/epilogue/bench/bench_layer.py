@@ -279,7 +279,7 @@ def run_phases(L, timer):
         ok_comp, _ = common.check(comp(), ref_t, p.tol_torch)     # first call compiles + autotunes, untimed
         ok_fusion = True
         if p.fusion is not None:
-            ok_fusion, _ = common.check(p.fusion(), p.ref_hk(), p.tol_hk)
+            ok_fusion, _ = common.check(p.fusion(), p.ref_hk(), common.control_tols(p.tol_hk))
         ok = ok_hk and ok_eager and ok_comp and ok_fusion
         row = dict(M=L.M, phase=name, hk_launches=HK_LAUNCHES[name], rel=rel, status="PASS" if ok else "FAIL")
         if ok:

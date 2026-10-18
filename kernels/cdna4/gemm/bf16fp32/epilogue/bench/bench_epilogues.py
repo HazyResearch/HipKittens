@@ -137,7 +137,8 @@ def run_row(name, gemm, M, K, N, Dh, timer):
     fusion = lambda: post(hk.matmul(pre(x), plain))
     want = c["ref"]()
     arms = dict(hk=hk_fn, eager=eager, compile=comp, fusion=fusion)   # compile's first call compiles + autotunes
-    checks = {arm: common.check(fn(), want, c["tol"]) for arm, fn in arms.items()}
+    checks = {arm: common.check(fn(), want, common.control_tols(c["tol"]) if arm == "fusion" else c["tol"])
+              for arm, fn in arms.items()}
     failed = [arm for arm, (ok, _) in checks.items() if not ok]
     row = dict(epilogue=name, gemm=gemm, M=M, K=K, N=N, rel=checks["hk"][1],
                **{f"rel_{arm}": rel for arm, (_, rel) in checks.items()},

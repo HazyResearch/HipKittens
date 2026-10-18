@@ -111,8 +111,11 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
   normalizes its input inside the timed qkv phase and also computes `r_next` in `down`, so a timed PyTorch
   layer does one more RMS reduction than the HK layer; in a stack of layers PyTorch would not need `r_next`.
 - **fusion-only control (`--phases`):** for every GEMM phase, the same HK GEMM(s) with the `noop` epilogue on
-  HK's own inputs, then the HK epilogue's work as eager PyTorch (QKV: one GEMM over `[Wq | Wk | Wv]`, then the
-  `r` scale, RoPE and the V copy; out_proj/down: residual add and 1/rms; gate_up: `r` scale and SwiGLU).
+  HK's own inputs, with the epilogue's work as eager PyTorch (QKV: `x · r · γ`, one GEMM over `[Wq | Wk | Wv]`,
+  RoPE and the V copy; out_proj/down: residual add and 1/rms; gate_up: `h · r · γ`, then SwiGLU).
+- **Control tolerance:** the control stores the GEMM output through HK's truncating bf16 store before its eager
+  epilogue, which a fused kernel never does, and SwiGLU multiplies two such values. Its bf16 outputs are gated at
+  `rtol 2.5e-2` (`CONTROL_TOL`) in both scripts; HK, eager and compiled PyTorch keep `rtol 1e-2`.
 - Each phase is timed on intermediates captured from a full run of the same implementation.
 - `--phases` compiles each PyTorch phase separately; `--full` compiles the whole layer as one function.
   `compile full - phases` shows what cross-phase fusion buys PyTorch.

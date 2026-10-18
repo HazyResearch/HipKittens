@@ -46,6 +46,15 @@ LLC_BYTES = {"gfx950": 256 * 2**20}
 STAGE_TOL = dict(rtol=1e-2, atol=1e-1)     # bf16 [M, N] outputs
 VECTOR_TOL = dict(rtol=1e-2, atol=1e-3)    # fp32 per-row inverse-RMS vectors
 LAYER_REL = 2e-2                           # full layer: normwise relative error
+# The fusion-only control stores the GEMM output to bf16 through HK's truncating store (up to 2^-7 relative)
+# before its eager epilogue, which the fused kernels never do; a product of two such values (SwiGLU) compounds
+# to about 2^-6. Its bf16 outputs are therefore gated at this rtol; every other arm keeps STAGE_TOL.
+CONTROL_TOL = dict(rtol=2.5e-2, atol=1e-1)
+
+
+def control_tols(tols):
+    """The tolerance tuple for the fusion-only control: STAGE_TOL entries become CONTROL_TOL."""
+    return tuple(CONTROL_TOL if t is STAGE_TOL else t for t in tols)
 
 
 def layer_gemms(cfg):
