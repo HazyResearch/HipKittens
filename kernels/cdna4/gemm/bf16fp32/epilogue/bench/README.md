@@ -7,8 +7,8 @@ prints a table, and exits non-zero if any row fails.
 | Script | Question |
 |---|---|
 | `ab_noop_vs_base.py` | Does the epilogue chassis (`tk_noop`) cost anything versus upstream's original GEMM? |
-| `bench_epilogues.py` | How much time and HBM traffic does each fused epilogue save versus eager PyTorch? |
-| `bench_layer.py --phases` | Per phase of one forward layer: HK vs eager vs `torch.compile`. |
+| `bench_epilogues.py` | How much time and HBM traffic does each fused epilogue save versus eager PyTorch and `torch.compile`? |
+| `bench_layer.py --phases` | Per phase of one forward layer: HK vs eager vs `torch.compile`, plus a fusion-only control per GEMM phase. |
 | `bench_layer.py --full` | The whole layer: HK vs eager vs `torch.compile`. |
 
 ## Build
@@ -46,11 +46,16 @@ Single-sequence causal prefill (batch 1) at M ∈ {2048, 4096, 8192} tokens. Con
 
 | `--config` | Model | d | d_ff | H | H_KV | Dh | Attention build |
 |---|---|---:|---:|---:|---:|---:|---|
+| `llama3.2-1b` | Llama-3.2-1B | 2048 | 8192 | 32 | 8 | 64 | `build_attn.sh 32 8 64 ...` |
+| `llama3.2-3b` | Llama-3.2-3B | 3072 | 8192 | 24 | 8 | 128 | `build_attn.sh 24 8 128 ...` |
 | `llama3-8b` (default) | Llama-3.1-8B, same shape as Mistral-7B | 4096 | 14336 | 32 | 8 | 128 | `build_attn.sh 32 8 128 ...` |
 | `llama3-70b` | Llama-3.1-70B | 8192 | 28672 | 64 | 8 | 128 | `build_attn.sh 64 8 128 ...` |
+| `llama3-405b` | Llama-3.1-405B (one layer) | 16384 | 53248 | 128 | 8 | 128 | `build_attn.sh 128 8 128 ...` |
 | `pr1` | PR #1's shape: Llama-2-7B widths with GQA (not a real model) | 4096 | 11008 | 32 | 8 | 128 | `build_attn.sh 32 8 128 ...` |
 
-Both Llama-3.1 models fit on one MI355X (288 GB), so the shapes are unsharded (no tensor parallelism).
+Widths come from each model's Hugging Face `config.json`. One layer of each fits on one MI355X (288 GB), so the
+shapes are unsharded (no tensor parallelism). The fp32 attention reference holds `[H, M, M]` fp32 scores, so its
+memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alone, plus a second copy in softmax.
 
 ## How timing works
 
@@ -67,6 +72,8 @@ Both Llama-3.1 models fit on one MI355X (288 GB), so the shapes are unsharded (n
 
 - **HK:** one fused HipKittens call.
 - **eager:** `torch.matmul` (hipBLASLt) followed by the epilogue written as lean bf16 eager PyTorch.
+- **compile:** the same eager function under `torch.compile`. Dynamo is reset before each row, so every row
+  compiles fresh rather than hitting the recompile limit and silently running eager.
 - **fusion-only:** HK's `noop` GEMM followed by the same eager PyTorch. HK and fusion-only share one
   GEMM, so `fusion-only/HK` is the speedup from fusion alone; `eager/HK` also includes the GEMM difference.
 - **HBM saved:** an analytical estimate, not a hardware measurement. Each epilogue has one formula in
@@ -99,9 +106,13 @@ Both Llama-3.1 models fit on one MI355X (288 GB), so the shapes are unsharded (n
 | 5 | down | `residual_rms(g, Wd, h)`: 2 launches | `h + g @ Wd`, then 1/rms for the next layer |
 
 - HK splits RMSNorm across phases: the producing GEMM emits r = 1/rms, the consuming GEMM applies it.
-  PyTorch normalizes in the consumer. Each side does each RMS reduction once per layer, so phase *sums*
-  compare fairly, but a single phase does not compare op-for-op.
-- HK's layer input `r_attn` is computed once outside timing (a previous layer would emit it).
+  PyTorch normalizes in the consumer, so a single phase does not compare op-for-op.
+- HK's layer input `r_attn` is computed once outside timing (a previous layer would emit it). PyTorch
+  normalizes its input inside the timed qkv phase and also computes `r_next` in `down`, so a timed PyTorch
+  layer does one more RMS reduction than the HK layer; in a stack of layers PyTorch would not need `r_next`.
+- **fusion-only control (`--phases`):** for every GEMM phase, the same HK GEMM(s) with the `noop` epilogue on
+  HK's own inputs, then the HK epilogue's work as eager PyTorch (QKV: one GEMM over `[Wq | Wk | Wv]`, then the
+  `r` scale, RoPE and the V copy; out_proj/down: residual add and 1/rms; gate_up: `r` scale and SwiGLU).
 - Each phase is timed on intermediates captured from a full run of the same implementation.
 - `--phases` compiles each PyTorch phase separately; `--full` compiles the whole layer as one function.
   `compile full - phases` shows what cross-phase fusion buys PyTorch.

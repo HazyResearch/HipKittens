@@ -1,16 +1,18 @@
 """One pre-norm GQA Transformer forward layer: HK vs PyTorch eager vs torch.compile.
 
 --phases  each of the five phases timed on its own, on intermediates captured from a full run of the same
-          implementation. Each torch phase is compiled separately.
+          implementation. Each torch phase is compiled separately. Every GEMM phase also times a fusion-only
+          control on HK's inputs: the same HK GEMM with the noop epilogue, then the HK epilogue's work as eager
+          torch (fusion-only/HK isolates fusion from GEMM speed). Attention has no epilogue and no control.
 --full    the whole layer. torch.compile sees the whole layer as one function, so it may fuse across phase
           boundaries. Also prints the compiled full layer minus the sum of the separately compiled phases
           (negative = what cross-phase fusion buys torch). --full times the phases too, for that line.
 
 Phases (HK launches): qkv (4: one hk.qkv GEMM + 3 copies), attention (1), out_proj (2), gate_up (1), down (2).
 HK splits RMSNorm across phases: the producer emits r = 1/rms, the consumer applies it. Torch normalizes in
-the consumer and computes r_next at the end of the layer, so each side does each RMS reduction once. The
-HK layer's input r_attn = 1/rms(x) is computed once, outside timing (a previous layer would emit it).
-Per-phase times therefore do not line up op-for-op; the phase sums do.
+the consumer. The HK layer's input r_attn = 1/rms(x) is computed once, outside timing (a previous layer would
+emit it); torch normalizes its input inside the timed qkv phase and also computes r_next in down, so a timed
+torch layer does one more RMS reduction than the HK layer. Per-phase times do not line up op-for-op.
 
 Build first: make KERNEL=<m> in the epilogue directory for every m in MODULES, and the attention kernel per
 M with bench/build_attn.sh <H> <H_KV> <Dh> <M>...
@@ -27,7 +29,7 @@ import hk
 
 MODULES = ["rmsnorm_rope", "residual_rms", "rms_reduce", "rmsnorm_swiglu"]
 HK_LAUNCHES = dict(qkv=4, attention=1, out_proj=2, gate_up=1, down=2)
-COMPILE = dict(mode="max-autotune-no-cudagraphs", dynamic=False)
+COMPILE = common.COMPILE
 
 
 def choose_sdpa(H, H_KV, Dh):
@@ -78,6 +80,10 @@ class Layer:
         self.cs_qkv = hk.prepare_qkv_rope_table(self.cs.repeat(1, self.H), self.cs.repeat(1, self.H_KV))
         self.r_attn = common.inv_rms(self.x)
         self.gqa, self.native_gqa = gqa, native_gqa
+        # Fusion-only control: the same HK GEMMs with the noop epilogue, gamma folded, natural column order;
+        # the epilogue work then runs as eager torch on the same inputs HK gets.
+        self.Pf = dict(qkv=hk.prepare(torch.cat([W["q"], W["k"], W["v"]], dim=1), gamma=ga),
+                       gu=hk.prepare(W["gu"], gamma=gm))
 
     # ---- HK phases ----
     def hk_qkv(self, x, r):
@@ -98,6 +104,30 @@ class Layer:
 
     def hk_down(self, g, h):
         return hk.residual_rms(g, self.P["dn"], h)                  # x_out, r_next
+
+    # ---- fusion-only control: HK noop GEMM + the HK epilogue's work as eager torch, on HK's inputs ----
+    def eager_inv_rms(self, t):
+        return torch.rsqrt(torch.linalg.vector_norm(t, dim=-1, dtype=torch.float32).square() / self.d + common.EPS)
+
+    def f_qkv(self, x, r):
+        M, Dh, nq, nkv = self.M, self.Dh, self.d, self.H_KV * self.Dh
+        c = hk.matmul(x, self.Pf["qkv"]) * r.to(common.BF16)[:, None]   # one launch over [Wq | Wk | Wv]
+        cs = self.cs.view(M, 1, Dh)
+        q = common.rope(c[:, :nq].view(M, self.H, Dh), cs).reshape(M, nq)
+        k = common.rope(c[:, nq:nq + nkv].view(M, self.H_KV, Dh), cs).reshape(M, nkv)
+        return q, k, c[:, nq + nkv:].contiguous()
+
+    def f_out_proj(self, o, x):
+        h = hk.matmul(o, self.P["o"]) + x
+        return h, self.eager_inv_rms(h)                             # h, r_mlp
+
+    def f_gate_up(self, h, r):
+        gu = hk.matmul(h, self.Pf["gu"]) * r.to(common.BF16)[:, None]
+        return F.silu(gu[:, :self.d_ff]) * gu[:, self.d_ff:]
+
+    def f_down(self, g, h):
+        x_out = hk.matmul(g, self.P["dn"]) + h
+        return x_out, self.eager_inv_rms(x_out)                     # x_out, r_next
 
     # ---- torch phases (eager and torch.compile run this same code) ----
     def t_qkv(self, x):
@@ -209,23 +239,27 @@ class Phase:
     ref_torch: object     # () -> fp32 reference for the torch inputs
     tol_hk: tuple
     tol_torch: tuple
+    fusion: object = None # () -> fusion-only control on HK-captured inputs (None for attention)
 
 
 def phases(L, a, b):
     S, V = common.STAGE_TOL, common.VECTOR_TOL
     return {
         "qkv": Phase(lambda: L.hk_qkv(a["x"], a["r"]), L.t_qkv, (b["x"],),
-                     lambda: L.ref_qkv(a["x"]), lambda: L.ref_qkv(b["x"]), (S, S, S), (S, S, S)),
+                     lambda: L.ref_qkv(a["x"]), lambda: L.ref_qkv(b["x"]), (S, S, S), (S, S, S),
+                     lambda: L.f_qkv(a["x"], a["r"])),
         "attention": Phase(lambda: L.hk_attention(a["q"], a["k"], a["v"]), L.t_attention, (b["q"], b["k"], b["v"]),
                            lambda: L.ref_attention(a["q"], a["k"], a["v"]),
                            lambda: L.ref_attention(b["q"], b["k"], b["v"]), (S,), (S,)),
         "out_proj": Phase(lambda: L.hk_out_proj(a["o"], a["x"]), L.t_out_proj, (b["o"], b["x"]),
                           lambda: L.ref_out_proj(a["o"], a["x"]), lambda: L.ref_out_proj(b["o"], b["x"])[:1],
-                          (S, V), (S,)),
+                          (S, V), (S,), lambda: L.f_out_proj(a["o"], a["x"])),
         "gate_up": Phase(lambda: L.hk_gate_up(a["h"], a["r_mlp"]), L.t_gate_up, (b["h"],),
-                         lambda: L.ref_gate_up(a["h"]), lambda: L.ref_gate_up(b["h"]), (S,), (S,)),
+                         lambda: L.ref_gate_up(a["h"]), lambda: L.ref_gate_up(b["h"]), (S,), (S,),
+                         lambda: L.f_gate_up(a["h"], a["r_mlp"])),
         "down": Phase(lambda: L.hk_down(a["g"], a["h"]), L.t_down, (b["g"], b["h"]),
-                      lambda: L.ref_down(a["g"], a["h"]), lambda: L.ref_down(b["g"], b["h"]), (S, V), (S, V)),
+                      lambda: L.ref_down(a["g"], a["h"]), lambda: L.ref_down(b["g"], b["h"]), (S, V), (S, V),
+                      lambda: L.f_down(a["g"], a["h"])),
     }
 
 
@@ -240,13 +274,19 @@ def run_phases(L, timer):
         ref_t = p.ref_torch()
         ok_eager, _ = common.check(eager(), ref_t, p.tol_torch)
         ok_comp, _ = common.check(comp(), ref_t, p.tol_torch)     # first call compiles + autotunes, untimed
-        ok = ok_hk and ok_eager and ok_comp
+        ok_fusion = True
+        if p.fusion is not None:
+            ok_fusion, _ = common.check(p.fusion(), p.ref_hk(), p.tol_hk)
+        ok = ok_hk and ok_eager and ok_comp and ok_fusion
         row = dict(M=L.M, phase=name, hk_launches=HK_LAUNCHES[name], rel=rel, status="PASS" if ok else "FAIL")
         if ok:
             t_hk, t_eager, t_comp = timer(p.hk), timer(eager), timer(comp)
             row.update(**common.ms_fields("hk", t_hk), **common.ms_fields("eager", t_eager),
                        **common.ms_fields("compile", t_comp),
                        eager_x=t_eager.median / t_hk.median, compile_x=t_comp.median / t_hk.median)
+            if p.fusion is not None:
+                t_fusion = timer(p.fusion)
+                row.update(**common.ms_fields("fusion", t_fusion), fusion_x=t_fusion.median / t_hk.median)
         rows.append(row)
         print(f"  M={L.M} {name}: {row['status']}", flush=True)
     rows.append(sum_row(L.M, rows))
@@ -266,7 +306,8 @@ def sum_row(M, rows):
 
 PHASE_COLUMNS = [("M", "M", "d"), ("phase", "phase", ""), ("HK launches", "hk_launches", "d"),
                  ("HK ms", "hk_ms", ".3f"), ("eager ms", "eager_ms", ".3f"), ("compile ms", "compile_ms", ".3f"),
-                 ("eager/HK", "eager_x", ".2f"), ("compile/HK", "compile_x", ".2f"), ("rel err", "rel", ".1e"),
+                 ("fusion-only ms", "fusion_ms", ".3f"), ("eager/HK", "eager_x", ".2f"),
+                 ("compile/HK", "compile_x", ".2f"), ("fusion-only/HK", "fusion_x", ".2f"), ("rel err", "rel", ".1e"),
                  ("status", "status", "")]
 
 

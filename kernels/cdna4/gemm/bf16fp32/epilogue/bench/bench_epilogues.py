@@ -1,8 +1,10 @@
-"""Each fused epilogue against PyTorch eager, on the layer GEMM where it belongs.
+"""Each fused epilogue against PyTorch eager and torch.compile, on the layer GEMM where it belongs.
 
 Arms (all cold cache):
   HK           one fused HipKittens call (hk.matmul, hk.inv_rms or hk.residual_rms)
   eager        torch.matmul (hipBLASLt) plus the epilogue as lean bf16 eager torch
+  compile      the same eager function under torch.compile (common.COMPILE); Dynamo is reset per row so every
+               row compiles fresh instead of hitting the recompile limit and silently running eager
   fusion-only  HK noop GEMM plus the same eager torch: the same GEMM as HK, so the ratio isolates fusion
 HBM saved: one analytical formula per epilogue (saved= in make_case): the bytes of every [M, N] / [M, K]
 intermediate the eager code writes and reads back, minus HK's own fp32 partial sums. It ignores cache, so
@@ -12,6 +14,7 @@ failing row is not timed, and the script then exits 1.
 Build first, in the epilogue directory: make KERNEL=<m> for every m in MODULES.
 """
 import torch
+import torch._dynamo
 import torch.nn.functional as F
 
 import common
@@ -125,25 +128,33 @@ def run_row(name, gemm, M, K, N, Dh, timer):
     c = make_case(name, M, K, N, Dh)
     x, W, plain = c["x"], c["W"], c["plain"]
     hk_fn = c["hk"]
-    eager = lambda: c["post"](torch.matmul(c["pre"](x), W))
-    fusion = lambda: c["post"](hk.matmul(c["pre"](x), plain))
+    pre, post = c["pre"], c["post"]
+    eager_fn = lambda x, W: post(torch.matmul(pre(x), W))
+    eager = lambda: eager_fn(x, W)
+    torch._dynamo.reset()
+    compiled = torch.compile(eager_fn, **common.COMPILE)
+    comp = lambda: compiled(x, W)
+    fusion = lambda: post(hk.matmul(pre(x), plain))
     want = c["ref"]()
     ok_hk, rel = common.check(hk_fn(), want, c["tol"])
     ok_eager, _ = common.check(eager(), want, c["tol"])
-    ok = ok_hk and ok_eager
+    ok_comp, _ = common.check(comp(), want, c["tol"])                 # first call compiles + autotunes, untimed
+    ok_fusion, _ = common.check(fusion(), want, c["tol"])
+    ok = ok_hk and ok_eager and ok_comp and ok_fusion
     row = dict(epilogue=name, gemm=gemm, M=M, K=K, N=N, rel=rel, status="PASS" if ok else "FAIL")
     if not ok:
         return row
     row["saved_MB"] = c["saved"] / 1e6
-    t_hk, t_eager, t_fusion = timer(hk_fn), timer(eager), timer(fusion)
+    t_hk, t_eager, t_comp, t_fusion = timer(hk_fn), timer(eager), timer(comp), timer(fusion)
     row.update(**common.ms_fields("hk", t_hk), **common.ms_fields("eager", t_eager),
-               **common.ms_fields("fusion", t_fusion),
-               eager_x=t_eager.median / t_hk.median, fusion_x=t_fusion.median / t_hk.median)
+               **common.ms_fields("compile", t_comp), **common.ms_fields("fusion", t_fusion),
+               eager_x=t_eager.median / t_hk.median, compile_x=t_comp.median / t_hk.median,
+               fusion_x=t_fusion.median / t_hk.median)
     return row
 
 
 def main():
-    args = common.parse_args("Fused epilogues vs PyTorch eager")
+    args = common.parse_args("Fused epilogues vs PyTorch eager and torch.compile")
     common.require_epilogue_modules(MODULES)
     torch.manual_seed(0)
     timer = common.Timer(args.warmup, args.iters)
@@ -157,10 +168,12 @@ def main():
                 rows.append(row)
                 print(f"  M={M} {name} on {gemm}: {row['status']}", flush=True)
     columns = [("epilogue", "epilogue", ""), ("GEMM", "gemm", ""), ("M", "M", "d"), ("N", "N", "d"), ("K", "K", "d"),
-               ("HK ms", "hk_ms", ".3f"), ("eager ms", "eager_ms", ".3f"), ("fusion-only ms", "fusion_ms", ".3f"),
-               ("eager/HK", "eager_x", ".2f"), ("fusion-only/HK", "fusion_x", ".2f"),
-               ("HBM saved MB", "saved_MB", ".1f"), ("rel err", "rel", ".1e"), ("status", "status", "")]
-    common.print_table(f"Fused epilogues vs PyTorch eager ({args.config}, cold cache)", columns, rows, args.markdown)
+               ("HK ms", "hk_ms", ".3f"), ("eager ms", "eager_ms", ".3f"), ("compile ms", "compile_ms", ".3f"),
+               ("fusion-only ms", "fusion_ms", ".3f"), ("eager/HK", "eager_x", ".2f"),
+               ("compile/HK", "compile_x", ".2f"), ("fusion-only/HK", "fusion_x", ".2f"),
+               ("HBM saved MB (upper bound)", "saved_MB", ".1f"), ("rel err", "rel", ".1e"), ("status", "status", "")]
+    common.print_table(f"Fused epilogues vs PyTorch eager and torch.compile ({args.config}, cold cache)",
+                       columns, rows, args.markdown)
     if args.json:
         common.write_json(args.json, "bench_epilogues", args.config, rows)
     raise SystemExit(common.exit_code(rows))

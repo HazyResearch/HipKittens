@@ -25,12 +25,20 @@ BF16, FP32 = torch.bfloat16, torch.float32
 EPS = 1e-5                         # RMSNorm epsilon, the value rms_reduce uses
 
 # name -> d (model width), d_ff (MLP width), H (query heads), H_KV (key/value heads), Dh (head dim)
+# Real models: widths from each model's Hugging Face config.json (hidden_size, intermediate_size,
+# num_attention_heads, num_key_value_heads, head_dim); every one has H * Dh == d and no biases.
 CONFIGS = {
+    "llama3.2-1b": dict(d=2048, d_ff=8192, H=32, H_KV=8, Dh=64),     # Llama-3.2-1B (head_dim 64)
+    "llama3.2-3b": dict(d=3072, d_ff=8192, H=24, H_KV=8, Dh=128),    # Llama-3.2-3B
     "llama3-8b": dict(d=4096, d_ff=14336, H=32, H_KV=8, Dh=128),    # Llama-3.1-8B (same shape as Mistral-7B)
     "llama3-70b": dict(d=8192, d_ff=28672, H=64, H_KV=8, Dh=128),   # Llama-3.1-70B
+    "llama3-405b": dict(d=16384, d_ff=53248, H=128, H_KV=8, Dh=128),  # Llama-3.1-405B
     "pr1": dict(d=4096, d_ff=11008, H=32, H_KV=8, Dh=128),          # PR #1's shape: Llama-2-7B widths with GQA; no real model
 }
 M_VALUES = (2048, 4096, 8192)
+
+# torch.compile settings for every compiled baseline: autotuned GEMM backends, no CUDA graphs, static shapes.
+COMPILE = dict(mode="max-autotune-no-cudagraphs", dynamic=False)
 
 # Last-level cache per GPU architecture. torch reports only L2, so the LLC (Infinity Cache) is listed here.
 LLC_BYTES = {"gfx950": 256 * 2**20}
