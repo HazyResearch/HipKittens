@@ -5,7 +5,6 @@ import torch
 import hk
 from conftest import DEV, assert_bitexact, gemm_exact, inputs, module, pow2_gamma, weight
 from test_rope import rope_perm
-from test_swiglu import permute as swiglu_permute
 
 MATMUL_EPILOGUES = {"noop", "silu", "scale", "residual_add", "rmsnorm_scale", "rmsnorm", "swiglu", "rmsnorm_swiglu",
                     "rope", "rmsnorm_rope"}
@@ -23,7 +22,7 @@ def test_prepare_matches_hand_layout():
     gamma = pow2_gamma(256)
     folded = (b.float() * gamma.float()[None, :]).to(torch.bfloat16)
     assert torch.equal(weight(b).tensor, b)
-    assert torch.equal(weight(b, layout="swiglu", gamma=gamma).tensor, swiglu_permute(folded))
+    assert torch.equal(weight(b, gamma=gamma).tensor, folded)
     assert torch.equal(weight(b, layout="rope").tensor, b[rope_perm(512)])
     w = weight(b, layout="rope", gamma=gamma)
     assert w.layout == "rope" and w.gamma_folded
@@ -31,7 +30,7 @@ def test_prepare_matches_hand_layout():
 
 def test_layout_mismatch():
     a, b = inputs(256, 256, 128, "random")
-    with pytest.raises(ValueError, match="'swiglu' weight"):
+    with pytest.raises(ValueError, match="'plain' weight"):
         hk.matmul(a, weight(b, layout="rope"), epilogue="swiglu")
 
 
@@ -42,7 +41,7 @@ def test_gamma_flag_mismatch():
         hk.matmul(a, weight(b, gamma=pow2_gamma(128)), epilogue="rmsnorm_scale", r=r,
                   gamma=torch.ones(256, dtype=torch.bfloat16, device=DEV))
     with pytest.raises(ValueError, match="gamma folded in"):
-        hk.matmul(a, weight(b, layout="swiglu"), epilogue="rmsnorm_swiglu", r=r)
+        hk.matmul(a, weight(b), epilogue="rmsnorm_swiglu", r=r)
 
 
 def test_argument_names():
@@ -91,7 +90,7 @@ def test_output_shapes():
     a, b = inputs(256, 512, 128, "random")
     module("noop"), module("swiglu")
     assert hk.matmul(a, weight(b)).shape == (256, 512)
-    assert hk.matmul(a, weight(b, layout="swiglu"), epilogue="swiglu").shape == (256, 256)
+    assert hk.matmul(a, weight(b), epilogue="swiglu").shape == (256, 256)
 
 
 def test_side_stream():

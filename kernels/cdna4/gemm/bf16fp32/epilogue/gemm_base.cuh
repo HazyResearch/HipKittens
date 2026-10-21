@@ -11,9 +11,20 @@ struct NoOpEpilogue {
     }
 };
 
+// An epilogue that sets `static constexpr bool split_gate_up = true` takes the natural gate_up weight
+// (b rows [0, N/2) = gate, [N/2, N) = value). Its block `col` loads gate rows [col*128, col*128+128) as B
+// half 0 and the matching value rows N/2 later as half 1, so each thread holds gate j in C[*][0] and
+// value j in C[*][1] without any weight permutation. Every other epilogue loads 256 contiguous rows.
+template<typename Epilogue>
+constexpr bool splits_gate_up() {
+    if constexpr (requires { Epilogue::split_gate_up; }) return Epilogue::split_gate_up;
+    else return false;
+}
+
 // gemm_kernel is a copy of the base GEMM's micro_tk (kernels/cdna4/gemm/bf16fp32/256_256_64_32_with16x32.cpp)
-// with three changes: it is templated on <Epilogue, Globals>, an unused debug variable is removed, and
-// the four final stores are replaced by Epilogue::apply(...). Re-copy the loop if the base changes.
+// with four changes: it is templated on <Epilogue, Globals>, an unused debug variable is removed, the B
+// loads use b_half0/b_half1 (split_gate_up above), and the four final stores are replaced by
+// Epilogue::apply(...). Re-copy the loop if the base changes.
 template<typename Epilogue = NoOpEpilogue, typename Globals = gemm_args_base>
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void gemm_kernel(const Globals g, int M, int N, int K) {
@@ -54,6 +65,9 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     // Assign the tile's row/column based on the pid_m and pid_n.
     int row = pid_m; 
     int col = pid_n;  
+    // B half-tile indices (units of HALF_BLOCK_SIZE rows) for this block's two 128-column halves.
+    const int b_half0 = splits_gate_up<Epilogue>() ? col : col * 2;
+    const int b_half1 = splits_gate_up<Epilogue>() ? N / BLOCK_SIZE + col : col * 2 + 1;
 
     // Info
     const int warp_id = kittens::warpid();
@@ -94,9 +108,9 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     G::prefill_swizzled_offsets(As[0][0], g.a, swizzled_offsets_A);
     G::prefill_swizzled_offsets(Bs[0][0], g.b, swizzled_offsets_B);
 
-    G::load(Bs[tic][0], g.b, {0, 0, col*2, 0}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_00);
+    G::load(Bs[tic][0], g.b, {0, 0, b_half0, 0}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_00);
     G::load(As[tic][0], g.a, {0, 0, row*2, 0}, swizzled_offsets_A, a_srsrc_base, a_base, a_lds_00);
-    G::load(Bs[tic][1], g.b, {0, 0, col*2 + 1, 0}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
+    G::load(Bs[tic][1], g.b, {0, 0, b_half1, 0}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
     G::load(As[tic][1], g.a, {0, 0, row*2 + 1, 0}, swizzled_offsets_A, a_srsrc_base, a_base, a_lds_01);
 
     if (warp_row == 1) {
@@ -106,9 +120,9 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     asm volatile("s_waitcnt vmcnt(4)");
     __builtin_amdgcn_s_barrier();
 
-    G::load(Bs[toc][0], g.b, {0, 0, col*2, 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_10);
+    G::load(Bs[toc][0], g.b, {0, 0, b_half0, 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_10);
     G::load(As[toc][0], g.a, {0, 0, row*2, 1}, swizzled_offsets_A, a_srsrc_base, a_base, a_lds_10);
-    G::load(Bs[toc][1], g.b, {0, 0, col*2 + 1, 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
+    G::load(Bs[toc][1], g.b, {0, 0, b_half1, 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
 
     asm volatile("s_waitcnt vmcnt(6)");
     __builtin_amdgcn_s_barrier();
@@ -133,7 +147,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 
         st_subtile_b = subtile_inplace<HALF_REG_BLOCK_N, K_STEP>(Bs[0][1], {warp_col, 0});
         load(B_tile_1, st_subtile_b);
-        G::load(Bs[0][0], g.b, {0, 0, col*2, tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_00);
+        G::load(Bs[0][0], g.b, {0, 0, b_half0, tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_00);
         __builtin_amdgcn_s_barrier();
 
         asm volatile("s_waitcnt lgkmcnt(0)");
@@ -156,7 +170,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 
         st_subtile_b = subtile_inplace<HALF_REG_BLOCK_N, K_STEP>(Bs[1][0], {warp_col, 0});
         load(B_tile_0, st_subtile_b);
-        G::load(Bs[0][1], g.b, {0, 0, col*2 + 1, tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
+        G::load(Bs[0][1], g.b, {0, 0, b_half1, tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
         asm volatile("s_waitcnt vmcnt(6)");
         __builtin_amdgcn_s_barrier();
 
@@ -181,7 +195,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 
         st_subtile_b = subtile_inplace<HALF_REG_BLOCK_N, K_STEP>(Bs[1][1], {warp_col, 0});
         load(B_tile_1, st_subtile_b);
-        G::load(Bs[1][0], g.b, {0, 0, col*2, tile + 3}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_10);
+        G::load(Bs[1][0], g.b, {0, 0, b_half0, tile + 3}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_10);
         __builtin_amdgcn_s_barrier();
 
         asm volatile("s_waitcnt lgkmcnt(0)");
@@ -202,7 +216,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        G::load(Bs[1][1], g.b, {0, 0, col*2 + 1, tile + 3}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
+        G::load(Bs[1][1], g.b, {0, 0, b_half1, tile + 3}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
         asm volatile("s_waitcnt vmcnt(6)");
         __builtin_amdgcn_s_barrier();
 

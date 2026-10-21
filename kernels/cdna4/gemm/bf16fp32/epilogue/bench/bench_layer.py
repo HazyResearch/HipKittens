@@ -76,7 +76,7 @@ class Layer:
         self.cs = common.rope_table(M, self.Dh)                     # one head's table [M, Dh]
         W, ga, gm = self.W, self.g_attn, self.g_mlp
         self.Pqkv = hk.prepare_qkv(W["q"], W["k"], W["v"], gamma=ga)
-        self.P = dict(o=hk.prepare(W["o"]), gu=hk.prepare(W["gu"], layout="swiglu", gamma=gm), dn=hk.prepare(W["dn"]))
+        self.P = dict(o=hk.prepare(W["o"]), gu=hk.prepare(W["gu"], gamma=gm), dn=hk.prepare(W["dn"]))
         self.cs_qkv = hk.prepare_qkv_rope_table(self.cs.repeat(1, self.H), self.cs.repeat(1, self.H_KV))
         self.r_attn = common.inv_rms(self.x)
         self.gqa, self.native_gqa = gqa, native_gqa

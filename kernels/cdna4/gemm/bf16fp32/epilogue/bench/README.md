@@ -62,7 +62,7 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
 - **Cold cache.** Before every timed call, the timer overwrites a buffer twice the last-level cache
   (2 × 256 MiB on gfx950), so each call reads its inputs from HBM. GPU events bracket only the call.
 - **Median of 50 calls** after 10 warm-up calls; JSON also records p10 and p90.
-- **Outside the timer:** input creation, weight preparation (`hk.prepare`: gamma folding, column
+- **Outside the timer:** input creation, weight preparation (`hk.prepare`: gamma folding, rope column
   permutation, transpose), and `torch.compile` compilation and autotuning.
 - **One compile mode:** `torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False)`. CUDA graphs
   are not used: both sides are limited by kernel time, not launch overhead.

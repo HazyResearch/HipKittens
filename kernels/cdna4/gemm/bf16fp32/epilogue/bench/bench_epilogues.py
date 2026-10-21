@@ -86,11 +86,10 @@ def make_case(name, M, K, N, Dh):
         return case(lambda: hk.matmul(x, folded, "rmsnorm", r=r), lambda t: rms_scale(t, r, g), ident,
                     lambda: (f(x) * r[:, None] * f(g)) @ f(W), saved=4 * MK)
     if name == "swiglu":                          # D, silu(gate) (half width)
-        sw = hk.prepare(W, layout="swiglu")
-        return case(lambda: hk.matmul(x, sw, "swiglu"), ident, swiglu, lambda: swiglu(xw()), saved=3 * MN)
+        return case(lambda: hk.matmul(x, plain, "swiglu"), ident, swiglu, lambda: swiglu(xw()), saved=3 * MN)
     if name == "rmsnorm_swiglu":                  # rmsnorm + swiglu
         r, g = common.inv_rms(x), common.gamma(K)
-        sw = hk.prepare(W, layout="swiglu", gamma=g)
+        sw = hk.prepare(W, gamma=g)
         return case(lambda: hk.matmul(x, sw, "rmsnorm_swiglu", r=r), lambda t: rms_scale(t, r, g), swiglu,
                     lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W)), saved=4 * MK + 3 * MN)
     if name in ("rope", "rmsnorm_rope"):          # D, six half-width products and sums

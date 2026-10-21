@@ -70,7 +70,7 @@ def test_chain_rmsnorm_swiglu():
     _, b2 = inputs(256, 1024, 256, "random", seed=1)               # W_gate_up as [2*d_ff, d_model]
     gamma = pow2_gamma(256)
     module("rmsnorm_swiglu")
-    out = hk.matmul(h, weight(b2, layout="swiglu", gamma=gamma), epilogue="rmsnorm_swiglu", r=r)
+    out = hk.matmul(h, weight(b2, gamma=gamma), epilogue="rmsnorm_swiglu", r=r)
     assert_within_bf16_step(out, rmsnorm_swiglu_reference(h, b2, r, gamma))
 
 

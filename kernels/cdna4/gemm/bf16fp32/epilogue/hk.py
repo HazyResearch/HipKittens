@@ -2,7 +2,7 @@
 
 Prepare static weights once, then call:
 
-    w  = hk.prepare(W, layout="swiglu", gamma=g)        # W: natural [K, N] bf16
+    w  = hk.prepare(W, gamma=g)                          # W: natural [K, N] bf16 ([gate | up] for swiglu)
     cs = hk.prepare_rope_table(cos_sin)                  # natural [M, N] bf16 [cos, sin] table
     y  = hk.matmul(x, w, epilogue="rmsnorm_swiglu", r=r)
     v  = hk.matmul(x, hk.prepare(Wv, gamma=g), epilogue="rmsnorm", r=r)   # rmsnorm(x, g) @ Wv
@@ -28,7 +28,7 @@ BF16, FP32 = torch.bfloat16, torch.float32
 
 @dataclass(frozen=True)
 class PreparedWeight:
-    """A weight in kernel form: [N, K] bf16, columns permuted for `layout`, gamma optionally folded."""
+    """A weight in kernel form: [N, K] bf16, columns permuted for a rope `layout`, gamma optionally folded."""
     tensor: torch.Tensor
     layout: str
     gamma_folded: bool
@@ -65,8 +65,8 @@ _EPILOGUES = {
     "residual_add":   _Spec("tk_residual_add", (("residual", "tile"),)),
     "rmsnorm_scale":  _Spec("tk_rmsnorm_scale", (("r", "row"), ("gamma", "col"))),
     "rmsnorm":        _Spec("tk_rmsnorm_scale", (("r", "row"),), gamma_folded=True, unit_gamma=True),
-    "swiglu":         _Spec("tk_swiglu", layout="swiglu", half_width=True),
-    "rmsnorm_swiglu": _Spec("tk_rmsnorm_swiglu", (("r", "row"),), layout="swiglu", gamma_folded=True, half_width=True),
+    "swiglu":         _Spec("tk_swiglu", half_width=True),
+    "rmsnorm_swiglu": _Spec("tk_rmsnorm_swiglu", (("r", "row"),), gamma_folded=True, half_width=True),
     "rope":           _Spec("tk_rope", (("cos_sin", "rope"),), layout="rope"),
     "rmsnorm_rope":   _Spec("tk_rmsnorm_rope", (("r", "row"), ("cos_sin", "rope")), layout="rope", gamma_folded=True),
 }
@@ -114,15 +114,6 @@ def _pair_slots(pairs, device):
     return (j // 128) * 256 + j % 128
 
 
-def _swiglu_perm(n, device):
-    """perm[new_col] = old_col: gate j (old col j) -> slot(j), value j (old col n/2 + j) -> slot(j) + 128."""
-    slot = _pair_slots(n // 2, device)
-    perm = torch.empty(n, dtype=torch.long, device=device)
-    perm[slot] = torch.arange(n // 2, device=device)
-    perm[slot + 128] = torch.arange(n // 2, n, device=device)
-    return perm
-
-
 def _rope_perm(n, device):
     """perm[new_col] = old_col: pair k's even col 2k -> slot(k), odd col 2k+1 -> slot(k) + 128."""
     slot = _pair_slots(n // 2, device)
@@ -137,10 +128,11 @@ def prepare(W, layout="plain", gamma=None):
     """Turn a natural weight W [K, N] (bf16) into the kernel operand, once.
 
     gamma (bf16 [K]) is folded into W's rows (rmsnorm(x, gamma) @ W == r * (x @ (gamma * W))), for the
-    rmsnorm_swiglu / rmsnorm_rope epilogues. layout "swiglu" or "rope" permutes the columns so each pair
-    sits in one thread; "plain" leaves them. The result is transposed to [N, K]."""
-    if layout not in ("plain", "swiglu", "rope"):
-        raise ValueError(f"layout must be 'plain', 'swiglu' or 'rope', got {layout!r}")
+    rmsnorm_* epilogues. layout "rope" permutes the columns so each rotation pair sits in one thread;
+    "plain" leaves them (the swiglu epilogues take the natural [gate | up] columns). The result is
+    transposed to [N, K]."""
+    if layout not in ("plain", "rope"):
+        raise ValueError(f"layout must be 'plain' or 'rope', got {layout!r}")
     _require(W, "W", BF16, (None, None))
     K, N = W.shape
     if K % 128 or N % 256:
@@ -148,9 +140,7 @@ def prepare(W, layout="plain", gamma=None):
     if gamma is not None:
         _require(gamma, "gamma", BF16, (K,), W.device)
         W = (W.float() * gamma.float()[:, None]).to(BF16)
-    if layout == "swiglu":
-        W = W[:, _swiglu_perm(N, W.device)]
-    elif layout == "rope":
+    if layout == "rope":
         W = W[:, _rope_perm(N, W.device)]
     return PreparedWeight(W.t().contiguous(), layout, gamma is not None)
 

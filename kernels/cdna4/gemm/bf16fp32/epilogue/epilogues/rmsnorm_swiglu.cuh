@@ -5,13 +5,14 @@
 
 // RMSNorm + SwiGLU (dim-reducing): out = silu(gate) * value, where [gate | value] = r[:, None] * (A @ B^T).
 // r is the precomputed per-row 1/rms. The caller folds the norm's per-feature gamma into B's rows
-// (rmsnorm(x, gamma) @ W == r * (x @ (gamma-folded W))) and permutes B's rows exactly as for
-// SwiGLU (epilogues/swiglu.cuh), so gate and value are register-co-resident.
+// (rmsnorm(x, gamma) @ W == r * (x @ (gamma-folded W))). b is otherwise the natural W_gate_up operand;
+// split_gate_up pairs gate and value in registers as for SwiGLU (epilogues/swiglu.cuh).
 struct RmsnormSwigluGlobals {
     _gl_A a; _gl_B b; _gl_C c;
     gl<float, -1, -1, -1, -1> r;  // [M] fp32; as a 4-D gl: [1, 1, 1, M]
 };
 struct RmsnormSwigluEpilogue {
+    static constexpr bool split_gate_up = true;
     static constexpr int out_cols(int n) { return n / 2; }
     template<typename Globals, typename Accum>
     static __device__ inline void apply(const Globals& g, Accum& C, int row, int col, int wr, int wc) {

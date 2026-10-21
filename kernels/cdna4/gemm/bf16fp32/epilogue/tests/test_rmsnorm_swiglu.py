@@ -1,6 +1,6 @@
 """tk_rmsnorm_swiglu: c = silu(gate) * value with [gate | value] = r[:, None] * (a @ b.T), [M, N] -> [M, N/2]
-(bf16, r = [M] fp32). The caller permutes b's rows as for SwiGLU (and folds the norm's gamma into b,
-which this test does not need). Fast SiLU allows one bf16 step."""
+(bf16, r = [M] fp32). b is the natural W_gate_up operand with the norm's gamma folded in. Fast SiLU allows
+one bf16 step."""
 import pytest
 import torch
 
@@ -18,7 +18,7 @@ def r_like(M, seed=4):
 
 def run(a, b, r, gamma):
     module("rmsnorm_swiglu")
-    return hk.matmul(a, weight(b, layout="swiglu", gamma=gamma), epilogue="rmsnorm_swiglu", r=r)
+    return hk.matmul(a, weight(b, gamma=gamma), epilogue="rmsnorm_swiglu", r=r)
 
 
 def reference(a, b, r, gamma):
@@ -49,7 +49,7 @@ def test_known_answer():
     ones = torch.ones(256, dtype=torch.bfloat16, device=DEV)
     assert_within_bf16_step(run(a, eye, r, ones), torch.full((512, 128), SILU_HALF, device=DEV))
     with pytest.raises(ValueError):                      # a weight without gamma folded is refused
-        hk.matmul(a, weight(eye, layout="swiglu"), epilogue="rmsnorm_swiglu", r=r)
+        hk.matmul(a, weight(eye), epilogue="rmsnorm_swiglu", r=r)
 
 
 @pytest.mark.parametrize("M,N,K", BAD_SHAPES)
