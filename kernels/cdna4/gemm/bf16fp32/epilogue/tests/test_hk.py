@@ -1,4 +1,4 @@
-"""hk: the API's own behavior: preparation, refusals, stream and graph safety, inv_rms."""
+"""hk: the API's own behavior: weights and gamma folding, refusals, stream and graph safety, inv_rms."""
 import pytest
 import torch
 
@@ -16,12 +16,12 @@ def test_available():
     assert av["rmsnorm_rope"] == ["r", "cos_sin"]
 
 
-def test_prepare_matches_hand_layout():
+def test_weight_is_not_copied_and_fold_scales_columns():
     _, b = inputs(256, 512, 256, "random")                       # test operand b [N, K]
     gamma = pow2_gamma(256)
     folded = (b.float() * gamma.float()[None, :]).to(torch.bfloat16)
-    assert torch.equal(weight(b).tensor, b)
-    assert torch.equal(weight(b, gamma=gamma).tensor, folded)
+    assert hk.weight(b).tensor.data_ptr() == b.data_ptr()        # hk reads the caller's memory as it is
+    assert torch.equal(hk.fold_gamma(b, gamma), folded)         # gamma [K] scales W's K columns
     assert weight(b, gamma=gamma).gamma_folded and not weight(b).gamma_folded
 
 
@@ -54,10 +54,11 @@ def test_strict_inputs():
     for bad in (a.float(), a.t().contiguous().t(), a.cpu()):          # fp32, non-contiguous, CPU
         with pytest.raises(ValueError, match="must be"):
             hk.matmul(bad, w)
-    with pytest.raises(TypeError, match="hk.prepare"):
+    with pytest.raises(TypeError, match="hk.weight"):
         hk.matmul(a, b)
-    with pytest.raises(ValueError, match="must be"):
-        hk.prepare(b.float())
+    for bad in (b.float(), b.t()):                                  # fp32; a [K, N] view of an [N, K] weight
+        with pytest.raises(ValueError, match="must be"):
+            hk.weight(bad)
     with pytest.raises(TypeError, match="alpha must be a torch.Tensor"):  # bool is not a number here
         hk.matmul(a, w, epilogue="scale", alpha=True)
 

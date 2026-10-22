@@ -2,7 +2,7 @@
 
 Arms (all cold cache):
   HK           one fused HipKittens call (hk.matmul, hk.inv_rms or hk.residual_rms)
-  eager        torch.matmul (hipBLASLt) plus the epilogue as lean bf16 eager torch
+  eager        torch.matmul(x, W.t()) (hipBLASLt) plus the epilogue as lean bf16 eager torch
   compile      the same eager function under torch.compile (common.COMPILE); Dynamo is reset per row so every
                row compiles fresh instead of hitting the recompile limit and silently running eager
   fusion-only  HK noop GEMM plus the same eager torch: the same GEMM as HK, so the ratio isolates fusion
@@ -55,24 +55,30 @@ def inv_rms_eager(D):
 
 
 def make_case(name, M, K, N, Dh):
-    """One epilogue at [M, K] x [K, N]. eager = post(torch.matmul(pre(x), W)); fusion-only =
-    post(hk noop(pre(x))); ref() is fp32. For input-RMSNorm rows every arm folds gamma into the weight once,
-    untimed (HK via hk.prepare, the others via common.fold_gamma), so pre is only x * r. saved = HBM bytes HK
-    avoids: every [M, N] / [M, K] intermediate the eager code writes and reads back (bf16, write + read), minus
-    HK's own fp32 partial-sum round trip. Vector-sized tensors are ignored. The README lists the same formulas."""
+    """One epilogue at [M, K] x [N, K].t(). Every arm reads the same weight tensor W [N, K] (nn.Linear layout):
+    eager = post(torch.matmul(pre(x), W.t())); fusion-only = post(hk noop(pre(x))); ref() is fp32. For
+    input-RMSNorm rows gamma is folded into that shared W once, untimed (hk.fold_gamma), so pre is only x * r.
+    saved = HBM bytes HK avoids: every [M, N] / [M, K] intermediate the eager code writes and reads back (bf16,
+    write + read), minus HK's own fp32 partial-sum round trip. Vector-sized tensors are ignored. The README
+    lists the same formulas."""
     x, W = common.activation(M, K), common.weight(K, N)
-    plain = hk.prepare(W)
     f = lambda t: t.float()
-    xw = lambda: f(x) @ f(W)
+    xw = lambda: f(x) @ f(W).t()
     ident = lambda t: t
     MN, MK = M * N * 2, M * K * 2                 # bf16 bytes of an [M, N] / [M, K] tensor
     partials = 2 * (N // 64) * M * 4              # HK's fp32 partial sums, written then read by rms_reduce
 
-    def case(hk_fn, pre, post, ref, saved, tol=(common.STAGE_TOL,), W_eager=None):
-        """W_eager: the natural weight the eager / compile / fusion-only arms multiply by (gamma-folded rows)."""
-        We = W if W_eager is None else W_eager
-        return dict(x=x, W=We, plain=plain if W_eager is None else hk.prepare(We), hk=hk_fn, pre=pre, post=post,
-                    ref=ref, saved=saved, tol=list(tol))
+    def case(hk_fn, pre, post, ref, saved, tol=(common.STAGE_TOL,), Wf=None):
+        """Wf: the gamma-folded weight, when the row has an input RMSNorm; every arm then multiplies by it."""
+        Ws = W if Wf is None else Wf
+        return dict(x=x, W=Ws, plain=hk.weight(Ws), hk=hk_fn, pre=pre, post=post, ref=ref, saved=saved,
+                    tol=list(tol))
+
+    def folded(g):
+        Wf = hk.fold_gamma(W, g)
+        return Wf, hk.weight(Wf, gamma_folded=True)
+
+    plain = hk.weight(W)
 
     if name == "noop":
         return case(lambda: hk.matmul(x, plain), ident, ident, xw, saved=0)
@@ -91,17 +97,16 @@ def make_case(name, M, K, N, Dh):
                     lambda D: rms_scale(D, r, gc), lambda: xw() * r[:, None] * f(gc), saved=4 * MN)
     if name == "rmsnorm":                         # x*r
         r, g = common.inv_rms(x), common.gamma(K)
-        folded = hk.prepare(W, gamma=g)
-        return case(lambda: hk.matmul(x, folded, "rmsnorm", r=r), lambda t: row_scale(t, r), ident,
-                    lambda: (f(x) * r[:, None] * f(g)) @ f(W), saved=2 * MK, W_eager=common.fold_gamma(W, g))
+        Wf, wf = folded(g)
+        return case(lambda: hk.matmul(x, wf, "rmsnorm", r=r), lambda t: row_scale(t, r), ident,
+                    lambda: (f(x) * r[:, None] * f(g)) @ f(W).t(), saved=2 * MK, Wf=Wf)
     if name == "swiglu":                          # D, silu(gate) (half width)
         return case(lambda: hk.matmul(x, plain, "swiglu"), ident, swiglu, lambda: swiglu(xw()), saved=3 * MN)
     if name == "rmsnorm_swiglu":                  # rmsnorm + swiglu
         r, g = common.inv_rms(x), common.gamma(K)
-        sw = hk.prepare(W, gamma=g)
-        return case(lambda: hk.matmul(x, sw, "rmsnorm_swiglu", r=r), lambda t: row_scale(t, r), swiglu,
-                    lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W)), saved=2 * MK + 3 * MN,
-                    W_eager=common.fold_gamma(W, g))
+        Wf, wf = folded(g)
+        return case(lambda: hk.matmul(x, wf, "rmsnorm_swiglu", r=r), lambda t: row_scale(t, r), swiglu,
+                    lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W).t()), saved=2 * MK + 3 * MN, Wf=Wf)
     if name in ("rope", "rmsnorm_rope"):          # D, six half-width products and sums
         head = common.rope_table(M, Dh)                            # one head's table [M, Dh]: HK's operand
         cs = head.repeat(1, N // Dh)                              # tiled across heads for the eager reference
@@ -110,10 +115,10 @@ def make_case(name, M, K, N, Dh):
             return case(lambda: hk.matmul(x, plain, "rope", cos_sin=head), ident, post,
                         lambda: common.rope(xw(), f(cs)), saved=8 * MN)
         r, g = common.inv_rms(x), common.gamma(K)
-        rw = hk.prepare(W, gamma=g)
-        return case(lambda: hk.matmul(x, rw, "rmsnorm_rope", r=r, cos_sin=head), lambda t: row_scale(t, r),
-                    post, lambda: common.rope((f(x) * r[:, None] * f(g)) @ f(W), f(cs)), saved=2 * MK + 8 * MN,
-                    W_eager=common.fold_gamma(W, g))
+        Wf, wf = folded(g)
+        return case(lambda: hk.matmul(x, wf, "rmsnorm_rope", r=r, cos_sin=head), lambda t: row_scale(t, r),
+                    post, lambda: common.rope((f(x) * r[:, None] * f(g)) @ f(W).t(), f(cs)),
+                    saved=2 * MK + 8 * MN, Wf=Wf)
     if name == "inv_rms":                         # D
         return case(lambda: hk.inv_rms(x, plain), ident, inv_rms_eager, lambda: common.inv_rms(xw()),
                     saved=2 * MN - partials, tol=(common.VECTOR_TOL,))
@@ -138,7 +143,7 @@ def run_row(name, gemm, M, K, N, Dh, timer):
     x, W, plain = c["x"], c["W"], c["plain"]
     hk_fn = c["hk"]
     pre, post = c["pre"], c["post"]
-    eager_fn = lambda x, W: post(torch.matmul(pre(x), W))
+    eager_fn = lambda x, W: post(torch.matmul(pre(x), W.t()))
     eager = lambda: eager_fn(x, W)
     torch._dynamo.reset()
     compiled = torch.compile(eager_fn, **common.COMPILE)

@@ -1,14 +1,15 @@
 """hk: Python API over the compiled GEMM-epilogue kernels (the tk_<name> modules).
 
-Prepare static weights once, then call:
+Weights are stored as [N, K] bf16, the layout of nn.Linear.weight; torch computes the same product as
+x @ W.t(). Label a weight once, then call:
 
-    w  = hk.prepare(W, gamma=g)                          # W: natural [K, N] bf16
-    y  = hk.matmul(x, w, epilogue="rmsnorm_swiglu", r=r)
-    v  = hk.matmul(x, hk.prepare(Wv, gamma=g), epilogue="rmsnorm", r=r)   # rmsnorm(x, g) @ Wv
-    q  = hk.matmul(x, hk.prepare(Wq, gamma=g), epilogue="rmsnorm_rope", r=r, cos_sin=cs)  # cs: one head's [M, Dh]
-    r  = hk.inv_rms(x, hk.prepare(W2))                   # [M] fp32 = 1 / rms(x @ W2)
-    h, r = hk.residual_rms(x, hk.prepare(Wo), residual)  # h = x @ Wo + residual, r = 1 / rms(h)
-    wqkv = hk.prepare_qkv(Wq, Wk, Wv, gamma=g)            # fused attention projections, once
+    fold = lambda W: hk.weight(hk.fold_gamma(W, g), gamma_folded=True)   # W: [N, K]; g: the norm's gain [K]
+    y  = hk.matmul(x, fold(Wgu), epilogue="rmsnorm_swiglu", r=r)
+    v  = hk.matmul(x, fold(Wv), epilogue="rmsnorm", r=r)                  # rmsnorm(x, g) @ Wv.t()
+    q  = hk.matmul(x, fold(Wq), epilogue="rmsnorm_rope", r=r, cos_sin=cs)  # cs: one head's [M, Dh]
+    r  = hk.inv_rms(x, hk.weight(W2))                    # [M] fp32 = 1 / rms(x @ W2.t())
+    h, r = hk.residual_rms(x, hk.weight(Wo), residual)   # h = x @ Wo.t() + residual, r = 1 / rms(h)
+    wqkv = hk.prepare_qkv(fold(Wq), fold(Wk), fold(Wv))  # concatenates [Wq; Wk; Wv], once
     q, k, v = hk.qkv(x, wqkv, r=r, cos_sin=cs)            # one GEMM launch for all three; V is not rotated
     hk.available()                                       # {epilogue: [argument names]}
 
@@ -26,16 +27,16 @@ BF16, FP32 = torch.bfloat16, torch.float32
 
 
 @dataclass(frozen=True)
-class PreparedWeight:
-    """A weight in kernel form: [N, K] bf16 (W transposed), gamma optionally folded."""
+class Weight:
+    """A weight as the kernels read it: [N, K] bf16, labelled with whether the RMSNorm gain is folded in."""
     tensor: torch.Tensor
     gamma_folded: bool
 
 
 @dataclass(frozen=True)
 class QkvWeight:
-    """[Wq | Wk | Wv] from hk.prepare_qkv: one gamma-folded weight plus the column split."""
-    weight: PreparedWeight
+    """[Wq; Wk; Wv] from hk.prepare_qkv: one gamma-folded weight plus the output column split."""
+    weight: Weight
     q_cols: int
     kv_cols: int
 
@@ -99,20 +100,25 @@ def _require(t, name, dtype, shape, device=None):
         raise ValueError(f"{name} must be on {device} (the same device as x), got {t.device}")
 
 
-def prepare(W, gamma=None):
-    """Turn a natural weight W [K, N] (bf16) into the kernel operand, once: transposed to [N, K].
+def weight(W, gamma_folded=False):
+    """Label W [N, K] (bf16, contiguous) for the kernels. No copy: hk reads W's memory as it is.
 
-    gamma (bf16 [K]) is folded into W's rows (rmsnorm(x, gamma) @ W == r * (x @ (gamma * W))), for the
-    rmsnorm_* epilogues. Columns stay in natural order for every epilogue: the swiglu and rope kernels pair
-    their columns in the GEMM's weight loads."""
+    gamma_folded says whether the RMSNorm gain is already folded into W (hk.fold_gamma); the rmsnorm_*
+    epilogues require it, the others refuse it, so a weight is never silently used with the wrong scale."""
     _require(W, "W", BF16, (None, None))
-    K, N = W.shape
+    N, K = W.shape
     if K % 128 or N % 256:
-        raise ValueError(f"W must be [K, N] with K % 128 == 0 and N % 256 == 0, got {tuple(W.shape)}")
-    if gamma is not None:
-        _require(gamma, "gamma", BF16, (K,), W.device)
-        W = (W.float() * gamma.float()[:, None]).to(BF16)
-    return PreparedWeight(W.t().contiguous(), gamma is not None)
+        raise ValueError(f"W must be [N, K] with N % 256 == 0 and K % 128 == 0, got {tuple(W.shape)}")
+    return Weight(W, bool(gamma_folded))
+
+
+def fold_gamma(W, gamma):
+    """W [N, K] bf16 with the RMSNorm gain gamma (bf16 [K]) folded into its columns: rmsnorm(x, gamma) @ W.t()
+    == r * (x @ (W * gamma).t()). Computed in fp32 and rounded to bf16 once. Returns a new tensor; do this once
+    per weight, and give the same folded tensor to every implementation you compare."""
+    _require(W, "W", BF16, (None, None))
+    _require(gamma, "gamma", BF16, (W.shape[1],), W.device)
+    return (W.float() * gamma.float()[None, :]).to(BF16)
 
 
 def _argument(name, kind, value, M, N, device):
@@ -136,17 +142,18 @@ def _argument(name, kind, value, M, N, device):
 
 
 def _check_weight(w, gamma_folded, what):
-    if not isinstance(w, PreparedWeight):
-        raise TypeError(f"w must come from hk.prepare(...), got {type(w).__name__}")
+    if not isinstance(w, Weight):
+        raise TypeError(f"w must come from hk.weight(...), got {type(w).__name__}")
     if w.gamma_folded != gamma_folded:
-        need = "gamma folded in (hk.prepare(W, ..., gamma=g))" if gamma_folded else "no gamma folded in"
+        need = ("gamma folded in (hk.weight(hk.fold_gamma(W, g), gamma_folded=True))" if gamma_folded
+                else "no gamma folded in")
         raise ValueError(f"{what} needs a weight with {need}")
 
 
 def matmul(x, w, epilogue=None, **args):
-    """GEMM x @ W with a fused epilogue; returns a new bf16 output ([M, N], or [M, N/2] for swiglu variants).
+    """GEMM x @ W.t() with a fused epilogue; returns a new bf16 output ([M, N], or [M, N/2] for swiglu variants).
 
-    x: bf16 [M, K]. w: from hk.prepare, with gamma folded in when the epilogue needs it. args: the epilogue's
+    x: bf16 [M, K]. w: hk.weight of W [N, K], with gamma folded in when the epilogue needs it. args: the epilogue's
     inputs by name (see hk.available()). Launches on torch.cuda.current_stream()."""
     return _launch(x, w, epilogue, args)
 
@@ -178,8 +185,8 @@ def _launch(x, w, epilogue, args, rope_cols=None):
 
 
 def inv_rms(x, w):
-    """r = 1 / rms(x @ W) per row, fp32 [M] (eps 1e-5), via partialrms + rms_reduce. Needs a weight without
-    gamma. Does not return x @ W itself."""
+    """r = 1 / rms(x @ W.t()) per row, fp32 [M] (eps 1e-5), via partialrms + rms_reduce. Needs a weight without
+    gamma. Does not return x @ W.t() itself."""
     _check_weight(w, False, "inv_rms")
     N, K = w.tensor.shape
     _require(x, "x", BF16, (None, K))
@@ -195,9 +202,9 @@ def inv_rms(x, w):
 
 
 def residual_rms(x, w, residual):
-    """h = x @ W + residual (bf16 [M, N], the next residual stream) and r = 1 / rms(h) per row (fp32 [M],
+    """h = x @ W.t() + residual (bf16 [M, N], the next residual stream) and r = 1 / rms(h) per row (fp32 [M],
     eps 1e-5, from h before its bf16 rounding), via the residual_rms GEMM + rms_reduce. Needs a weight
-    without gamma; fold the norm's gamma into the next weight (hk.prepare(W, gamma=g))."""
+    without gamma; fold the norm's gamma into the next weight (hk.fold_gamma)."""
     _check_weight(w, False, "residual_rms")
     N, K = w.tensor.shape
     _require(x, "x", BF16, (None, K))
@@ -214,23 +221,22 @@ def residual_rms(x, w, residual):
     return h, r
 
 
-def prepare_qkv(Wq, Wk, Wv, gamma):
-    """Fuse the attention projection weights into one operand for hk.qkv, once. Wq [K, Nq], Wk and Wv [K, Nkv]:
-    natural bf16. gamma (bf16 [K], the attention norm's gain) is folded in, as for "rmsnorm_rope". Nq and Nkv must
-    each be multiples of 256, like any hk weight, so each part is a shape the separate calls also accept."""
-    _require(Wq, "Wq", BF16, (None, None))
-    K, Nq = Wq.shape
-    _require(Wk, "Wk", BF16, (K, None), Wq.device)
-    Nkv = Wk.shape[1]
-    _require(Wv, "Wv", BF16, (K, Nkv), Wq.device)
-    if Nq % 256 or Nkv % 256:
-        raise ValueError(f"Wq and Wk/Wv need N % 256 == 0, got Nq={Nq}, Nkv={Nkv}")
-    return QkvWeight(prepare(torch.cat([Wq, Wk, Wv], dim=1), gamma=gamma), Nq, Nkv)
+def prepare_qkv(wq, wk, wv):
+    """Fuse the attention projection weights into one operand for hk.qkv, once: concatenates [Wq; Wk; Wv] along N
+    (a copy). wq [Nq, K], wk and wv [Nkv, K]: hk.weight's, gamma folded in, as for "rmsnorm_rope". Nq and Nkv are
+    multiples of 256 like any hk weight, so each part is a shape the separate calls also accept."""
+    for name, w in (("Wq", wq), ("Wk", wk), ("Wv", wv)):
+        _check_weight(w, True, f"prepare_qkv's {name}")
+    Nq, K = wq.tensor.shape
+    _require(wk.tensor, "Wk", BF16, (None, K), wq.tensor.device)
+    Nkv = wk.tensor.shape[0]
+    _require(wv.tensor, "Wv", BF16, (Nkv, K), wq.tensor.device)
+    return QkvWeight(Weight(torch.cat([wq.tensor, wk.tensor, wv.tensor], dim=0), True), Nq, Nkv)
 
 
 def qkv(x, w, r, cos_sin):
     """q, k, v = RoPE(r * (x @ Wq)), RoPE(r * (x @ Wk)), r * (x @ Wv), gamma folded into all three, as ONE GEMM
-    launch ("rmsnorm_rope" over [Wq | Wk | Wv], rotating only the Q and K columns); then q, k and v are copied out
+    launch ("rmsnorm_rope" over [Wq; Wk; Wv], rotating only the Q and K columns); then q, k and v are copied out
     as contiguous bf16 [M, Nq], [M, Nkv], [M, Nkv] (attention takes contiguous inputs). w from hk.prepare_qkv,
     cos_sin one head's natural [M, Dh] table, r = 1 / rms(x) fp32 [M]. q and k equal separate "rmsnorm_rope" calls
     bitwise; v is within one bf16 step of the "rmsnorm" call (this store rounds to nearest, that one truncates)."""

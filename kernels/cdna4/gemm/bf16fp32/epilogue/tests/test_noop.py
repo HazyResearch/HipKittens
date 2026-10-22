@@ -32,7 +32,7 @@ def test_known_answer():
     a, _ = inputs(512, 256, 256, "random")
     eye = torch.eye(256, dtype=torch.bfloat16, device=DEV)
     assert torch.equal(run(a, eye), a)                       # a @ I.T == a
-    with pytest.raises(TypeError):                            # an unprepared weight is refused
+    with pytest.raises(TypeError):                            # a bare tensor (not hk.weight) is refused
         hk.matmul(a, eye)
 
 

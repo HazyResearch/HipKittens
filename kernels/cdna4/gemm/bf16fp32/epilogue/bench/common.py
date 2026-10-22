@@ -58,7 +58,7 @@ def control_tols(tols):
 
 
 def layer_gemms(cfg):
-    """The layer's GEMMs as name -> (K, N); each weight is natural [K, N]."""
+    """The layer's GEMMs as name -> (K, N); each weight is stored [N, K] (common.weight)."""
     d, d_ff, kv = cfg["d"], cfg["d_ff"], cfg["H_KV"] * cfg["Dh"]
     return {"Wq": (d, d), "Wk": (d, kv), "Wv": (d, kv), "Wo": (d, d), "Wgu": (d, 2 * d_ff), "Wd": (d_ff, d)}
 
@@ -71,19 +71,14 @@ def activation(M, K):
 
 
 def weight(K, N):
-    """bf16 natural weight [K, N] scaled by 1/sqrt(K), so x @ W stays O(1)."""
-    return (torch.randn(K, N, device="cuda") * K ** -0.5).to(BF16)
+    """bf16 weight for a K -> N projection, stored [N, K] like nn.Linear.weight (x @ W.t()), scaled by 1/sqrt(K)
+    so the product stays O(1). Drawn as [K, N] and transposed once, untimed, so the values match earlier runs."""
+    return (torch.randn(K, N, device="cuda") * K ** -0.5).to(BF16).t().contiguous()
 
 
 def gamma(n):
     """bf16 RMSNorm gain [n], near 1."""
     return (1 + 0.1 * torch.randn(n, device="cuda")).to(BF16)
-
-
-def fold_gamma(W, g):
-    """Natural [K, N] bf16 weight with the RMSNorm gain folded into its rows, as hk.prepare(W, gamma=g) does
-    (fp32 product, one bf16 rounding). PyTorch baselines use it so both sides fold gamma once, untimed."""
-    return (W.float() * g.float()[:, None]).to(BF16)
 
 
 def inv_rms(t):

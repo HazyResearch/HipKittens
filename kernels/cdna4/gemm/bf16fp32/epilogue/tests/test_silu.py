@@ -36,7 +36,7 @@ def test_known_answer():
     a = torch.ones(512, 256, dtype=torch.bfloat16, device=DEV)
     eye = torch.eye(256, dtype=torch.bfloat16, device=DEV)
     assert_within_bf16_step(run(a, eye), torch.full((512, 256), SILU_1, device=DEV))
-    with pytest.raises(TypeError):                            # an unprepared weight is refused
+    with pytest.raises(TypeError):                            # a bare tensor (not hk.weight) is refused
         hk.matmul(a, eye, epilogue="silu")
 
 

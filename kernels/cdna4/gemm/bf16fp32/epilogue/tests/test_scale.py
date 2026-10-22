@@ -39,7 +39,7 @@ def test_known_answer():
     eye = torch.eye(256, dtype=torch.bfloat16, device=DEV)
     c = run(a, eye, alpha_tensor(0.5))
     assert torch.equal(c, torch.full_like(c, 0.5))            # 0.5, not 2.0: alpha multiplies
-    with pytest.raises(TypeError):                            # an unprepared weight is refused
+    with pytest.raises(TypeError):                            # a bare tensor (not hk.weight) is refused
         hk.matmul(a, eye, epilogue="scale", alpha=0.5)
 
 

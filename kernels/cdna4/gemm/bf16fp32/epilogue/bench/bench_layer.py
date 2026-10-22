@@ -63,31 +63,33 @@ def load_gqa(cfg, M):
 
 
 class Layer:
-    """Weights, prepared HK operands, and the five phases of both implementations at one M."""
+    """Weights (shared by every implementation), HK operands, and the five phases of both implementations at one M."""
 
     def __init__(self, cfg, M, gqa, native_gqa):
         self.M, self.d, self.d_ff = M, cfg["d"], cfg["d_ff"]
         self.H, self.H_KV, self.Dh = cfg["H"], cfg["H_KV"], cfg["Dh"]
         d, kv = self.d, self.H_KV * self.Dh
         self.W = dict(q=common.weight(d, d), k=common.weight(d, kv), v=common.weight(d, kv), o=common.weight(d, d),
-                      gu=common.weight(d, 2 * self.d_ff), dn=common.weight(self.d_ff, d))
+                      gu=common.weight(d, 2 * self.d_ff), dn=common.weight(self.d_ff, d))   # each [N, K]
         self.g_attn, self.g_mlp = common.gamma(d), common.gamma(d)
         self.x = common.activation(M, d)
         self.cs = common.rope_table(M, self.Dh)                     # one head's table [M, Dh]
         W, ga, gm = self.W, self.g_attn, self.g_mlp
-        self.Pqkv = hk.prepare_qkv(W["q"], W["k"], W["v"], gamma=ga)
-        self.P = dict(o=hk.prepare(W["o"]), gu=hk.prepare(W["gu"], gamma=gm), dn=hk.prepare(W["dn"]))
+        # Every implementation reads these same tensors: the norms' gamma is folded into the weights that follow
+        # an RMSNorm once, untimed (hk.fold_gamma); the per-call RMSNorm is then the row scale r alone. PyTorch
+        # multiplies by W.t(), a view; HK reads W as it is. Only HK concatenates [Wq; Wk; Wv] (prepare_qkv).
+        self.Wf = dict(q=hk.fold_gamma(W["q"], ga), k=hk.fold_gamma(W["k"], ga), v=hk.fold_gamma(W["v"], ga),
+                       gu=hk.fold_gamma(W["gu"], gm))
+        Wf = self.Wf
+        folded = lambda t: hk.weight(t, gamma_folded=True)
+        self.Pqkv = hk.prepare_qkv(folded(Wf["q"]), folded(Wf["k"]), folded(Wf["v"]))
+        self.P = dict(o=hk.weight(W["o"]), gu=folded(Wf["gu"]), dn=hk.weight(W["dn"]))
         self.r_attn = common.inv_rms(self.x)
         self.gqa, self.native_gqa = gqa, native_gqa
-        # PyTorch and the fusion-only control fold the norms' gamma into their weights once, untimed, as
-        # hk.prepare does for HK; the per-call RMSNorm is then the row scale r alone.
-        self.Wf = dict(q=common.fold_gamma(W["q"], ga), k=common.fold_gamma(W["k"], ga),
-                       v=common.fold_gamma(W["v"], ga), gu=common.fold_gamma(W["gu"], gm))
-        # Fusion-only control: the same HK GEMMs with the noop epilogue (natural column order); the epilogue
-        # work, including the RMSNorm row scale with the same precomputed r, runs as eager torch on the inputs
-        # HK gets. This is the unfused form bench_epilogues.py uses for its rmsnorm_* rows.
-        Wf = self.Wf
-        self.Pf = dict(qkv=hk.prepare(torch.cat([Wf["q"], Wf["k"], Wf["v"]], dim=1)), gu=hk.prepare(Wf["gu"]))
+        # Fusion-only control: the same HK GEMMs with the noop epilogue (natural column order) on the same weight
+        # memory; the epilogue work, including the RMSNorm row scale with the same precomputed r, runs as eager
+        # torch on the inputs HK gets. This is the unfused form bench_epilogues.py uses for its rmsnorm_* rows.
+        self.Pf = dict(qkv=hk.weight(self.Pqkv.weight.tensor), gu=hk.weight(Wf["gu"]))
 
     # ---- HK phases ----
     def hk_qkv(self, x, r):
@@ -118,7 +120,7 @@ class Layer:
 
     def f_qkv(self, x, r):
         M, Dh, nq, nkv = self.M, self.Dh, self.d, self.H_KV * self.Dh
-        c = hk.matmul(self.row_scale(x, r), self.Pf["qkv"])          # one launch over [Wq | Wk | Wv]
+        c = hk.matmul(self.row_scale(x, r), self.Pf["qkv"])          # one launch over [Wq; Wk; Wv]
         cs = self.cs.view(M, 1, Dh)
         q = common.rope(c[:, :nq].view(M, self.H, Dh), cs).reshape(M, nq)
         k = common.rope(c[:, nq:nq + nkv].view(M, self.H_KV, Dh), cs).reshape(M, nkv)
@@ -141,9 +143,9 @@ class Layer:
         M, Dh, W = self.M, self.Dh, self.Wf
         xn = F.rms_norm(x, (self.d,), None, common.EPS)
         cs = self.cs.view(M, 1, Dh)
-        q = common.rope((xn @ W["q"]).view(M, self.H, Dh), cs)
-        k = common.rope((xn @ W["k"]).view(M, self.H_KV, Dh), cs)
-        v = (xn @ W["v"]).view(M, self.H_KV, Dh)
+        q = common.rope((xn @ W["q"].t()).view(M, self.H, Dh), cs)
+        k = common.rope((xn @ W["k"].t()).view(M, self.H_KV, Dh), cs)
+        v = (xn @ W["v"].t()).view(M, self.H_KV, Dh)
         return q, k, v
 
     def t_attention(self, q, k, v):
@@ -155,14 +157,14 @@ class Layer:
         return o.squeeze(0).transpose(0, 1).reshape(self.M, self.d)
 
     def t_out_proj(self, o, x):
-        return x + o @ self.W["o"]
+        return x + o @ self.W["o"].t()
 
     def t_gate_up(self, h):
-        gu = F.rms_norm(h, (self.d,), None, common.EPS) @ self.Wf["gu"]
+        gu = F.rms_norm(h, (self.d,), None, common.EPS) @ self.Wf["gu"].t()
         return F.silu(gu[:, :self.d_ff]) * gu[:, self.d_ff:]
 
     def t_down(self, g, h):
-        x_out = h + g @ self.W["dn"]
+        x_out = h + g @ self.W["dn"].t()
         r_next = torch.rsqrt(torch.linalg.vector_norm(x_out, dim=-1, dtype=torch.float32).square() / self.d + common.EPS)
         return x_out, r_next
 
@@ -171,9 +173,9 @@ class Layer:
         M, Dh, W = self.M, self.Dh, self.W
         xn = x.float() * common.inv_rms(x)[:, None] * self.g_attn.float()
         cs = self.cs.float().view(M, 1, Dh)
-        q = common.rope((xn @ W["q"].float()).view(M, self.H, Dh), cs).reshape(M, -1)
-        k = common.rope((xn @ W["k"].float()).view(M, self.H_KV, Dh), cs).reshape(M, -1)
-        return q, k, xn @ W["v"].float()
+        q = common.rope((xn @ W["q"].float().t()).view(M, self.H, Dh), cs).reshape(M, -1)
+        k = common.rope((xn @ W["k"].float().t()).view(M, self.H_KV, Dh), cs).reshape(M, -1)
+        return q, k, xn @ W["v"].float().t()
 
     def ref_attention(self, q, k, v):
         M, H, H_KV, Dh = self.M, self.H, self.H_KV, self.Dh
@@ -186,16 +188,16 @@ class Layer:
         return (torch.softmax(s, dim=-1) @ vh).transpose(0, 1).reshape(M, H * Dh)
 
     def ref_out_proj(self, o, x):
-        h = x.float() + o.float() @ self.W["o"].float()
+        h = x.float() + o.float() @ self.W["o"].float().t()
         return h, common.inv_rms(h)
 
     def ref_gate_up(self, h):
         hn = h.float() * common.inv_rms(h)[:, None] * self.g_mlp.float()
-        gu = hn @ self.W["gu"].float()
+        gu = hn @ self.W["gu"].float().t()
         return F.silu(gu[:, :self.d_ff]) * gu[:, self.d_ff:]
 
     def ref_down(self, g, h):
-        x_out = h.float() + g.float() @ self.W["dn"].float()
+        x_out = h.float() + g.float() @ self.W["dn"].float().t()
         return x_out, common.inv_rms(x_out)
 
     # ---- captured intermediates from one full run of each implementation ----

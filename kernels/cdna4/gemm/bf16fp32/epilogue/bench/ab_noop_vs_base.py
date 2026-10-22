@@ -39,7 +39,7 @@ def main():
     rows = []
     for M, K, N in shapes(args.cfg, args.M):
         a = common.activation(M, K)
-        bt = common.weight(K, N).t().contiguous()               # both kernels take B transposed: [N, K]
+        bt = common.weight(K, N)                                    # [N, K]: both kernels read B this way
         c_noop = torch.empty(M, N, dtype=common.BF16, device="cuda")
         c_base = torch.empty_like(c_noop)
         run_noop = lambda: noop.dispatch(a, bt, c_noop, stream)

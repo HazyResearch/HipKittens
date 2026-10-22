@@ -63,9 +63,11 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
   (2 × 256 MiB on gfx950), so each call reads its inputs from HBM. GPU events bracket only the call.
 - **Median of 50 calls** after 10 warm-up calls; JSON also records p10 and p90.
 - **Outside the timer:** input creation (including the one-head `[M, Dh]` RoPE table HK reads, and its tiling
-  across heads for `bench_epilogues.py`'s eager reference), weight preparation (`hk.prepare`: transpose and gamma
-  folding; `hk.prepare_qkv` also concatenates `[Wq | Wk | Wv]`), the same gamma fold for the PyTorch and
-  fusion-only weights (`common.fold_gamma`), and `torch.compile` compilation and autotuning.
+  across heads for `bench_epilogues.py`'s eager reference), the RMSNorm gamma fold (`hk.fold_gamma`, once per
+  weight), HK's QKV concatenation (`hk.prepare_qkv`), and `torch.compile` compilation and autotuning.
+- **Same weights for every arm.** Weights are stored `[N, K]`, the `nn.Linear` layout, and gamma is folded into
+  them once. HK reads that tensor as it is; PyTorch multiplies by `W.t()`, a view that hipBLASLt reads in place.
+  The only HK-only preparation is the QKV concatenation; PyTorch runs Q, K and V as three matmuls.
 - **One compile mode:** `torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False)`. CUDA graphs
   are not used: both sides are limited by kernel time, not launch overhead.
 - Eager and compiled PyTorch are separate columns; there is no best-of number.
@@ -73,7 +75,7 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
 ## Columns in `bench_epilogues.py`
 
 - **HK:** one fused HipKittens call.
-- **eager:** `torch.matmul` (hipBLASLt) followed by the epilogue written as lean bf16 eager PyTorch.
+- **eager:** `torch.matmul(x, W.t())` (hipBLASLt) followed by the epilogue written as lean bf16 eager PyTorch.
 - **compile:** the same eager function under `torch.compile`. Dynamo is reset before each row, so every row
   compiles fresh rather than hitting the recompile limit and silently running eager.
 - **fusion-only:** HK's `noop` GEMM followed by the same eager PyTorch. HK and fusion-only share one
@@ -101,11 +103,11 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
 
 | # | Phase | HK | PyTorch |
 |---|---|---|---|
-| 1 | qkv | `hk.qkv`: one `rmsnorm_rope` GEMM over `[Wq ∣ Wk ∣ Wv]` + 3 copies (4 launches) | `rms_norm` (gamma folded into the weights), three matmuls, RoPE on q and k |
+| 1 | qkv | `hk.qkv`: one `rmsnorm_rope` GEMM over `[Wq; Wk; Wv]` + 3 copies (4 launches) | `rms_norm` (gamma folded into the weights), three matmuls, RoPE on q and k |
 | 2 | attention | `gqa_causal` on contiguous q, k, v | transposes, then SDPA |
-| 3 | out_proj | `residual_rms(o, Wo, x)`: 2 launches | `x + o @ Wo` |
+| 3 | out_proj | `residual_rms(o, Wo, x)`: 2 launches | `x + o @ Wo.t()` |
 | 4 | gate_up | `rmsnorm_swiglu`: 1 launch | `rms_norm` (gamma folded), matmul, `silu(gate) * up` |
-| 5 | down | `residual_rms(g, Wd, h)`: 2 launches | `h + g @ Wd`, then 1/rms for the next layer |
+| 5 | down | `residual_rms(g, Wd, h)`: 2 launches | `h + g @ Wd.t()`, then 1/rms for the next layer |
 
 - HK splits RMSNorm across phases: the producing GEMM emits r = 1/rms, the consuming GEMM applies it.
   PyTorch normalizes in the consumer, so a single phase does not compare op-for-op.
