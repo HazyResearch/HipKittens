@@ -14,6 +14,8 @@ void dispatch(RmsnormRopeGlobals g, hipStream_t stream) {
         throw std::runtime_error("rmsnorm_rope: rope_cols must be a multiple of 256 in [0, N]");
     if (reinterpret_cast<uintptr_t>(g.c.raw_ptr) % alignof(bf16_2) != 0)
         throw std::runtime_error("rmsnorm_rope: output must have 4-byte alignment");
+    if (reinterpret_cast<uintptr_t>(g.cos_sin.raw_ptr) % alignof(bf16_2) != 0)   // read as bf16x2 [cos, sin]
+        throw std::runtime_error("rmsnorm_rope: cos_sin must have 4-byte alignment");
     launch<RmsnormRopeEpilogue, RmsnormRopeGlobals>(g, stream);
 }
 

@@ -56,3 +56,12 @@ def test_rejects_plain_weight():
     Wq, Wk, _ = weights(128, 512, 256)
     with pytest.raises(TypeError, match="prepare_qkv"):
         hk.qkv(a, hk.prepare(Wq, gamma=pow2_gamma(128)), r=r_like(256), cos_sin=cos_sin_table(256, 128))
+
+
+def test_rejects_head_dim_not_dividing_split():
+    # Nq + 2 * Nkv = 1024 is a multiple of Dh = 512, but Nkv = 256 is not: K's heads would start mid-table
+    module("rmsnorm_rope")
+    a, _ = inputs(256, 256, 128, "random")
+    Wq, Wk, Wv = weights(128, 512, 256)
+    with pytest.raises(ValueError, match="must divide Nq"):
+        hk.qkv(a, hk.prepare_qkv(Wq, Wk, Wv, gamma=pow2_gamma(128)), r=r_like(256), cos_sin=cos_sin_table(256, 512))

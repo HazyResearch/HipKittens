@@ -127,6 +127,8 @@ def _argument(name, kind, value, M, N, device):
         if dh == 0 or dh % 2 or N % dh:
             raise ValueError(f"{name} must be one head's [M, Dh] table with Dh even and N % Dh == 0, got "
                              f"{tuple(value.shape)} for N={N}")
+        if value.data_ptr() % 4:                          # the kernel reads [cos, sin] as one bf16x2 word
+            raise ValueError(f"{name} must start at a 4-byte aligned address")
         return value
     dtype, shape = {"row": (FP32, (M,)), "col": (BF16, (N,)), "tile": (BF16, (M, N))}[kind]
     _require(value, name, dtype, shape, device)
@@ -235,5 +237,9 @@ def qkv(x, w, r, cos_sin):
     if not isinstance(w, QkvWeight):
         raise TypeError(f"w must come from hk.prepare_qkv(...), got {type(w).__name__}")
     nq, nkv = w.q_cols, w.kv_cols
+    if isinstance(cos_sin, torch.Tensor) and cos_sin.dim() == 2 and cos_sin.shape[1] and (
+            nq % cos_sin.shape[1] or nkv % cos_sin.shape[1]):
+        raise ValueError(f"cos_sin's head dim {cos_sin.shape[1]} must divide Nq={nq} and Nkv={nkv}, so every "
+                         f"Q and K head starts at table column 0")
     out = _launch(x, w.weight, "rmsnorm_rope", dict(r=r, cos_sin=cos_sin), rope_cols=nq + nkv)
     return out[:, :nq].contiguous(), out[:, nq:nq + nkv].contiguous(), out[:, nq + nkv:].contiguous()

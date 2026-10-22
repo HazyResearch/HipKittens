@@ -97,3 +97,15 @@ def test_rejects_misaligned_output():
     misaligned = torch.empty(256 * 256 + 1, dtype=torch.bfloat16, device=DEV)[1:].view(256, 256)
     with pytest.raises(RuntimeError, match="4-byte alignment"):     # hk always allocates aligned output
         module("rope").dispatch(a, b, misaligned, cos_sin_table(256, 256), 256, stream())
+
+
+def test_rejects_misaligned_table():
+    """The epilogue reads [cos, sin] as one bf16x2 word: a table starting at an odd bf16 element is refused."""
+    a, b = inputs(256, 256, 128, "random")
+    cs = torch.empty(256 * 256 + 1, dtype=torch.bfloat16, device=DEV)[1:].view(256, 256)
+    cs.copy_(cos_sin_table(256, 256))
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        run(a, b, cs)
+    out = torch.empty(256, 256, dtype=torch.bfloat16, device=DEV)
+    with pytest.raises(RuntimeError, match="cos_sin must have 4-byte alignment"):
+        module("rope").dispatch(a, b, out, cs, 256, stream())
