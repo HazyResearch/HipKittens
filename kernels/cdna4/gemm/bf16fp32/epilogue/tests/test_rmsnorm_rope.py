@@ -6,7 +6,7 @@ import torch
 
 import hk
 from conftest import BAD_SHAPES, DEV, SHAPES, gemm_exact, hk_shape_error, inputs, module, pow2_gamma, stream, weight
-from test_rope import assert_rope_close, cos_sin_table, rope_perm
+from test_rope import assert_rope_close, cos_sin_table
 
 
 def r_like(M, seed=6):
@@ -16,20 +16,21 @@ def r_like(M, seed=6):
 
 def run(a, b, r, cos_sin, gamma):
     module("rmsnorm_rope")
-    return hk.matmul(a, weight(b, gamma=gamma), epilogue="rmsnorm_rope", r=r,
-                     cos_sin=hk.prepare_rope_table(cos_sin))
+    return hk.matmul(a, weight(b, gamma=gamma), epilogue="rmsnorm_rope", r=r, cos_sin=cos_sin)
 
 
 def folded(b, gamma):
     return (b.float() * gamma.float()[None, :]).to(torch.bfloat16)   # gamma scales b's K axis
 
 
+@pytest.mark.parametrize("dh", ["N", 128])                # one head spanning N, or 128-wide heads sharing a table
 @pytest.mark.parametrize("kind", ["random", "large"])
 @pytest.mark.parametrize("M,N,K", SHAPES)
-def test_shapes(M, N, K, kind):
+def test_shapes(M, N, K, kind, dh):
     a, b = inputs(M, N, K, kind)
-    r, cs, gamma = r_like(M), cos_sin_table(M, N), pow2_gamma(K)
-    assert_rope_close(run(a, b, r, cs, gamma), gemm_exact(a, folded(b, gamma)) * r[:, None], cs)   # r first
+    r, cs, gamma = r_like(M), cos_sin_table(M, N if dh == "N" else dh), pow2_gamma(K)
+    want = gemm_exact(a, folded(b, gamma)) * r[:, None]                                           # r first
+    assert_rope_close(run(a, b, r, cs, gamma), want, cs.repeat(1, N // cs.shape[1]))
 
 
 def test_zeros():
@@ -49,7 +50,7 @@ def test_known_answer():
     assert torch.equal(out, want)
     with pytest.raises(ValueError):                      # a weight without gamma folded is refused
         hk.matmul(a, weight(eye), epilogue="rmsnorm_rope", r=torch.full((512,), 0.5, device=DEV),
-                  cos_sin=hk.prepare_rope_table(cs.to(torch.bfloat16)))
+                  cos_sin=cs.to(torch.bfloat16))
 
 
 @pytest.mark.parametrize("M,N,K", BAD_SHAPES)
@@ -69,7 +70,5 @@ def test_rejects_wrong_dtype():
 def test_rejects_misaligned_output():
     a, b = inputs(256, 256, 128, "random")
     misaligned = torch.empty(256 * 256 + 1, dtype=torch.bfloat16, device=DEV)[1:].view(256, 256)
-    perm = rope_perm(256)                                # hk always allocates aligned output: call the binding
-    with pytest.raises(RuntimeError, match="4-byte alignment"):
-        module("rmsnorm_rope").dispatch(a, b, misaligned, r_like(256),
-                                        cos_sin_table(256, 256)[:, perm].contiguous(), stream())
+    with pytest.raises(RuntimeError, match="4-byte alignment"):     # hk always allocates aligned output
+        module("rmsnorm_rope").dispatch(a, b, misaligned, r_like(256), cos_sin_table(256, 256), 256, stream())

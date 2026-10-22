@@ -3,14 +3,13 @@
 Prepare static weights once, then call:
 
     w  = hk.prepare(W, gamma=g)                          # W: natural [K, N] bf16
-    cs = hk.prepare_rope_table(cos_sin)                  # natural [M, N] bf16 [cos, sin] table
     y  = hk.matmul(x, w, epilogue="rmsnorm_swiglu", r=r)
     v  = hk.matmul(x, hk.prepare(Wv, gamma=g), epilogue="rmsnorm", r=r)   # rmsnorm(x, g) @ Wv
+    q  = hk.matmul(x, hk.prepare(Wq, gamma=g), epilogue="rmsnorm_rope", r=r, cos_sin=cs)  # cs: one head's [M, Dh]
     r  = hk.inv_rms(x, hk.prepare(W2))                   # [M] fp32 = 1 / rms(x @ W2)
     h, r = hk.residual_rms(x, hk.prepare(Wo), residual)  # h = x @ Wo + residual, r = 1 / rms(h)
     wqkv = hk.prepare_qkv(Wq, Wk, Wv, gamma=g)            # fused attention projections, once
-    cs  = hk.prepare_qkv_rope_table(cos_sin_q, cos_sin_k) # V gets the identity rotation
-    q, k, v = hk.qkv(x, wqkv, r=r, cos_sin=cs)            # one GEMM launch for all three
+    q, k, v = hk.qkv(x, wqkv, r=r, cos_sin=cs)            # one GEMM launch for all three; V is not rotated
     hk.available()                                       # {epilogue: [argument names]}
 
 Every call launches on torch.cuda.current_stream() and does not synchronize. Inputs are never
@@ -31,12 +30,6 @@ class PreparedWeight:
     """A weight in kernel form: [N, K] bf16 (W transposed), gamma optionally folded."""
     tensor: torch.Tensor
     gamma_folded: bool
-
-
-@dataclass(frozen=True)
-class RopeTable:
-    """An [M, N] bf16 interleaved [cos, sin] table, columns permuted with rope_perm (ops/rotary.cuh)."""
-    tensor: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -106,22 +99,6 @@ def _require(t, name, dtype, shape, device=None):
         raise ValueError(f"{name} must be on {device} (the same device as x), got {t.device}")
 
 
-def _pair_slots(pairs, device):
-    """Column of each pair's first member after permutation: pair j -> (j/128)*256 + j%128."""
-    j = torch.arange(pairs, device=device)
-    return (j // 128) * 256 + j % 128
-
-
-def _rope_perm(n, device):
-    """perm[new_col] = old_col: pair k's even col 2k -> slot(k), odd col 2k+1 -> slot(k) + 128."""
-    slot = _pair_slots(n // 2, device)
-    k = torch.arange(n // 2, device=device)
-    perm = torch.empty(n, dtype=torch.long, device=device)
-    perm[slot] = 2 * k
-    perm[slot + 128] = 2 * k + 1
-    return perm
-
-
 def prepare(W, gamma=None):
     """Turn a natural weight W [K, N] (bf16) into the kernel operand, once: transposed to [N, K].
 
@@ -138,25 +115,19 @@ def prepare(W, gamma=None):
     return PreparedWeight(W.t().contiguous(), gamma is not None)
 
 
-def prepare_rope_table(cos_sin):
-    """Permute a natural interleaved [cos, sin] table (bf16 [M, N]) to the rope kernels' register order, once."""
-    _require(cos_sin, "cos_sin", BF16, (None, None))
-    if cos_sin.shape[1] % 256:
-        raise ValueError(f"cos_sin must have N % 256 == 0, got {tuple(cos_sin.shape)}")
-    return RopeTable(cos_sin[:, _rope_perm(cos_sin.shape[1], cos_sin.device)].contiguous())
-
-
 def _argument(name, kind, value, M, N, device):
     if kind == "scalar":
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return torch.full((1,), float(value), dtype=FP32, device=device)
         _require(value, name, FP32, (1,), device)
         return value
-    if kind == "rope":
-        if not isinstance(value, RopeTable):
-            raise TypeError(f"{name} must come from hk.prepare_rope_table(...), got {type(value).__name__}")
-        _require(value.tensor, name, BF16, (M, N), device)
-        return value.tensor
+    if kind == "rope":                                    # one head's natural interleaved table, shared by heads
+        _require(value, name, BF16, (M, None), device)
+        dh = value.shape[1]
+        if dh == 0 or dh % 2 or N % dh:
+            raise ValueError(f"{name} must be one head's [M, Dh] table with Dh even and N % Dh == 0, got "
+                             f"{tuple(value.shape)} for N={N}")
+        return value
     dtype, shape = {"row": (FP32, (M,)), "col": (BF16, (N,)), "tile": (BF16, (M, N))}[kind]
     _require(value, name, dtype, shape, device)
     return value
@@ -175,6 +146,11 @@ def matmul(x, w, epilogue=None, **args):
 
     x: bf16 [M, K]. w: from hk.prepare, with gamma folded in when the epilogue needs it. args: the epilogue's
     inputs by name (see hk.available()). Launches on torch.cuda.current_stream()."""
+    return _launch(x, w, epilogue, args)
+
+
+def _launch(x, w, epilogue, args, rope_cols=None):
+    """matmul's body. rope_cols (rope epilogues only): rotate columns [0, rope_cols), default all N."""
     name = "noop" if epilogue is None else epilogue
     spec = _EPILOGUES.get(name)
     if spec is None:
@@ -188,6 +164,8 @@ def matmul(x, w, epilogue=None, **args):
     _require(w.tensor, "w", BF16, (N, K), x.device)
     M = x.shape[0]
     values = [_argument(a, kind, args[a], M, N, x.device) for a, kind in spec.args]
+    if any(kind == "rope" for _, kind in spec.args):
+        values.append(N if rope_cols is None else rope_cols)
     out = torch.empty(M, N // 2 if spec.half_width else N, dtype=BF16, device=x.device)
     with torch.cuda.device(x.device):                     # launch on x's GPU, on its current stream
         stream = torch.cuda.current_stream(x.device).cuda_stream
@@ -248,25 +226,14 @@ def prepare_qkv(Wq, Wk, Wv, gamma):
     return QkvWeight(prepare(torch.cat([Wq, Wk, Wv], dim=1), gamma=gamma), Nq, Nkv)
 
 
-def prepare_qkv_rope_table(cos_sin_q, cos_sin_k):
-    """The [cos, sin] table for hk.qkv, once per sequence length. cos_sin_q [M, Nq] and cos_sin_k [M, Nkv] are
-    natural interleaved bf16 tables, as for hk.prepare_rope_table. V's columns get cos = 1, sin = 0, so RoPE
-    leaves V unrotated."""
-    _require(cos_sin_q, "cos_sin_q", BF16, (None, None))
-    _require(cos_sin_k, "cos_sin_k", BF16, (cos_sin_q.shape[0], None), cos_sin_q.device)
-    identity = torch.zeros_like(cos_sin_k)
-    identity[:, 0::2] = 1
-    return prepare_rope_table(torch.cat([cos_sin_q, cos_sin_k, identity], dim=1))
-
-
 def qkv(x, w, r, cos_sin):
     """q, k, v = RoPE(r * (x @ Wq)), RoPE(r * (x @ Wk)), r * (x @ Wv), gamma folded into all three, as ONE GEMM
-    launch ("rmsnorm_rope" over [Wq | Wk | Wv]); then q, k and v are copied out as contiguous bf16 [M, Nq],
-    [M, Nkv], [M, Nkv] (attention takes contiguous inputs). w from hk.prepare_qkv, cos_sin from
-    hk.prepare_qkv_rope_table, r = 1 / rms(x) fp32 [M]. q and k equal separate "rmsnorm_rope" calls bitwise; v
-    is within one bf16 step of the "rmsnorm" call (this store rounds to nearest, that one truncates)."""
+    launch ("rmsnorm_rope" over [Wq | Wk | Wv], rotating only the Q and K columns); then q, k and v are copied out
+    as contiguous bf16 [M, Nq], [M, Nkv], [M, Nkv] (attention takes contiguous inputs). w from hk.prepare_qkv,
+    cos_sin one head's natural [M, Dh] table, r = 1 / rms(x) fp32 [M]. q and k equal separate "rmsnorm_rope" calls
+    bitwise; v is within one bf16 step of the "rmsnorm" call (this store rounds to nearest, that one truncates)."""
     if not isinstance(w, QkvWeight):
         raise TypeError(f"w must come from hk.prepare_qkv(...), got {type(w).__name__}")
-    out = matmul(x, w.weight, "rmsnorm_rope", r=r, cos_sin=cos_sin)
     nq, nkv = w.q_cols, w.kv_cols
+    out = _launch(x, w.weight, "rmsnorm_rope", dict(r=r, cos_sin=cos_sin), rope_cols=nq + nkv)
     return out[:, :nq].contiguous(), out[:, nq:nq + nkv].contiguous(), out[:, nq + nkv:].contiguous()

@@ -77,7 +77,6 @@ class Layer:
         W, ga, gm = self.W, self.g_attn, self.g_mlp
         self.Pqkv = hk.prepare_qkv(W["q"], W["k"], W["v"], gamma=ga)
         self.P = dict(o=hk.prepare(W["o"]), gu=hk.prepare(W["gu"], gamma=gm), dn=hk.prepare(W["dn"]))
-        self.cs_qkv = hk.prepare_qkv_rope_table(self.cs.repeat(1, self.H), self.cs.repeat(1, self.H_KV))
         self.r_attn = common.inv_rms(self.x)
         self.gqa, self.native_gqa = gqa, native_gqa
         # Fusion-only control: the same HK GEMMs with the noop epilogue (plain weights, natural column order);
@@ -87,7 +86,7 @@ class Layer:
 
     # ---- HK phases ----
     def hk_qkv(self, x, r):
-        return hk.qkv(x, self.Pqkv, r=r, cos_sin=self.cs_qkv)
+        return hk.qkv(x, self.Pqkv, r=r, cos_sin=self.cs)
 
     def hk_attention(self, q, k, v):
         M, H, H_KV, Dh = self.M, self.H, self.H_KV, self.Dh

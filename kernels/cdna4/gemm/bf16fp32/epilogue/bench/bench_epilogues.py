@@ -93,15 +93,15 @@ def make_case(name, M, K, N, Dh):
         return case(lambda: hk.matmul(x, sw, "rmsnorm_swiglu", r=r), lambda t: rms_scale(t, r, g), swiglu,
                     lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W)), saved=4 * MK + 3 * MN)
     if name in ("rope", "rmsnorm_rope"):          # D, six half-width products and sums
-        cs = common.rope_table(M, Dh).repeat(1, N // Dh)          # one head's table, tiled across heads
-        table = hk.prepare_rope_table(cs)
+        head = common.rope_table(M, Dh)                            # one head's table [M, Dh]: HK's operand
+        cs = head.repeat(1, N // Dh)                              # tiled across heads for the eager reference
         post = lambda D: common.rope(D, cs)
         if name == "rope":
-            return case(lambda: hk.matmul(x, plain, "rope", cos_sin=table), ident, post,
+            return case(lambda: hk.matmul(x, plain, "rope", cos_sin=head), ident, post,
                         lambda: common.rope(xw(), f(cs)), saved=8 * MN)
         r, g = common.inv_rms(x), common.gamma(K)
         rw = hk.prepare(W, gamma=g)
-        return case(lambda: hk.matmul(x, rw, "rmsnorm_rope", r=r, cos_sin=table), lambda t: rms_scale(t, r, g),
+        return case(lambda: hk.matmul(x, rw, "rmsnorm_rope", r=r, cos_sin=head), lambda t: rms_scale(t, r, g),
                     post, lambda: common.rope((f(x) * r[:, None] * f(g)) @ f(W), f(cs)), saved=4 * MK + 8 * MN)
     if name == "inv_rms":                         # D
         return case(lambda: hk.inv_rms(x, plain), ident, inv_rms_eager, lambda: common.inv_rms(xw()),

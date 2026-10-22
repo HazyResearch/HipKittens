@@ -1,6 +1,7 @@
-"""hk.qkv: one "rmsnorm_rope" GEMM over [Wq | Wk | Wv] with an identity RoPE table for V. Q and K must equal the
-separate "rmsnorm_rope" calls bitwise (same GEMM per column, same epilogue arithmetic). V must be within one bf16
-step of the "rmsnorm" call: identical fp32 values, but this store rounds to nearest and that one truncates."""
+"""hk.qkv: one "rmsnorm_rope" GEMM over [Wq | Wk | Wv] rotating only the Q and K columns, with one head's
+[M, Dh] cos/sin table. Q and K must equal the separate "rmsnorm_rope" calls bitwise (same GEMM per column, same
+epilogue arithmetic). V must be within one bf16 step of the "rmsnorm" call: identical fp32 values, but this
+store rounds to nearest and that one truncates."""
 import pytest
 import torch
 
@@ -22,14 +23,13 @@ def test_matches_separate_calls(M, Nq, Nkv, K):
     a, _ = inputs(M, 256, K, "random")
     Wq, Wk, Wv = weights(K, Nq, Nkv)
     r, g = r_like(M), pow2_gamma(K)
-    cs_q, cs_k = cos_sin_table(M, Nq), cos_sin_table(M, Nkv)
+    cs = cos_sin_table(M, 128)                                     # one 128-wide head's table, shared
 
-    q, k, v = hk.qkv(a, hk.prepare_qkv(Wq, Wk, Wv, gamma=g), r=r, cos_sin=hk.prepare_qkv_rope_table(cs_q, cs_k))
+    q, k, v = hk.qkv(a, hk.prepare_qkv(Wq, Wk, Wv, gamma=g), r=r, cos_sin=cs)
 
-    rope = lambda W, cs: hk.matmul(a, hk.prepare(W, gamma=g), "rmsnorm_rope", r=r,
-                                   cos_sin=hk.prepare_rope_table(cs))
-    assert torch.equal(q, rope(Wq, cs_q))
-    assert torch.equal(k, rope(Wk, cs_k))
+    rope = lambda W: hk.matmul(a, hk.prepare(W, gamma=g), "rmsnorm_rope", r=r, cos_sin=cs)
+    assert torch.equal(q, rope(Wq))
+    assert torch.equal(k, rope(Wk))
     v_ref = hk.matmul(a, hk.prepare(Wv, gamma=g), "rmsnorm", r=r)
     assert ((v.float() - v_ref.float()).abs() <= bf16_step(v_ref.float())).all()
     assert all(t.is_contiguous() for t in (q, k, v))
@@ -55,5 +55,4 @@ def test_rejects_plain_weight():
     a, _ = inputs(256, 256, 128, "random")
     Wq, Wk, _ = weights(128, 512, 256)
     with pytest.raises(TypeError, match="prepare_qkv"):
-        hk.qkv(a, hk.prepare(Wq, gamma=pow2_gamma(128)), r=r_like(256),
-               cos_sin=hk.prepare_qkv_rope_table(cos_sin_table(256, 512), cos_sin_table(256, 256)))
+        hk.qkv(a, hk.prepare(Wq, gamma=pow2_gamma(128)), r=r_like(256), cos_sin=cos_sin_table(256, 128))

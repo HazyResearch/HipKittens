@@ -3,11 +3,12 @@
 #include "rotary.cuh"
 
 // out = RoPE(A @ B^T) with interleaved pairs (2k, 2k+1), written in natural column order. B is the natural
-// weight; split_rope_pairs pairs its rows in registers (gemm_base.cuh). The caller permutes cos_sin with
-// rope_perm (see ops/rotary.cuh).
+// weight; split_rope_pairs pairs its rows in registers (gemm_base.cuh). cos_sin is one head's natural
+// [M, Dh] table, shared by all heads (see ops/rotary.cuh).
 struct RopeGlobals {
     _gl_A a; _gl_B b; _gl_C c;
-    gl<bf16, -1, -1, -1, -1> cos_sin;   // [M, N] bf16: interleaved [cos, sin], rope_perm'd columns
+    gl<bf16, -1, -1, -1, -1> cos_sin;   // [M, Dh] bf16: natural interleaved [cos, sin] of one head
+    int rope_cols;                      // columns [0, rope_cols) are rotated, the rest stored as is
 };
 struct RopeEpilogue {
     static constexpr bool split_rope_pairs = true;

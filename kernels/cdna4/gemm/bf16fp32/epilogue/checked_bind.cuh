@@ -8,7 +8,7 @@
 // Like kittens::py::bind_function, but raises unless each tensor argument has the expected torch
 // dtype, and takes the HIP stream to launch on as a trailing integer (torch's .cuda_stream). Without it a bf16 tensor passed where fp32 is expected (or the reverse) is silently
 // reinterpreted: from_object reads only the data pointer and the shape.
-enum class tensor_dtype { bf16, fp32 };
+enum class tensor_dtype { bf16, fp32, int_scalar };   // int_scalar: a Python int (an `int` Globals member)
 
 // torch.bfloat16 and torch.float32 are singleton objects: look each up once, then compare pointers.
 // release() keeps the references alive for the whole process, so nothing is freed after Python shuts down.
@@ -19,6 +19,11 @@ inline PyObject* torch_dtype(tensor_dtype d) {
 }
 
 inline void require_dtype(const pybind11::object& t, tensor_dtype expected, size_t index) {
+    if (expected == tensor_dtype::int_scalar) {
+        if (!pybind11::isinstance<pybind11::int_>(t))
+            throw std::runtime_error("argument " + std::to_string(index) + " must be a Python int");
+        return;
+    }
     const pybind11::object got = t.attr("dtype");
     if (got.ptr() != torch_dtype(expected))
         throw std::runtime_error("argument " + std::to_string(index) + " must be " +

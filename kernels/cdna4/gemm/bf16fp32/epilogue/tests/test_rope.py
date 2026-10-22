@@ -1,5 +1,5 @@
 """tk_rope: c = RoPE(a @ b.T) with interleaved pairs (2k, 2k+1), natural column order (bf16). b is natural;
-the caller permutes cos_sin with rope_perm. The output store rounds to nearest (packed
+cos_sin is one head's natural [M, Dh] table, shared by all heads. The output store rounds to nearest (packed
 v_cvt_pk_bf16_f32). Allowed difference (assert_rope_close): one bf16 step of the result plus the fp32
 rounding of the rotation's two products and sum, 4 * 2^-24 * (|x||cos| + |y||sin|), which only matters
 when the two products nearly cancel."""
@@ -8,16 +8,6 @@ import torch
 
 import hk
 from conftest import BAD_SHAPES, DEV, SHAPES, bf16_step, gemm_exact, hk_shape_error, inputs, module, stream, weight
-
-
-def rope_perm(N):
-    """perm[new_col] = old_col: pair k's even column 2k -> (k/128)*256 + k%128, odd column 2k+1 -> +128."""
-    k = torch.arange(N // 2, device=DEV)
-    slot = (k // 128) * 256 + k % 128
-    perm = torch.empty(N, dtype=torch.long, device=DEV)
-    perm[slot] = 2 * k
-    perm[slot + 128] = 2 * k + 1
-    return perm
 
 
 def cos_sin_table(M, N, base=10000.0):
@@ -57,15 +47,16 @@ def assert_rope_close(got, h, cos_sin):
 
 def run(a, b, cos_sin):
     module("rope")
-    return hk.matmul(a, weight(b), epilogue="rope", cos_sin=hk.prepare_rope_table(cos_sin))
+    return hk.matmul(a, weight(b), epilogue="rope", cos_sin=cos_sin)
 
 
+@pytest.mark.parametrize("dh", ["N", 128])                # one head spanning N, or 128-wide heads sharing a table
 @pytest.mark.parametrize("kind", ["random", "large"])
 @pytest.mark.parametrize("M,N,K", SHAPES)
-def test_shapes(M, N, K, kind):
+def test_shapes(M, N, K, kind, dh):
     a, b = inputs(M, N, K, kind)
-    cs = cos_sin_table(M, N)
-    assert_rope_close(run(a, b, cs), gemm_exact(a, b), cs)
+    cs = cos_sin_table(M, N if dh == "N" else dh)
+    assert_rope_close(run(a, b, cs), gemm_exact(a, b), cs.repeat(1, N // cs.shape[1]))
 
 
 def test_zeros():
@@ -83,8 +74,8 @@ def test_known_answer():
     want = torch.empty_like(a)
     want[:, 0::2], want[:, 1::2] = a[:, 1::2], -a[:, 0::2]
     assert torch.equal(out, want)
-    with pytest.raises(TypeError):                       # an unprepared cos/sin table is refused
-        hk.matmul(a, weight(eye), epilogue="rope", cos_sin=cs.to(torch.bfloat16))
+    with pytest.raises(ValueError, match="N % Dh"):         # a table width that does not divide N is refused
+        run(a, eye, cs[:, :96].contiguous().to(torch.bfloat16))
 
 
 @pytest.mark.parametrize("M,N,K", BAD_SHAPES)
@@ -104,6 +95,5 @@ def test_rejects_wrong_dtype():
 def test_rejects_misaligned_output():
     a, b = inputs(256, 256, 128, "random")
     misaligned = torch.empty(256 * 256 + 1, dtype=torch.bfloat16, device=DEV)[1:].view(256, 256)
-    perm = rope_perm(256)                                # hk always allocates aligned output: call the binding
-    with pytest.raises(RuntimeError, match="4-byte alignment"):
-        module("rope").dispatch(a, b, misaligned, cos_sin_table(256, 256)[:, perm].contiguous(), stream())
+    with pytest.raises(RuntimeError, match="4-byte alignment"):     # hk always allocates aligned output
+        module("rope").dispatch(a, b, misaligned, cos_sin_table(256, 256), 256, stream())
