@@ -79,10 +79,15 @@ class Layer:
         self.P = dict(o=hk.prepare(W["o"]), gu=hk.prepare(W["gu"], gamma=gm), dn=hk.prepare(W["dn"]))
         self.r_attn = common.inv_rms(self.x)
         self.gqa, self.native_gqa = gqa, native_gqa
-        # Fusion-only control: the same HK GEMMs with the noop epilogue (plain weights, natural column order);
-        # the epilogue work, including the RMSNorm scale with the same precomputed r, runs as eager torch on the
-        # inputs HK gets. This is the unfused form bench_epilogues.py uses for its rmsnorm_* rows.
-        self.Pf = dict(qkv=hk.prepare(torch.cat([W["q"], W["k"], W["v"]], dim=1)), gu=hk.prepare(W["gu"]))
+        # PyTorch and the fusion-only control fold the norms' gamma into their weights once, untimed, as
+        # hk.prepare does for HK; the per-call RMSNorm is then the row scale r alone.
+        self.Wf = dict(q=common.fold_gamma(W["q"], ga), k=common.fold_gamma(W["k"], ga),
+                       v=common.fold_gamma(W["v"], ga), gu=common.fold_gamma(W["gu"], gm))
+        # Fusion-only control: the same HK GEMMs with the noop epilogue (natural column order); the epilogue
+        # work, including the RMSNorm row scale with the same precomputed r, runs as eager torch on the inputs
+        # HK gets. This is the unfused form bench_epilogues.py uses for its rmsnorm_* rows.
+        Wf = self.Wf
+        self.Pf = dict(qkv=hk.prepare(torch.cat([Wf["q"], Wf["k"], Wf["v"]], dim=1)), gu=hk.prepare(Wf["gu"]))
 
     # ---- HK phases ----
     def hk_qkv(self, x, r):
@@ -108,12 +113,12 @@ class Layer:
     def eager_inv_rms(self, t):
         return torch.rsqrt(torch.linalg.vector_norm(t, dim=-1, dtype=torch.float32).square() / self.d + common.EPS)
 
-    def rms_scale(self, t, r, g):
-        return t * r.to(common.BF16)[:, None] * g                   # eager RMSNorm with a given r
+    def row_scale(self, t, r):
+        return t * r.to(common.BF16)[:, None]                       # eager RMSNorm with r given, gamma folded
 
     def f_qkv(self, x, r):
         M, Dh, nq, nkv = self.M, self.Dh, self.d, self.H_KV * self.Dh
-        c = hk.matmul(self.rms_scale(x, r, self.g_attn), self.Pf["qkv"])   # one launch over [Wq | Wk | Wv]
+        c = hk.matmul(self.row_scale(x, r), self.Pf["qkv"])          # one launch over [Wq | Wk | Wv]
         cs = self.cs.view(M, 1, Dh)
         q = common.rope(c[:, :nq].view(M, self.H, Dh), cs).reshape(M, nq)
         k = common.rope(c[:, nq:nq + nkv].view(M, self.H_KV, Dh), cs).reshape(M, nkv)
@@ -124,17 +129,17 @@ class Layer:
         return h, self.eager_inv_rms(h)                             # h, r_mlp
 
     def f_gate_up(self, h, r):
-        gu = hk.matmul(self.rms_scale(h, r, self.g_mlp), self.Pf["gu"])
+        gu = hk.matmul(self.row_scale(h, r), self.Pf["gu"])
         return F.silu(gu[:, :self.d_ff]) * gu[:, self.d_ff:]
 
     def f_down(self, g, h):
         x_out = hk.matmul(g, self.P["dn"]) + h
         return x_out, self.eager_inv_rms(x_out)                     # x_out, r_next
 
-    # ---- torch phases (eager and torch.compile run this same code) ----
+    # ---- torch phases (eager and torch.compile run this same code; gamma folded into self.Wf) ----
     def t_qkv(self, x):
-        M, Dh, W = self.M, self.Dh, self.W
-        xn = F.rms_norm(x, (self.d,), self.g_attn, common.EPS)
+        M, Dh, W = self.M, self.Dh, self.Wf
+        xn = F.rms_norm(x, (self.d,), None, common.EPS)
         cs = self.cs.view(M, 1, Dh)
         q = common.rope((xn @ W["q"]).view(M, self.H, Dh), cs)
         k = common.rope((xn @ W["k"]).view(M, self.H_KV, Dh), cs)
@@ -153,7 +158,7 @@ class Layer:
         return x + o @ self.W["o"]
 
     def t_gate_up(self, h):
-        gu = F.rms_norm(h, (self.d,), self.g_mlp, common.EPS) @ self.W["gu"]
+        gu = F.rms_norm(h, (self.d,), None, common.EPS) @ self.Wf["gu"]
         return F.silu(gu[:, :self.d_ff]) * gu[:, self.d_ff:]
 
     def t_down(self, g, h):

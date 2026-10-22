@@ -34,8 +34,13 @@ PLACEMENT = {
 
 
 def rms_scale(t, r, g):
-    """Eager RMSNorm with a given per-row inverse RMS r (fp32 [M]) and gain g (bf16): t * r * g in bf16."""
+    """Eager per-row and per-column scale with a given inverse RMS r (fp32 [M]) and gain g (bf16): t * r * g."""
     return t * r.to(common.BF16)[:, None] * g
+
+
+def row_scale(t, r):
+    """Eager input RMSNorm with r given and the gain already folded into the weight: t * r in bf16."""
+    return t * r.to(common.BF16)[:, None]
 
 
 def swiglu(D):
@@ -51,9 +56,10 @@ def inv_rms_eager(D):
 
 def make_case(name, M, K, N, Dh):
     """One epilogue at [M, K] x [K, N]. eager = post(torch.matmul(pre(x), W)); fusion-only =
-    post(hk noop(pre(x))); ref() is fp32. saved = HBM bytes HK avoids: every [M, N] / [M, K] intermediate
-    the eager code writes and reads back (bf16, write + read), minus HK's own fp32 partial-sum round trip.
-    Vector-sized tensors are ignored. The README lists the same formulas."""
+    post(hk noop(pre(x))); ref() is fp32. For input-RMSNorm rows every arm folds gamma into the weight once,
+    untimed (HK via hk.prepare, the others via common.fold_gamma), so pre is only x * r. saved = HBM bytes HK
+    avoids: every [M, N] / [M, K] intermediate the eager code writes and reads back (bf16, write + read), minus
+    HK's own fp32 partial-sum round trip. Vector-sized tensors are ignored. The README lists the same formulas."""
     x, W = common.activation(M, K), common.weight(K, N)
     plain = hk.prepare(W)
     f = lambda t: t.float()
@@ -62,8 +68,11 @@ def make_case(name, M, K, N, Dh):
     MN, MK = M * N * 2, M * K * 2                 # bf16 bytes of an [M, N] / [M, K] tensor
     partials = 2 * (N // 64) * M * 4              # HK's fp32 partial sums, written then read by rms_reduce
 
-    def case(hk_fn, pre, post, ref, saved, tol=(common.STAGE_TOL,)):
-        return dict(x=x, W=W, plain=plain, hk=hk_fn, pre=pre, post=post, ref=ref, saved=saved, tol=list(tol))
+    def case(hk_fn, pre, post, ref, saved, tol=(common.STAGE_TOL,), W_eager=None):
+        """W_eager: the natural weight the eager / compile / fusion-only arms multiply by (gamma-folded rows)."""
+        We = W if W_eager is None else W_eager
+        return dict(x=x, W=We, plain=plain if W_eager is None else hk.prepare(We), hk=hk_fn, pre=pre, post=post,
+                    ref=ref, saved=saved, tol=list(tol))
 
     if name == "noop":
         return case(lambda: hk.matmul(x, plain), ident, ident, xw, saved=0)
@@ -80,18 +89,19 @@ def make_case(name, M, K, N, Dh):
         r, gc = common.inv_rms(x), common.gamma(N)
         return case(lambda: hk.matmul(x, plain, "rmsnorm_scale", r=r, gamma=gc), ident,
                     lambda D: rms_scale(D, r, gc), lambda: xw() * r[:, None] * f(gc), saved=4 * MN)
-    if name == "rmsnorm":                         # x*r, x*r*g
+    if name == "rmsnorm":                         # x*r
         r, g = common.inv_rms(x), common.gamma(K)
         folded = hk.prepare(W, gamma=g)
-        return case(lambda: hk.matmul(x, folded, "rmsnorm", r=r), lambda t: rms_scale(t, r, g), ident,
-                    lambda: (f(x) * r[:, None] * f(g)) @ f(W), saved=4 * MK)
+        return case(lambda: hk.matmul(x, folded, "rmsnorm", r=r), lambda t: row_scale(t, r), ident,
+                    lambda: (f(x) * r[:, None] * f(g)) @ f(W), saved=2 * MK, W_eager=common.fold_gamma(W, g))
     if name == "swiglu":                          # D, silu(gate) (half width)
         return case(lambda: hk.matmul(x, plain, "swiglu"), ident, swiglu, lambda: swiglu(xw()), saved=3 * MN)
     if name == "rmsnorm_swiglu":                  # rmsnorm + swiglu
         r, g = common.inv_rms(x), common.gamma(K)
         sw = hk.prepare(W, gamma=g)
-        return case(lambda: hk.matmul(x, sw, "rmsnorm_swiglu", r=r), lambda t: rms_scale(t, r, g), swiglu,
-                    lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W)), saved=4 * MK + 3 * MN)
+        return case(lambda: hk.matmul(x, sw, "rmsnorm_swiglu", r=r), lambda t: row_scale(t, r), swiglu,
+                    lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W)), saved=2 * MK + 3 * MN,
+                    W_eager=common.fold_gamma(W, g))
     if name in ("rope", "rmsnorm_rope"):          # D, six half-width products and sums
         head = common.rope_table(M, Dh)                            # one head's table [M, Dh]: HK's operand
         cs = head.repeat(1, N // Dh)                              # tiled across heads for the eager reference
@@ -101,8 +111,9 @@ def make_case(name, M, K, N, Dh):
                         lambda: common.rope(xw(), f(cs)), saved=8 * MN)
         r, g = common.inv_rms(x), common.gamma(K)
         rw = hk.prepare(W, gamma=g)
-        return case(lambda: hk.matmul(x, rw, "rmsnorm_rope", r=r, cos_sin=head), lambda t: rms_scale(t, r, g),
-                    post, lambda: common.rope((f(x) * r[:, None] * f(g)) @ f(W), f(cs)), saved=4 * MK + 8 * MN)
+        return case(lambda: hk.matmul(x, rw, "rmsnorm_rope", r=r, cos_sin=head), lambda t: row_scale(t, r),
+                    post, lambda: common.rope((f(x) * r[:, None] * f(g)) @ f(W), f(cs)), saved=2 * MK + 8 * MN,
+                    W_eager=common.fold_gamma(W, g))
     if name == "inv_rms":                         # D
         return case(lambda: hk.inv_rms(x, plain), ident, inv_rms_eager, lambda: common.inv_rms(xw()),
                     saved=2 * MN - partials, tol=(common.VECTOR_TOL,))

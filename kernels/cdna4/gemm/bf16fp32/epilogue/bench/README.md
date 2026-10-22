@@ -63,9 +63,9 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
   (2 × 256 MiB on gfx950), so each call reads its inputs from HBM. GPU events bracket only the call.
 - **Median of 50 calls** after 10 warm-up calls; JSON also records p10 and p90.
 - **Outside the timer:** input creation (including the one-head `[M, Dh]` RoPE table HK reads, and its tiling
-  across heads for `bench_epilogues.py`'s eager reference), weight
-  preparation (`hk.prepare`: transpose and gamma folding; `hk.prepare_qkv` also concatenates `[Wq | Wk | Wv]`),
-  and `torch.compile` compilation and autotuning.
+  across heads for `bench_epilogues.py`'s eager reference), weight preparation (`hk.prepare`: transpose and gamma
+  folding; `hk.prepare_qkv` also concatenates `[Wq | Wk | Wv]`), the same gamma fold for the PyTorch and
+  fusion-only weights (`common.fold_gamma`), and `torch.compile` compilation and autotuning.
 - **One compile mode:** `torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False)`. CUDA graphs
   are not used: both sides are limited by kernel time, not launch overhead.
 - Eager and compiled PyTorch are separate columns; there is no best-of number.
@@ -89,11 +89,11 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
   | noop | none | 0 |
   | silu, scale, residual_add | D | 2·MN |
   | rmsnorm_scale | D, D·r | 4·MN |
-  | rmsnorm | x·r, x·r·g | 4·MK |
+  | rmsnorm | x·r (gamma folded into W on every side) | 2·MK |
   | swiglu | D, silu(gate) (half width) | 3·MN |
-  | rmsnorm_swiglu | rmsnorm + swiglu | 4·MK + 3·MN |
+  | rmsnorm_swiglu | rmsnorm + swiglu | 2·MK + 3·MN |
   | rope | D, six half-width products and sums | 8·MN |
-  | rmsnorm_rope | rmsnorm + rope | 4·MK + 8·MN |
+  | rmsnorm_rope | rmsnorm + rope | 2·MK + 8·MN |
   | inv_rms | D | 2·MN − HK's fp32 partials, 2·(N/64)·M·4 |
   | residual_rms | D, second read of h | 3·MN − HK's fp32 partials |
 
@@ -101,10 +101,10 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
 
 | # | Phase | HK | PyTorch |
 |---|---|---|---|
-| 1 | qkv | `hk.qkv`: one `rmsnorm_rope` GEMM over `[Wq ∣ Wk ∣ Wv]` + 3 copies (4 launches) | `rms_norm`, three matmuls, RoPE on q and k |
+| 1 | qkv | `hk.qkv`: one `rmsnorm_rope` GEMM over `[Wq ∣ Wk ∣ Wv]` + 3 copies (4 launches) | `rms_norm` (gamma folded into the weights), three matmuls, RoPE on q and k |
 | 2 | attention | `gqa_causal` on contiguous q, k, v | transposes, then SDPA |
 | 3 | out_proj | `residual_rms(o, Wo, x)`: 2 launches | `x + o @ Wo` |
-| 4 | gate_up | `rmsnorm_swiglu`: 1 launch | `rms_norm`, matmul, `silu(gate) * up` |
+| 4 | gate_up | `rmsnorm_swiglu`: 1 launch | `rms_norm` (gamma folded), matmul, `silu(gate) * up` |
 | 5 | down | `residual_rms(g, Wd, h)`: 2 launches | `h + g @ Wd`, then 1/rms for the next layer |
 
 - HK splits RMSNorm across phases: the producing GEMM emits r = 1/rms, the consuming GEMM applies it.
@@ -113,8 +113,8 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
   normalizes its input inside the timed qkv phase and also computes `r_next` in `down`, so a timed PyTorch
   layer does one more RMS reduction than the HK layer; in a stack of layers PyTorch would not need `r_next`.
 - **fusion-only control (`--phases`):** for every GEMM phase, the same HK GEMM(s) with the `noop` epilogue on
-  HK's own inputs, with the epilogue's work as eager PyTorch (QKV: `x · r · γ`, one GEMM over `[Wq | Wk | Wv]`,
-  RoPE and the V copy; out_proj/down: residual add and 1/rms; gate_up: `h · r · γ`, then SwiGLU).
+  HK's own inputs, with the epilogue's work as eager PyTorch (QKV: `x · r` on gamma-folded weights, one GEMM over
+  `[Wq | Wk | Wv]`, RoPE and the V copy; out_proj/down: residual add and 1/rms; gate_up: `h · r`, then SwiGLU).
 - **Control tolerance:** the control stores the GEMM output through HK's truncating bf16 store before its eager
   epilogue, which a fused kernel never does, and SwiGLU multiplies two such values. Its bf16 outputs are gated at
   `rtol 2.5e-2` (`CONTROL_TOL`) in both scripts; HK, eager and compiled PyTorch keep `rtol 1e-2`.

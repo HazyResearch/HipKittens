@@ -80,6 +80,12 @@ def gamma(n):
     return (1 + 0.1 * torch.randn(n, device="cuda")).to(BF16)
 
 
+def fold_gamma(W, g):
+    """Natural [K, N] bf16 weight with the RMSNorm gain folded into its rows, as hk.prepare(W, gamma=g) does
+    (fp32 product, one bf16 rounding). PyTorch baselines use it so both sides fold gamma once, untimed."""
+    return (W.float() * g.float()[:, None]).to(BF16)
+
+
 def inv_rms(t):
     """fp32 [M]: 1 / rms(t) per row, computed in fp32."""
     return torch.rsqrt(t.float().pow(2).mean(-1) + EPS)
