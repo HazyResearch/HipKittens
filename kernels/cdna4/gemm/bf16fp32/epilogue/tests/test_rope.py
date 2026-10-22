@@ -1,5 +1,5 @@
-"""tk_rope: c = RoPE(a @ b.T) with interleaved pairs (2k, 2k+1), natural column order (bf16). The caller
-permutes b's rows and cos_sin with rope_perm. The output store rounds to nearest (packed
+"""tk_rope: c = RoPE(a @ b.T) with interleaved pairs (2k, 2k+1), natural column order (bf16). b is natural;
+the caller permutes cos_sin with rope_perm. The output store rounds to nearest (packed
 v_cvt_pk_bf16_f32). Allowed difference (assert_rope_close): one bf16 step of the result plus the fp32
 rounding of the rotation's two products and sum, 4 * 2^-24 * (|x||cos| + |y||sin|), which only matters
 when the two products nearly cancel."""
@@ -57,7 +57,7 @@ def assert_rope_close(got, h, cos_sin):
 
 def run(a, b, cos_sin):
     module("rope")
-    return hk.matmul(a, weight(b, layout="rope"), epilogue="rope", cos_sin=hk.prepare_rope_table(cos_sin))
+    return hk.matmul(a, weight(b), epilogue="rope", cos_sin=hk.prepare_rope_table(cos_sin))
 
 
 @pytest.mark.parametrize("kind", ["random", "large"])
@@ -84,7 +84,7 @@ def test_known_answer():
     want[:, 0::2], want[:, 1::2] = a[:, 1::2], -a[:, 0::2]
     assert torch.equal(out, want)
     with pytest.raises(TypeError):                       # an unprepared cos/sin table is refused
-        hk.matmul(a, weight(eye, layout="rope"), epilogue="rope", cos_sin=cs.to(torch.bfloat16))
+        hk.matmul(a, weight(eye), epilogue="rope", cos_sin=cs.to(torch.bfloat16))
 
 
 @pytest.mark.parametrize("M,N,K", BAD_SHAPES)
@@ -106,4 +106,4 @@ def test_rejects_misaligned_output():
     misaligned = torch.empty(256 * 256 + 1, dtype=torch.bfloat16, device=DEV)[1:].view(256, 256)
     perm = rope_perm(256)                                # hk always allocates aligned output: call the binding
     with pytest.raises(RuntimeError, match="4-byte alignment"):
-        module("rope").dispatch(a, b[perm].contiguous(), misaligned, cos_sin_table(256, 256)[:, perm].contiguous(), stream())
+        module("rope").dispatch(a, b, misaligned, cos_sin_table(256, 256)[:, perm].contiguous(), stream())

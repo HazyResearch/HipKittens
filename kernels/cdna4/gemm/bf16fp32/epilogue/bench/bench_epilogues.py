@@ -97,11 +97,10 @@ def make_case(name, M, K, N, Dh):
         table = hk.prepare_rope_table(cs)
         post = lambda D: common.rope(D, cs)
         if name == "rope":
-            rw = hk.prepare(W, layout="rope")
-            return case(lambda: hk.matmul(x, rw, "rope", cos_sin=table), ident, post,
+            return case(lambda: hk.matmul(x, plain, "rope", cos_sin=table), ident, post,
                         lambda: common.rope(xw(), f(cs)), saved=8 * MN)
         r, g = common.inv_rms(x), common.gamma(K)
-        rw = hk.prepare(W, layout="rope", gamma=g)
+        rw = hk.prepare(W, gamma=g)
         return case(lambda: hk.matmul(x, rw, "rmsnorm_rope", r=r, cos_sin=table), lambda t: rms_scale(t, r, g),
                     post, lambda: common.rope((f(x) * r[:, None] * f(g)) @ f(W), f(cs)), saved=4 * MK + 8 * MN)
     if name == "inv_rms":                         # D

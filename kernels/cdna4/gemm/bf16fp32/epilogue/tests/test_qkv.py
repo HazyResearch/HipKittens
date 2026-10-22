@@ -26,7 +26,7 @@ def test_matches_separate_calls(M, Nq, Nkv, K):
 
     q, k, v = hk.qkv(a, hk.prepare_qkv(Wq, Wk, Wv, gamma=g), r=r, cos_sin=hk.prepare_qkv_rope_table(cs_q, cs_k))
 
-    rope = lambda W, cs: hk.matmul(a, hk.prepare(W, layout="rope", gamma=g), "rmsnorm_rope", r=r,
+    rope = lambda W, cs: hk.matmul(a, hk.prepare(W, gamma=g), "rmsnorm_rope", r=r,
                                    cos_sin=hk.prepare_rope_table(cs))
     assert torch.equal(q, rope(Wq, cs_q))
     assert torch.equal(k, rope(Wk, cs_k))
@@ -55,5 +55,5 @@ def test_rejects_plain_weight():
     a, _ = inputs(256, 256, 128, "random")
     Wq, Wk, _ = weights(128, 512, 256)
     with pytest.raises(TypeError, match="prepare_qkv"):
-        hk.qkv(a, hk.prepare(Wq, layout="rope", gamma=pow2_gamma(128)), r=r_like(256),
+        hk.qkv(a, hk.prepare(Wq, gamma=pow2_gamma(128)), r=r_like(256),
                cos_sin=hk.prepare_qkv_rope_table(cos_sin_table(256, 512), cos_sin_table(256, 256)))

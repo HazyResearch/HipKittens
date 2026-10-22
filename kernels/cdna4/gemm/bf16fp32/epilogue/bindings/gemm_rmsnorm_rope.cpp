@@ -16,7 +16,7 @@ void dispatch(RmsnormRopeGlobals g, hipStream_t stream) {
 
 PYBIND11_MODULE(TK_MODULE_NAME, m) {
     m.doc() = "GEMM + RMSNorm + RoPE: c = RoPE(r[:, None] * (a @ b.T)), natural column order; a = [M,K], b = [N,K] "
-              "gamma-folded and rope_perm'd, cos_sin = [M,N] rope_perm'd, c = [M,N] 4-byte aligned (bf16), r = [M] (fp32)";
+              "gamma-folded, cos_sin = [M,N] rope_perm'd, c = [M,N] 4-byte aligned (bf16), r = [M] (fp32)";
     bind_checked<dispatch>(m, "dispatch", {tensor_dtype::bf16, tensor_dtype::bf16, tensor_dtype::bf16, tensor_dtype::fp32, tensor_dtype::bf16},
         &RmsnormRopeGlobals::a, &RmsnormRopeGlobals::b, &RmsnormRopeGlobals::c,
         &RmsnormRopeGlobals::r, &RmsnormRopeGlobals::cos_sin);

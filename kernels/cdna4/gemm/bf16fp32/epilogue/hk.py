@@ -2,7 +2,7 @@
 
 Prepare static weights once, then call:
 
-    w  = hk.prepare(W, gamma=g)                          # W: natural [K, N] bf16 ([gate | up] for swiglu)
+    w  = hk.prepare(W, gamma=g)                          # W: natural [K, N] bf16
     cs = hk.prepare_rope_table(cos_sin)                  # natural [M, N] bf16 [cos, sin] table
     y  = hk.matmul(x, w, epilogue="rmsnorm_swiglu", r=r)
     v  = hk.matmul(x, hk.prepare(Wv, gamma=g), epilogue="rmsnorm", r=r)   # rmsnorm(x, g) @ Wv
@@ -14,7 +14,7 @@ Prepare static weights once, then call:
     hk.available()                                       # {epilogue: [argument names]}
 
 Every call launches on torch.cuda.current_stream() and does not synchronize. Inputs are never
-converted: a wrong dtype, shape, device or layout raises. A scalar `alpha` may be a Python number.
+converted: a wrong dtype, shape or device raises. A scalar `alpha` may be a Python number.
 Shapes: M and N multiples of 256, K a multiple of 128. The tk_<name> modules must be built
 (make KERNEL=<name>) and importable.
 """
@@ -28,21 +28,20 @@ BF16, FP32 = torch.bfloat16, torch.float32
 
 @dataclass(frozen=True)
 class PreparedWeight:
-    """A weight in kernel form: [N, K] bf16, columns permuted for a rope `layout`, gamma optionally folded."""
+    """A weight in kernel form: [N, K] bf16 (W transposed), gamma optionally folded."""
     tensor: torch.Tensor
-    layout: str
     gamma_folded: bool
 
 
 @dataclass(frozen=True)
 class RopeTable:
-    """An [M, N] bf16 interleaved [cos, sin] table, columns permuted like a rope-layout weight."""
+    """An [M, N] bf16 interleaved [cos, sin] table, columns permuted with rope_perm (ops/rotary.cuh)."""
     tensor: torch.Tensor
 
 
 @dataclass(frozen=True)
 class QkvWeight:
-    """[Wq | Wk | Wv] from hk.prepare_qkv: one rope-layout, gamma-folded weight plus the column split."""
+    """[Wq | Wk | Wv] from hk.prepare_qkv: one gamma-folded weight plus the column split."""
     weight: PreparedWeight
     q_cols: int
     kv_cols: int
@@ -52,7 +51,6 @@ class QkvWeight:
 class _Spec:
     module: str
     args: tuple = ()             # ((name, kind), ...); kind: scalar | row | col | tile | rope
-    layout: str = "plain"
     gamma_folded: bool = False
     half_width: bool = False
     unit_gamma: bool = False     # the kernel takes an output-column gamma; pass ones (gamma is folded into w)
@@ -67,8 +65,8 @@ _EPILOGUES = {
     "rmsnorm":        _Spec("tk_rmsnorm_scale", (("r", "row"),), gamma_folded=True, unit_gamma=True),
     "swiglu":         _Spec("tk_swiglu", half_width=True),
     "rmsnorm_swiglu": _Spec("tk_rmsnorm_swiglu", (("r", "row"),), gamma_folded=True, half_width=True),
-    "rope":           _Spec("tk_rope", (("cos_sin", "rope"),), layout="rope"),
-    "rmsnorm_rope":   _Spec("tk_rmsnorm_rope", (("r", "row"), ("cos_sin", "rope")), layout="rope", gamma_folded=True),
+    "rope":           _Spec("tk_rope", (("cos_sin", "rope"),)),
+    "rmsnorm_rope":   _Spec("tk_rmsnorm_rope", (("r", "row"), ("cos_sin", "rope")), gamma_folded=True),
 }
 
 _ONES = {}
@@ -124,15 +122,12 @@ def _rope_perm(n, device):
     return perm
 
 
-def prepare(W, layout="plain", gamma=None):
-    """Turn a natural weight W [K, N] (bf16) into the kernel operand, once.
+def prepare(W, gamma=None):
+    """Turn a natural weight W [K, N] (bf16) into the kernel operand, once: transposed to [N, K].
 
     gamma (bf16 [K]) is folded into W's rows (rmsnorm(x, gamma) @ W == r * (x @ (gamma * W))), for the
-    rmsnorm_* epilogues. layout "rope" permutes the columns so each rotation pair sits in one thread;
-    "plain" leaves them (the swiglu epilogues take the natural [gate | up] columns). The result is
-    transposed to [N, K]."""
-    if layout not in ("plain", "rope"):
-        raise ValueError(f"layout must be 'plain' or 'rope', got {layout!r}")
+    rmsnorm_* epilogues. Columns stay in natural order for every epilogue: the swiglu and rope kernels pair
+    their columns in the GEMM's weight loads."""
     _require(W, "W", BF16, (None, None))
     K, N = W.shape
     if K % 128 or N % 256:
@@ -140,13 +135,11 @@ def prepare(W, layout="plain", gamma=None):
     if gamma is not None:
         _require(gamma, "gamma", BF16, (K,), W.device)
         W = (W.float() * gamma.float()[:, None]).to(BF16)
-    if layout == "rope":
-        W = W[:, _rope_perm(N, W.device)]
-    return PreparedWeight(W.t().contiguous(), layout, gamma is not None)
+    return PreparedWeight(W.t().contiguous(), gamma is not None)
 
 
 def prepare_rope_table(cos_sin):
-    """Permute a natural interleaved [cos, sin] table (bf16 [M, N]) the way rope weights are permuted, once."""
+    """Permute a natural interleaved [cos, sin] table (bf16 [M, N]) to the rope kernels' register order, once."""
     _require(cos_sin, "cos_sin", BF16, (None, None))
     if cos_sin.shape[1] % 256:
         raise ValueError(f"cos_sin must have N % 256 == 0, got {tuple(cos_sin.shape)}")
@@ -169,11 +162,9 @@ def _argument(name, kind, value, M, N, device):
     return value
 
 
-def _check_weight(w, layout, gamma_folded, what):
+def _check_weight(w, gamma_folded, what):
     if not isinstance(w, PreparedWeight):
         raise TypeError(f"w must come from hk.prepare(...), got {type(w).__name__}")
-    if w.layout != layout:
-        raise ValueError(f"{what} needs a {layout!r} weight, got {w.layout!r} (use hk.prepare(W, layout={layout!r}))")
     if w.gamma_folded != gamma_folded:
         need = "gamma folded in (hk.prepare(W, ..., gamma=g))" if gamma_folded else "no gamma folded in"
         raise ValueError(f"{what} needs a weight with {need}")
@@ -182,13 +173,13 @@ def _check_weight(w, layout, gamma_folded, what):
 def matmul(x, w, epilogue=None, **args):
     """GEMM x @ W with a fused epilogue; returns a new bf16 output ([M, N], or [M, N/2] for swiglu variants).
 
-    x: bf16 [M, K]. w: from hk.prepare with the layout / gamma the epilogue needs. args: the epilogue's
+    x: bf16 [M, K]. w: from hk.prepare, with gamma folded in when the epilogue needs it. args: the epilogue's
     inputs by name (see hk.available()). Launches on torch.cuda.current_stream()."""
     name = "noop" if epilogue is None else epilogue
     spec = _EPILOGUES.get(name)
     if spec is None:
         raise ValueError(f"unknown epilogue {epilogue!r}; available: {sorted(_EPILOGUES)}")
-    _check_weight(w, spec.layout, spec.gamma_folded, f"epilogue {name!r}")
+    _check_weight(w, spec.gamma_folded, f"epilogue {name!r}")
     expected = [a for a, _ in spec.args]
     if sorted(args) != sorted(expected):
         raise TypeError(f"epilogue {name!r} takes arguments {expected}, got {sorted(args)}")
@@ -207,9 +198,9 @@ def matmul(x, w, epilogue=None, **args):
 
 
 def inv_rms(x, w):
-    """r = 1 / rms(x @ W) per row, fp32 [M] (eps 1e-5), via partialrms + rms_reduce. Needs a plain weight
-    without gamma. Does not return x @ W itself."""
-    _check_weight(w, "plain", False, "inv_rms")
+    """r = 1 / rms(x @ W) per row, fp32 [M] (eps 1e-5), via partialrms + rms_reduce. Needs a weight without
+    gamma. Does not return x @ W itself."""
+    _check_weight(w, False, "inv_rms")
     N, K = w.tensor.shape
     _require(x, "x", BF16, (None, K))
     _require(w.tensor, "w", BF16, (N, K), x.device)
@@ -225,9 +216,9 @@ def inv_rms(x, w):
 
 def residual_rms(x, w, residual):
     """h = x @ W + residual (bf16 [M, N], the next residual stream) and r = 1 / rms(h) per row (fp32 [M],
-    eps 1e-5, from h before its bf16 rounding), via the residual_rms GEMM + rms_reduce. Needs a plain
-    weight without gamma; fold the norm's gamma into the next weight (hk.prepare(W, ..., gamma=g))."""
-    _check_weight(w, "plain", False, "residual_rms")
+    eps 1e-5, from h before its bf16 rounding), via the residual_rms GEMM + rms_reduce. Needs a weight
+    without gamma; fold the norm's gamma into the next weight (hk.prepare(W, gamma=g))."""
+    _check_weight(w, False, "residual_rms")
     N, K = w.tensor.shape
     _require(x, "x", BF16, (None, K))
     _require(w.tensor, "w", BF16, (N, K), x.device)
@@ -254,7 +245,7 @@ def prepare_qkv(Wq, Wk, Wv, gamma):
     _require(Wv, "Wv", BF16, (K, Nkv), Wq.device)
     if Nq % 256 or Nkv % 256:
         raise ValueError(f"Wq and Wk/Wv need N % 256 == 0, got Nq={Nq}, Nkv={Nkv}")
-    return QkvWeight(prepare(torch.cat([Wq, Wk, Wv], dim=1), layout="rope", gamma=gamma), Nq, Nkv)
+    return QkvWeight(prepare(torch.cat([Wq, Wk, Wv], dim=1), gamma=gamma), Nq, Nkv)
 
 
 def prepare_qkv_rope_table(cos_sin_q, cos_sin_k):

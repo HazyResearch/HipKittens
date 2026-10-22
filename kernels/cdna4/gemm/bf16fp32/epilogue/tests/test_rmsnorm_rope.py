@@ -16,7 +16,7 @@ def r_like(M, seed=6):
 
 def run(a, b, r, cos_sin, gamma):
     module("rmsnorm_rope")
-    return hk.matmul(a, weight(b, layout="rope", gamma=gamma), epilogue="rmsnorm_rope", r=r,
+    return hk.matmul(a, weight(b, gamma=gamma), epilogue="rmsnorm_rope", r=r,
                      cos_sin=hk.prepare_rope_table(cos_sin))
 
 
@@ -48,7 +48,7 @@ def test_known_answer():
     want[:, 0::2], want[:, 1::2] = 0.5 * a[:, 1::2], -0.5 * a[:, 0::2]
     assert torch.equal(out, want)
     with pytest.raises(ValueError):                      # a weight without gamma folded is refused
-        hk.matmul(a, weight(eye, layout="rope"), epilogue="rmsnorm_rope", r=torch.full((512,), 0.5, device=DEV),
+        hk.matmul(a, weight(eye), epilogue="rmsnorm_rope", r=torch.full((512,), 0.5, device=DEV),
                   cos_sin=hk.prepare_rope_table(cs.to(torch.bfloat16)))
 
 
@@ -71,5 +71,5 @@ def test_rejects_misaligned_output():
     misaligned = torch.empty(256 * 256 + 1, dtype=torch.bfloat16, device=DEV)[1:].view(256, 256)
     perm = rope_perm(256)                                # hk always allocates aligned output: call the binding
     with pytest.raises(RuntimeError, match="4-byte alignment"):
-        module("rmsnorm_rope").dispatch(a, b[perm].contiguous(), misaligned, r_like(256),
+        module("rmsnorm_rope").dispatch(a, b, misaligned, r_like(256),
                                         cos_sin_table(256, 256)[:, perm].contiguous(), stream())

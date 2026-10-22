@@ -42,8 +42,8 @@ def test_known_answer():
     out = run(a, eye)
     assert_within_bf16_step(out, torch.full((512, 128), SILU_1 * 2, device=DEV))   # not silu(2) * 1
     assert not torch.allclose(out.float(), torch.full_like(out.float(), SILU_2))
-    with pytest.raises(ValueError):                           # a rope-layout weight is refused
-        hk.matmul(a, weight(eye, layout="rope"), epilogue="swiglu")
+    with pytest.raises(ValueError):                           # a gamma-folded weight is refused
+        hk.matmul(a, weight(eye, gamma=torch.ones(256, dtype=torch.bfloat16, device=DEV)), epilogue="swiglu")
 
 
 @pytest.mark.parametrize("M,N,K", BAD_SHAPES)

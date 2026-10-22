@@ -21,10 +21,21 @@ constexpr bool splits_gate_up() {
     else return false;
 }
 
+// An epilogue that sets `static constexpr bool split_rope_pairs = true` takes the natural weight (b = [N, K],
+// RoPE pair k in rows 2k and 2k+1). launch() hands the kernel b viewed as [N/2, 2K] (same memory), whose row p
+// holds row 2p in columns [0, K) and row 2p+1 in columns [K, 2K). Block `col` loads view rows
+// [col*128, col*128+128): their first K columns (the even rows) as B half 0 and their last K columns (the odd
+// rows) as half 1, so pair k's x is in C[*][0] and its y in C[*][1] of the same thread.
+template<typename Epilogue>
+constexpr bool splits_rope_pairs() {
+    if constexpr (requires { Epilogue::split_rope_pairs; }) return Epilogue::split_rope_pairs;
+    else return false;
+}
+
 // gemm_kernel is a copy of the base GEMM's micro_tk (kernels/cdna4/gemm/bf16fp32/256_256_64_32_with16x32.cpp)
 // with four changes: it is templated on <Epilogue, Globals>, an unused debug variable is removed, the B
-// loads use b_half0/b_half1 (split_gate_up above), and the four final stores are replaced by
-// Epilogue::apply(...). Re-copy the loop if the base changes.
+// loads use b_half0/b_half1/b_k1 (split_gate_up, split_rope_pairs above), and the four final stores are
+// replaced by Epilogue::apply(...). Re-copy the loop if the base changes.
 template<typename Epilogue = NoOpEpilogue, typename Globals = gemm_args_base>
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void gemm_kernel(const Globals g, int M, int N, int K) {
@@ -65,9 +76,13 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     // Assign the tile's row/column based on the pid_m and pid_n.
     int row = pid_m; 
     int col = pid_n;  
-    // B half-tile indices (units of HALF_BLOCK_SIZE rows) for this block's two 128-column halves.
-    const int b_half0 = splits_gate_up<Epilogue>() ? col : col * 2;
-    const int b_half1 = splits_gate_up<Epilogue>() ? N / BLOCK_SIZE + col : col * 2 + 1;
+    // B half-tile indices (units of HALF_BLOCK_SIZE rows) for this block's two 128-column halves, and the
+    // K-tile offset of half 1 (non-zero only for split_rope_pairs, whose half 1 is the view's second K columns).
+    const int b_half0 = splits_gate_up<Epilogue>() || splits_rope_pairs<Epilogue>() ? col : col * 2;
+    const int b_half1 = splits_gate_up<Epilogue>()   ? N / BLOCK_SIZE + col
+                      : splits_rope_pairs<Epilogue>() ? col
+                      : col * 2 + 1;
+    const int b_k1 = splits_rope_pairs<Epilogue>() ? K / K_STEP : 0;
 
     // Info
     const int warp_id = kittens::warpid();
@@ -81,7 +96,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     const int a_row_stride = g.a.template stride<2>() * sizeof(bf16);
     const int b_row_stride = g.b.template stride<2>() * sizeof(bf16);
     i32x4 a_srsrc_base = make_srsrc(a_base, M * a_row_stride, a_row_stride);
-    i32x4 b_srsrc_base = make_srsrc(b_base, N * b_row_stride, b_row_stride);
+    i32x4 b_srsrc_base = make_srsrc(b_base, g.b.rows() * b_row_stride, b_row_stride);
 
     const int wid = warpid() % NUM_WARPS;
     constexpr int elem_per_warp = (16 / sizeof(bf16)) * kittens::WARP_THREADS;
@@ -110,7 +125,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 
     G::load(Bs[tic][0], g.b, {0, 0, b_half0, 0}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_00);
     G::load(As[tic][0], g.a, {0, 0, row*2, 0}, swizzled_offsets_A, a_srsrc_base, a_base, a_lds_00);
-    G::load(Bs[tic][1], g.b, {0, 0, b_half1, 0}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
+    G::load(Bs[tic][1], g.b, {0, 0, b_half1, b_k1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
     G::load(As[tic][1], g.a, {0, 0, row*2 + 1, 0}, swizzled_offsets_A, a_srsrc_base, a_base, a_lds_01);
 
     if (warp_row == 1) {
@@ -122,7 +137,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 
     G::load(Bs[toc][0], g.b, {0, 0, b_half0, 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_10);
     G::load(As[toc][0], g.a, {0, 0, row*2, 1}, swizzled_offsets_A, a_srsrc_base, a_base, a_lds_10);
-    G::load(Bs[toc][1], g.b, {0, 0, b_half1, 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
+    G::load(Bs[toc][1], g.b, {0, 0, b_half1, b_k1 + 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
 
     asm volatile("s_waitcnt vmcnt(6)");
     __builtin_amdgcn_s_barrier();
@@ -170,7 +185,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 
         st_subtile_b = subtile_inplace<HALF_REG_BLOCK_N, K_STEP>(Bs[1][0], {warp_col, 0});
         load(B_tile_0, st_subtile_b);
-        G::load(Bs[0][1], g.b, {0, 0, b_half1, tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
+        G::load(Bs[0][1], g.b, {0, 0, b_half1, b_k1 + tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
         asm volatile("s_waitcnt vmcnt(6)");
         __builtin_amdgcn_s_barrier();
 
@@ -216,7 +231,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        G::load(Bs[1][1], g.b, {0, 0, b_half1, tile + 3}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
+        G::load(Bs[1][1], g.b, {0, 0, b_half1, b_k1 + tile + 3}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
         asm volatile("s_waitcnt vmcnt(6)");
         __builtin_amdgcn_s_barrier();
 
@@ -332,6 +347,8 @@ void launch(Globals g, hipStream_t stream = 0) {
     const size_t mem = MAX_SHARED_MEMORY;
     hip_check(hipFuncSetAttribute((void*)gemm_kernel<Epilogue, Globals>, hipFuncAttributeMaxDynamicSharedMemorySize, mem),
               "hipFuncSetAttribute");
+    if constexpr (splits_rope_pairs<Epilogue>())        // same memory as b = [N, K]; see split_rope_pairs
+        g.b = decltype(g.b)(g.b.raw_ptr, 1, 1, N / 2, 2 * K);
     gemm_kernel<Epilogue, Globals><<<dim3((N / BLOCK_SIZE) * (M / BLOCK_SIZE)), dim3(NUM_THREADS), mem, stream>>>(g, M, N, K);
     hip_check(hipGetLastError(), "gemm_kernel launch");
 }

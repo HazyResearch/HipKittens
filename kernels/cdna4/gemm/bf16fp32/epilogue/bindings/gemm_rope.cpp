@@ -13,8 +13,8 @@ void dispatch(RopeGlobals g, hipStream_t stream) {
 }
 
 PYBIND11_MODULE(TK_MODULE_NAME, m) {
-    m.doc() = "GEMM + RoPE: c = RoPE(a @ b.T), interleaved pairs, natural column order; a = [M,K], b = [N,K] and cos_sin = [M,N] "
-              "rope_perm'd (see ops/rotary.cuh), c = [M,N] 4-byte aligned (all bf16)";
+    m.doc() = "GEMM + RoPE: c = RoPE(a @ b.T), interleaved pairs, natural column order; a = [M,K], b = [N,K], "
+              "cos_sin = [M,N] rope_perm'd (see ops/rotary.cuh), c = [M,N] 4-byte aligned (all bf16)";
     bind_checked<dispatch>(m, "dispatch", {tensor_dtype::bf16, tensor_dtype::bf16, tensor_dtype::bf16, tensor_dtype::bf16},
         &RopeGlobals::a, &RopeGlobals::b, &RopeGlobals::c, &RopeGlobals::cos_sin);
 }

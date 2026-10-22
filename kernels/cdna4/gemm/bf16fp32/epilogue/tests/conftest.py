@@ -54,10 +54,10 @@ def stream():
     return torch.cuda.current_stream().cuda_stream
 
 
-def weight(b, layout="plain", gamma=None):
+def weight(b, gamma=None):
     """hk-prepared weight from a test operand b [N, K] (hk.prepare takes the natural [K, N])."""
     import hk
-    return hk.prepare(b.t().contiguous(), layout=layout, gamma=gamma)
+    return hk.prepare(b.t().contiguous(), gamma=gamma)
 
 
 def pow2_gamma(K, seed=7):

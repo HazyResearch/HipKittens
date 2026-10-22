@@ -4,7 +4,6 @@ import torch
 
 import hk
 from conftest import DEV, assert_bitexact, gemm_exact, inputs, module, pow2_gamma, weight
-from test_rope import rope_perm
 
 MATMUL_EPILOGUES = {"noop", "silu", "scale", "residual_add", "rmsnorm_scale", "rmsnorm", "swiglu", "rmsnorm_swiglu",
                     "rope", "rmsnorm_rope"}
@@ -23,15 +22,7 @@ def test_prepare_matches_hand_layout():
     folded = (b.float() * gamma.float()[None, :]).to(torch.bfloat16)
     assert torch.equal(weight(b).tensor, b)
     assert torch.equal(weight(b, gamma=gamma).tensor, folded)
-    assert torch.equal(weight(b, layout="rope").tensor, b[rope_perm(512)])
-    w = weight(b, layout="rope", gamma=gamma)
-    assert w.layout == "rope" and w.gamma_folded
-
-
-def test_layout_mismatch():
-    a, b = inputs(256, 256, 128, "random")
-    with pytest.raises(ValueError, match="'plain' weight"):
-        hk.matmul(a, weight(b, layout="rope"), epilogue="swiglu")
+    assert weight(b, gamma=gamma).gamma_folded and not weight(b).gamma_folded
 
 
 def test_gamma_flag_mismatch():
@@ -156,7 +147,7 @@ def test_inv_rms():
     got = hk.inv_rms(a, weight(b)).double()
     assert ((got - want).abs() <= (64 + 16 + 4) * 2.0 ** -24 * want).all()
     with pytest.raises(ValueError):
-        hk.inv_rms(a, weight(b, layout="rope"))
+        hk.inv_rms(a, weight(b, gamma=pow2_gamma(256)))
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")

@@ -4,8 +4,9 @@
 #include "base.cuh"
 
 // Interleaved RoPE: out[2k] = x*cos + y*sin, out[2k+1] = y*cos - x*sin, stored in natural column order.
-// The caller permutes B's rows and cos_sin with rope_perm (pair k -> columns k%128 and k%128 + 128 of
-// 256-column block k/128), so x is in C[i][0] and y in C[i][1] of the same thread.
+// split_rope_pairs (gemm_base.cuh) loads pair k's two weight rows as B halves 0 and 1, so x is in C[i][0] and
+// y in C[i][1] of the same thread (pair k -> columns k%128 and k%128 + 128 of 256-column block k/128); the
+// caller permutes cos_sin with rope_perm to match.
 // Each rotated pair is written as one round-to-nearest bf16x2 word at columns (2k, 2k+1); c must be
 // 4-byte aligned. Lane L of a 16x16 base tile owns column L%16, so its pair is
 // k = col*128 + wc*32 + j*16 + L%16.
