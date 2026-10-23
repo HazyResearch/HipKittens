@@ -62,9 +62,10 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
 - **Cold cache.** Before every timed call, the timer overwrites a buffer twice the last-level cache
   (2 × 256 MiB on gfx950), so each call reads its inputs from HBM. GPU events bracket only the call.
 - **Median of 50 calls** after 10 warm-up calls; JSON also records p10 and p90.
-- **Outside the timer:** input creation (including the one-head `[M, Dh]` RoPE table HK reads, and its tiling
-  across heads for `bench_epilogues.py`'s eager reference), HK's RMSNorm inputs a previous GEMM would produce
-  (`r` and `x · gamma`, see below), and `torch.compile` compilation and autotuning.
+- **Outside the timer:** input creation (including the one-head `[M, Dh]` RoPE table, which every timed arm reads
+  broadcast over the heads; `bench_epilogues.py` tiles it across heads only for its fp32 reference), HK's RMSNorm
+  inputs a previous GEMM would produce (`r` and `x · gamma`, see below), and `torch.compile` compilation and
+  autotuning.
 - **Same weights for every arm, used as they are.** Weights are plain `[N, K]` tensors, the `nn.Linear` layout;
   nothing is folded, permuted, transposed or concatenated. HK reads them in place (its QKV GEMM reads Wq, Wk and
   Wv through three pointers); PyTorch multiplies by `W.t()`, a view that hipBLASLt reads in place.

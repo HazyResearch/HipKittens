@@ -108,9 +108,10 @@ def make_case(name, M, K, N, Dh):
                     lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W).t()), saved=4 * MK + 3 * MN,
                     fusion=lambda: swiglu(hk.matmul(row_scale(xg, r), W)))
     if name in ("rope", "rmsnorm_rope"):          # D, six half-width products and sums
-        head = common.rope_table(M, Dh)                            # one head's table [M, Dh]: HK's operand
-        cs = head.repeat(1, N // Dh)                              # tiled across heads for the eager reference
-        post = lambda D: common.rope(D, cs)
+        head = common.rope_table(M, Dh)                            # one head's table [M, Dh]: every arm's operand
+        cs = head.repeat(1, N // Dh)                              # tiled across heads, for the fp32 references only
+        # Timed arms broadcast one head's table over the heads, as HK reads it (and as bench_layer does).
+        post = lambda D: common.rope(D.view(M, N // Dh, Dh), head.view(M, 1, Dh)).reshape(M, N)
         if name == "rope":
             return case(lambda: hk.matmul(x, W, "rope", cos_sin=head), ident, post,
                         lambda: common.rope(xw(), f(cs)), saved=8 * MN)
