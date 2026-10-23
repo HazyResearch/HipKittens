@@ -76,12 +76,20 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     // Assign the tile's row/column based on the pid_m and pid_n.
     int row = pid_m; 
     int col = pid_n;  
+    // Three-B globals (b = Wq, b_k = Wk, b_v = Wv; hk.qkv): every 256-column output block lies inside one of the
+    // three, so the block picks its B tensor and its column within it once, here. All B addressing below uses gb.
+    _gl_B gb = g.b;
+    int bcol = col;
+    if constexpr (requires { g.b_k; g.b_v; g.q_blocks; g.qk_blocks; }) {
+        if (col >= g.qk_blocks)     { gb = g.b_v; bcol = col - g.qk_blocks; }
+        else if (col >= g.q_blocks) { gb = g.b_k; bcol = col - g.q_blocks; }
+    }
     // B half-tile indices (units of HALF_BLOCK_SIZE rows) for this block's two 128-column halves, and the
     // K-tile offset of half 1 (non-zero only for split_rope_pairs, whose half 1 is the view's second K columns).
-    const int b_half0 = splits_gate_up<Epilogue>() || splits_rope_pairs<Epilogue>() ? col : col * 2;
-    const int b_half1 = splits_gate_up<Epilogue>()   ? N / BLOCK_SIZE + col
-                      : splits_rope_pairs<Epilogue>() ? col
-                      : col * 2 + 1;
+    const int b_half0 = splits_gate_up<Epilogue>() || splits_rope_pairs<Epilogue>() ? bcol : bcol * 2;
+    const int b_half1 = splits_gate_up<Epilogue>()   ? N / BLOCK_SIZE + bcol
+                      : splits_rope_pairs<Epilogue>() ? bcol
+                      : bcol * 2 + 1;
     const int b_k1 = splits_rope_pairs<Epilogue>() ? K / K_STEP : 0;
 
     // Info
@@ -92,11 +100,11 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 
     /********** Readfirstlane hoisting **********/
     const bf16* a_base = (bf16*)&g.a[{0, 0, 0, 0}];
-    const bf16* b_base = (bf16*)&g.b[{0, 0, 0, 0}];
+    const bf16* b_base = (bf16*)&gb[{0, 0, 0, 0}];
     const int a_row_stride = g.a.template stride<2>() * sizeof(bf16);
-    const int b_row_stride = g.b.template stride<2>() * sizeof(bf16);
+    const int b_row_stride = gb.template stride<2>() * sizeof(bf16);
     i32x4 a_srsrc_base = make_srsrc(a_base, M * a_row_stride, a_row_stride);
-    i32x4 b_srsrc_base = make_srsrc(b_base, g.b.rows() * b_row_stride, b_row_stride);
+    i32x4 b_srsrc_base = make_srsrc(b_base, gb.rows() * b_row_stride, b_row_stride);
 
     const int wid = warpid() % NUM_WARPS;
     constexpr int elem_per_warp = (16 / sizeof(bf16)) * kittens::WARP_THREADS;
@@ -121,11 +129,11 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     uint32_t swizzled_offsets_A[memcpy_per_tile/2];
     uint32_t swizzled_offsets_B[memcpy_per_tile/2];
     G::prefill_swizzled_offsets(As[0][0], g.a, swizzled_offsets_A);
-    G::prefill_swizzled_offsets(Bs[0][0], g.b, swizzled_offsets_B);
+    G::prefill_swizzled_offsets(Bs[0][0], gb, swizzled_offsets_B);
 
-    G::load(Bs[tic][0], g.b, {0, 0, b_half0, 0}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_00);
+    G::load(Bs[tic][0], gb, {0, 0, b_half0, 0}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_00);
     G::load(As[tic][0], g.a, {0, 0, row*2, 0}, swizzled_offsets_A, a_srsrc_base, a_base, a_lds_00);
-    G::load(Bs[tic][1], g.b, {0, 0, b_half1, b_k1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
+    G::load(Bs[tic][1], gb, {0, 0, b_half1, b_k1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
     G::load(As[tic][1], g.a, {0, 0, row*2 + 1, 0}, swizzled_offsets_A, a_srsrc_base, a_base, a_lds_01);
 
     if (warp_row == 1) {
@@ -135,9 +143,9 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     asm volatile("s_waitcnt vmcnt(4)");
     __builtin_amdgcn_s_barrier();
 
-    G::load(Bs[toc][0], g.b, {0, 0, b_half0, 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_10);
+    G::load(Bs[toc][0], gb, {0, 0, b_half0, 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_10);
     G::load(As[toc][0], g.a, {0, 0, row*2, 1}, swizzled_offsets_A, a_srsrc_base, a_base, a_lds_10);
-    G::load(Bs[toc][1], g.b, {0, 0, b_half1, b_k1 + 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
+    G::load(Bs[toc][1], gb, {0, 0, b_half1, b_k1 + 1}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
 
     asm volatile("s_waitcnt vmcnt(6)");
     __builtin_amdgcn_s_barrier();
@@ -162,7 +170,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 
         st_subtile_b = subtile_inplace<HALF_REG_BLOCK_N, K_STEP>(Bs[0][1], {warp_col, 0});
         load(B_tile_1, st_subtile_b);
-        G::load(Bs[0][0], g.b, {0, 0, b_half0, tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_00);
+        G::load(Bs[0][0], gb, {0, 0, b_half0, tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_00);
         __builtin_amdgcn_s_barrier();
 
         asm volatile("s_waitcnt lgkmcnt(0)");
@@ -185,7 +193,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 
         st_subtile_b = subtile_inplace<HALF_REG_BLOCK_N, K_STEP>(Bs[1][0], {warp_col, 0});
         load(B_tile_0, st_subtile_b);
-        G::load(Bs[0][1], g.b, {0, 0, b_half1, b_k1 + tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
+        G::load(Bs[0][1], gb, {0, 0, b_half1, b_k1 + tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
         asm volatile("s_waitcnt vmcnt(6)");
         __builtin_amdgcn_s_barrier();
 
@@ -210,7 +218,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 
         st_subtile_b = subtile_inplace<HALF_REG_BLOCK_N, K_STEP>(Bs[1][1], {warp_col, 0});
         load(B_tile_1, st_subtile_b);
-        G::load(Bs[1][0], g.b, {0, 0, b_half0, tile + 3}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_10);
+        G::load(Bs[1][0], gb, {0, 0, b_half0, tile + 3}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_10);
         __builtin_amdgcn_s_barrier();
 
         asm volatile("s_waitcnt lgkmcnt(0)");
@@ -231,7 +239,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        G::load(Bs[1][1], g.b, {0, 0, b_half1, b_k1 + tile + 3}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
+        G::load(Bs[1][1], gb, {0, 0, b_half1, b_k1 + tile + 3}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_11);
         asm volatile("s_waitcnt vmcnt(6)");
         __builtin_amdgcn_s_barrier();
 
@@ -329,7 +337,10 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 // (or [M, Epilogue::out_cols(N)] for epilogues that narrow the output).
 template<typename Epilogue, typename Globals>
 void launch(Globals g, hipStream_t stream = 0) {
-    const int M = g.a.rows(), N = g.b.rows(), K = g.a.cols();
+    constexpr bool three_b = requires { g.b_k; g.b_v; g.q_blocks; g.qk_blocks; };
+    int N = g.b.rows();
+    if constexpr (three_b) N += g.b_k.rows() + g.b_v.rows();
+    const int M = g.a.rows(), K = g.a.cols();
     if (M <= 0 || N <= 0 || K <= 0)
         throw std::runtime_error("GEMM: M, N and K must be positive");
     if (M % BLOCK_SIZE || N % BLOCK_SIZE)
@@ -338,6 +349,14 @@ void launch(Globals g, hipStream_t stream = 0) {
         throw std::runtime_error("GEMM: K must be a multiple of 128");
     if (g.b.cols() != K)
         throw std::runtime_error("GEMM: operand shape mismatch (need a=[M,K], b=[N,K])");
+    if constexpr (three_b) {
+        if (g.b_k.cols() != K || g.b_v.cols() != K)
+            throw std::runtime_error("GEMM: Wk and Wv must be [*, K] like Wq");
+        if (g.b.rows() % BLOCK_SIZE || g.b_k.rows() % BLOCK_SIZE || g.b_k.rows() != g.b_v.rows())
+            throw std::runtime_error("GEMM: Wq and Wk/Wv rows must be multiples of 256, Wk and Wv equal");
+        g.q_blocks = g.b.rows() / BLOCK_SIZE;
+        g.qk_blocks = g.q_blocks + g.b_k.rows() / BLOCK_SIZE;
+    }
     if constexpr (requires { g.c; }) {                  // partials-only epilogues have no c
         int out_cols = N;                               // dim-reducing epilogues narrow the output
         if constexpr (requires { Epilogue::out_cols(N); }) out_cols = Epilogue::out_cols(N);
@@ -347,8 +366,13 @@ void launch(Globals g, hipStream_t stream = 0) {
     const size_t mem = MAX_SHARED_MEMORY;
     hip_check(hipFuncSetAttribute((void*)gemm_kernel<Epilogue, Globals>, hipFuncAttributeMaxDynamicSharedMemorySize, mem),
               "hipFuncSetAttribute");
-    if constexpr (splits_rope_pairs<Epilogue>())        // same memory as b = [N, K]; see split_rope_pairs
-        g.b = decltype(g.b)(g.b.raw_ptr, 1, 1, N / 2, 2 * K);
+    if constexpr (splits_rope_pairs<Epilogue>()) {      // same memory as b = [N, K]; see split_rope_pairs
+        g.b = decltype(g.b)(g.b.raw_ptr, 1, 1, g.b.rows() / 2, 2 * K);
+        if constexpr (three_b) {
+            g.b_k = decltype(g.b_k)(g.b_k.raw_ptr, 1, 1, g.b_k.rows() / 2, 2 * K);
+            g.b_v = decltype(g.b_v)(g.b_v.raw_ptr, 1, 1, g.b_v.rows() / 2, 2 * K);
+        }
+    }
     gemm_kernel<Epilogue, Globals><<<dim3((N / BLOCK_SIZE) * (M / BLOCK_SIZE)), dim3(NUM_THREADS), mem, stream>>>(g, M, N, K);
     hip_check(hipGetLastError(), "gemm_kernel launch");
 }

@@ -1,4 +1,4 @@
-"""hk: the API's own behavior: weights and gamma folding, refusals, stream and graph safety, inv_rms."""
+"""hk: the API's own behavior: refusals, stream and graph safety, inv_rms."""
 import pytest
 import torch
 
@@ -14,25 +14,6 @@ def test_available():
     assert set(av) == MATMUL_EPILOGUES
     assert av["rmsnorm_scale"] == ["r", "gamma"] and av["rmsnorm"] == ["r"] and av["noop"] == []
     assert av["rmsnorm_rope"] == ["r", "cos_sin"]
-
-
-def test_weight_is_not_copied_and_fold_scales_columns():
-    _, b = inputs(256, 512, 256, "random")                       # test operand b [N, K]
-    gamma = pow2_gamma(256)
-    folded = (b.float() * gamma.float()[None, :]).to(torch.bfloat16)
-    assert hk.weight(b).tensor.data_ptr() == b.data_ptr()        # hk reads the caller's memory as it is
-    assert torch.equal(hk.fold_gamma(b, gamma), folded)         # gamma [K] scales W's K columns
-    assert weight(b, gamma=gamma).gamma_folded and not weight(b).gamma_folded
-
-
-def test_gamma_flag_mismatch():
-    a, b = inputs(256, 256, 128, "random")
-    r = torch.ones(256, device=DEV)
-    with pytest.raises(ValueError, match="no gamma folded"):
-        hk.matmul(a, weight(b, gamma=pow2_gamma(128)), epilogue="rmsnorm_scale", r=r,
-                  gamma=torch.ones(256, dtype=torch.bfloat16, device=DEV))
-    with pytest.raises(ValueError, match="gamma folded in"):
-        hk.matmul(a, weight(b), epilogue="rmsnorm_swiglu", r=r)
 
 
 def test_argument_names():
@@ -54,11 +35,9 @@ def test_strict_inputs():
     for bad in (a.float(), a.t().contiguous().t(), a.cpu()):          # fp32, non-contiguous, CPU
         with pytest.raises(ValueError, match="must be"):
             hk.matmul(bad, w)
-    with pytest.raises(TypeError, match="hk.weight"):
-        hk.matmul(a, b)
     for bad in (b.float(), b.t()):                                  # fp32; a [K, N] view of an [N, K] weight
         with pytest.raises(ValueError, match="must be"):
-            hk.weight(bad)
+            hk.matmul(a, bad)
     with pytest.raises(TypeError, match="alpha must be a torch.Tensor"):  # bool is not a number here
         hk.matmul(a, w, epilogue="scale", alpha=True)
 
@@ -147,8 +126,6 @@ def test_inv_rms():
     want = torch.rsqrt(h.square().mean(1) + 1e-5)
     got = hk.inv_rms(a, weight(b)).double()
     assert ((got - want).abs() <= (64 + 16 + 4) * 2.0 ** -24 * want).all()
-    with pytest.raises(ValueError):
-        hk.inv_rms(a, weight(b, gamma=pow2_gamma(256)))
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")

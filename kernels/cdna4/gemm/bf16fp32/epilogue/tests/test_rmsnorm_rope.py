@@ -48,9 +48,6 @@ def test_known_answer():
     want = torch.empty_like(a)
     want[:, 0::2], want[:, 1::2] = 0.5 * a[:, 1::2], -0.5 * a[:, 0::2]
     assert torch.equal(out, want)
-    with pytest.raises(ValueError):                      # a weight without gamma folded is refused
-        hk.matmul(a, weight(eye), epilogue="rmsnorm_rope", r=torch.full((512,), 0.5, device=DEV),
-                  cos_sin=cs.to(torch.bfloat16))
 
 
 @pytest.mark.parametrize("M,N,K", BAD_SHAPES)

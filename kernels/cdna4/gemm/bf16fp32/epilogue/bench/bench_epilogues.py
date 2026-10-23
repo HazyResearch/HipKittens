@@ -21,7 +21,7 @@ import common
 import hk
 
 MODULES = ["noop", "silu", "scale", "residual_add", "rmsnorm_scale", "swiglu", "rmsnorm_swiglu",
-           "rope", "rmsnorm_rope", "partialrms", "residual_rms", "rms_reduce"]
+           "rope", "rmsnorm_rope", "partialrms", "residual_rms_gamma", "rms_reduce"]
 
 # epilogue -> the layer GEMMs it runs on
 PLACEMENT = {
@@ -39,7 +39,7 @@ def rms_scale(t, r, g):
 
 
 def row_scale(t, r):
-    """Eager input RMSNorm with r given and the gain already folded into the weight: t * r in bf16."""
+    """Eager input RMSNorm with r given on an input that already carries the gain: t * r in bf16."""
     return t * r.to(common.BF16)[:, None]
 
 
@@ -55,12 +55,13 @@ def inv_rms_eager(D):
 
 
 def make_case(name, M, K, N, Dh):
-    """One epilogue at [M, K] x [N, K].t(). Every arm reads the same weight tensor W [N, K] (nn.Linear layout):
-    eager = post(torch.matmul(pre(x), W.t())); fusion-only = post(hk noop(pre(x))); ref() is fp32. For
-    input-RMSNorm rows gamma is folded into that shared W once, untimed (hk.fold_gamma), so pre is only x * r.
-    saved = HBM bytes HK avoids: every [M, N] / [M, K] intermediate the eager code writes and reads back (bf16,
-    write + read), minus HK's own fp32 partial-sum round trip. Vector-sized tensors are ignored. The README
-    lists the same formulas."""
+    """One epilogue at [M, K] x [N, K].t(). Every arm reads the same plain weight W [N, K] (nn.Linear layout):
+    eager = post(torch.matmul(pre(x), W.t())); fusion-only = post(hk noop(...)) on HK's inputs; ref() is fp32.
+    Input-RMSNorm rows: HK reads x * gamma as its producer (residual_rms with gamma) writes it, plus r, both
+    untimed here; eager and compile apply x * r * gamma per call (rms_scale); fusion-only scales HK's x * gamma by
+    r eagerly. residual_rms is the producer form: it also writes h * gamma. saved = HBM bytes HK avoids: every
+    [M, N] / [M, K] intermediate the eager code writes and reads back (bf16, write + read), minus HK's own fp32
+    partial-sum round trip. Vector-sized tensors are ignored. The README lists the same formulas."""
     x, W = common.activation(M, K), common.weight(K, N)
     f = lambda t: t.float()
     xw = lambda: f(x) @ f(W).t()
@@ -68,79 +69,78 @@ def make_case(name, M, K, N, Dh):
     MN, MK = M * N * 2, M * K * 2                 # bf16 bytes of an [M, N] / [M, K] tensor
     partials = 2 * (N // 64) * M * 4              # HK's fp32 partial sums, written then read by rms_reduce
 
-    def case(hk_fn, pre, post, ref, saved, tol=(common.STAGE_TOL,), Wf=None):
-        """Wf: the gamma-folded weight, when the row has an input RMSNorm; every arm then multiplies by it."""
-        Ws = W if Wf is None else Wf
-        return dict(x=x, W=Ws, plain=hk.weight(Ws), hk=hk_fn, pre=pre, post=post, ref=ref, saved=saved,
-                    tol=list(tol))
+    def case(hk_fn, pre, post, ref, saved, tol=(common.STAGE_TOL,), fusion=None):
+        """fusion: the fusion-only control when it differs from post(hk noop(pre(x)))."""
+        fusion = fusion or (lambda: post(hk.matmul(pre(x), W)))
+        return dict(x=x, W=W, hk=hk_fn, pre=pre, post=post, ref=ref, saved=saved, tol=list(tol), fusion=fusion)
 
-    def folded(g):
-        Wf = hk.fold_gamma(W, g)
-        return Wf, hk.weight(Wf, gamma_folded=True)
-
-    plain = hk.weight(W)
+    def scaled(g):
+        """HK's input for an input-RMSNorm row: x * gamma, as the producer writes it (fp32 product, one rounding)."""
+        return (f(x) * f(g)[None, :]).to(common.BF16)
 
     if name == "noop":
-        return case(lambda: hk.matmul(x, plain), ident, ident, xw, saved=0)
+        return case(lambda: hk.matmul(x, W), ident, ident, xw, saved=0)
     if name == "silu":                            # D
-        return case(lambda: hk.matmul(x, plain, "silu"), ident, F.silu, lambda: F.silu(xw()), saved=2 * MN)
+        return case(lambda: hk.matmul(x, W, "silu"), ident, F.silu, lambda: F.silu(xw()), saved=2 * MN)
     if name == "scale":                           # D
-        return case(lambda: hk.matmul(x, plain, "scale", alpha=0.5), ident, lambda D: D * 0.5,
+        return case(lambda: hk.matmul(x, W, "scale", alpha=0.5), ident, lambda D: D * 0.5,
                     lambda: xw() * 0.5, saved=2 * MN)
     if name == "residual_add":                    # D
         res = common.activation(M, N)
-        return case(lambda: hk.matmul(x, plain, "residual_add", residual=res), ident, lambda D: D + res,
+        return case(lambda: hk.matmul(x, W, "residual_add", residual=res), ident, lambda D: D + res,
                     lambda: xw() + f(res), saved=2 * MN)
     if name == "rmsnorm_scale":                   # D, D*r
         r, gc = common.inv_rms(x), common.gamma(N)
-        return case(lambda: hk.matmul(x, plain, "rmsnorm_scale", r=r, gamma=gc), ident,
+        return case(lambda: hk.matmul(x, W, "rmsnorm_scale", r=r, gamma=gc), ident,
                     lambda D: rms_scale(D, r, gc), lambda: xw() * r[:, None] * f(gc), saved=4 * MN)
-    if name == "rmsnorm":                         # x*r
+    if name == "rmsnorm":                         # x*r, x*r*g
         r, g = common.inv_rms(x), common.gamma(K)
-        Wf, wf = folded(g)
-        return case(lambda: hk.matmul(x, wf, "rmsnorm", r=r), lambda t: row_scale(t, r), ident,
-                    lambda: (f(x) * r[:, None] * f(g)) @ f(W).t(), saved=2 * MK, Wf=Wf)
+        xg = scaled(g)
+        return case(lambda: hk.matmul(xg, W, "rmsnorm", r=r), lambda t: rms_scale(t, r, g), ident,
+                    lambda: (f(x) * r[:, None] * f(g)) @ f(W).t(), saved=4 * MK,
+                    fusion=lambda: hk.matmul(row_scale(xg, r), W))
     if name == "swiglu":                          # D, silu(gate) (half width)
-        return case(lambda: hk.matmul(x, plain, "swiglu"), ident, swiglu, lambda: swiglu(xw()), saved=3 * MN)
+        return case(lambda: hk.matmul(x, W, "swiglu"), ident, swiglu, lambda: swiglu(xw()), saved=3 * MN)
     if name == "rmsnorm_swiglu":                  # rmsnorm + swiglu
         r, g = common.inv_rms(x), common.gamma(K)
-        Wf, wf = folded(g)
-        return case(lambda: hk.matmul(x, wf, "rmsnorm_swiglu", r=r), lambda t: row_scale(t, r), swiglu,
-                    lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W).t()), saved=2 * MK + 3 * MN, Wf=Wf)
+        xg = scaled(g)
+        return case(lambda: hk.matmul(xg, W, "rmsnorm_swiglu", r=r), lambda t: rms_scale(t, r, g), swiglu,
+                    lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W).t()), saved=4 * MK + 3 * MN,
+                    fusion=lambda: swiglu(hk.matmul(row_scale(xg, r), W)))
     if name in ("rope", "rmsnorm_rope"):          # D, six half-width products and sums
         head = common.rope_table(M, Dh)                            # one head's table [M, Dh]: HK's operand
         cs = head.repeat(1, N // Dh)                              # tiled across heads for the eager reference
         post = lambda D: common.rope(D, cs)
         if name == "rope":
-            return case(lambda: hk.matmul(x, plain, "rope", cos_sin=head), ident, post,
+            return case(lambda: hk.matmul(x, W, "rope", cos_sin=head), ident, post,
                         lambda: common.rope(xw(), f(cs)), saved=8 * MN)
         r, g = common.inv_rms(x), common.gamma(K)
-        Wf, wf = folded(g)
-        return case(lambda: hk.matmul(x, wf, "rmsnorm_rope", r=r, cos_sin=head), lambda t: row_scale(t, r),
+        xg = scaled(g)
+        return case(lambda: hk.matmul(xg, W, "rmsnorm_rope", r=r, cos_sin=head), lambda t: rms_scale(t, r, g),
                     post, lambda: common.rope((f(x) * r[:, None] * f(g)) @ f(W).t(), f(cs)),
-                    saved=2 * MK + 8 * MN, Wf=Wf)
+                    saved=4 * MK + 8 * MN, fusion=lambda: post(hk.matmul(row_scale(xg, r), W)))
     if name == "inv_rms":                         # D
-        return case(lambda: hk.inv_rms(x, plain), ident, inv_rms_eager, lambda: common.inv_rms(xw()),
+        return case(lambda: hk.inv_rms(x, W), ident, inv_rms_eager, lambda: common.inv_rms(xw()),
                     saved=2 * MN - partials, tol=(common.VECTOR_TOL,))
-    if name == "residual_rms":                    # D, second read of h
-        res = common.activation(M, N)
+    if name == "residual_rms":                    # D, second read of h, third read of h (for h * g)
+        res, g = common.activation(M, N), common.gamma(N)
 
         def post(D):
             h = D + res
-            return h, inv_rms_eager(h)
+            return h, h * g, inv_rms_eager(h)
 
         def ref():
             h = xw() + f(res)
-            return h, common.inv_rms(h)
+            return h, h * f(g), common.inv_rms(h)
 
-        return case(lambda: hk.residual_rms(x, plain, res), ident, post, ref, saved=3 * MN - partials,
-                    tol=(common.STAGE_TOL, common.VECTOR_TOL))
+        return case(lambda: hk.residual_rms(x, W, res, gamma=g), ident, post, ref, saved=4 * MN - partials,
+                    tol=(common.STAGE_TOL, common.STAGE_TOL, common.VECTOR_TOL))
     raise ValueError(f"unknown epilogue {name!r}")
 
 
 def run_row(name, gemm, M, K, N, Dh, timer):
     c = make_case(name, M, K, N, Dh)
-    x, W, plain = c["x"], c["W"], c["plain"]
+    x, W = c["x"], c["W"]
     hk_fn = c["hk"]
     pre, post = c["pre"], c["post"]
     eager_fn = lambda x, W: post(torch.matmul(pre(x), W.t()))
@@ -148,7 +148,7 @@ def run_row(name, gemm, M, K, N, Dh, timer):
     torch._dynamo.reset()
     compiled = torch.compile(eager_fn, **common.COMPILE)
     comp = lambda: compiled(x, W)
-    fusion = lambda: post(hk.matmul(pre(x), plain))
+    fusion = c["fusion"]
     want = c["ref"]()
     arms = dict(hk=hk_fn, eager=eager, compile=comp, fusion=fusion)   # compile's first call compiles + autotunes
     checks = {arm: common.check(fn(), want, common.control_tols(c["tol"]) if arm == "fusion" else c["tol"])

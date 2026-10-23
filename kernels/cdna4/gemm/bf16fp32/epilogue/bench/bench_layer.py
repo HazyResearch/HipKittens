@@ -8,16 +8,20 @@
           boundaries. Also prints the compiled full layer minus the sum of the separately compiled phases
           (negative = what cross-phase fusion buys torch). --full times the phases too, for that line.
 
-Phases (HK launches): qkv (4: one hk.qkv GEMM + 3 copies), attention (1), out_proj (2), gate_up (1), down (2).
-HK splits RMSNorm across phases: the producer emits r = 1/rms, the consumer applies it. Torch normalizes in
-the consumer. The HK layer's input r_attn = 1/rms(x) is computed once, outside timing (a previous layer would
-emit it); torch normalizes its input inside the timed qkv phase and also computes r_next in down, so a timed
-torch layer does one more RMS reduction than the HK layer. Per-phase times do not line up op-for-op.
+Phases (HK launches): qkv (4: one hk.qkv GEMM over the three weights + 3 copies), attention (1), out_proj (2),
+gate_up (1), down (2). HK splits RMSNorm across phases: the producer GEMM (out_proj, down) emits r = 1/rms(h) and
+h * gamma, the consumer GEMM (gate_up, the next layer's qkv) multiplies h * gamma by a plain weight and applies r.
+Torch normalizes in the consumer with F.rms_norm(x, gamma). Every implementation reads the same plain [N, K] weights;
+nothing is prepared. The HK layer's inputs r_attn = 1/rms(x) and x * gamma_attn are computed once, outside timing
+(a previous layer's down phase emits both, and this layer's down phase pays for the next layer's); torch normalizes
+its input inside the timed qkv phase and also computes r_next in down, so a timed torch layer does one more RMS
+reduction than the HK layer. Per-phase times do not line up op-for-op.
 
 Build first: make KERNEL=<m> in the epilogue directory for every m in MODULES, and the attention kernel per
 M with bench/build_attn.sh <H> <H_KV> <Dh> <M>...
 """
 import dataclasses
+import importlib
 
 import torch
 import torch._dynamo
@@ -27,7 +31,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 import common
 import hk
 
-MODULES = ["rmsnorm_rope", "residual_rms", "rms_reduce", "rmsnorm_swiglu"]
+MODULES = ["rmsnorm_rope_qkv", "residual_rms_gamma", "rms_reduce", "rmsnorm_swiglu", "noop", "noop_qkv"]
 HK_LAUNCHES = dict(qkv=4, attention=1, out_proj=2, gate_up=1, down=2)
 COMPILE = common.COMPILE
 
@@ -62,8 +66,16 @@ def load_gqa(cfg, M):
     return common.load_extension(common.find_extension(common.BENCH / "attn_build", name, hint), name=name)
 
 
+def noop_qkv(x, wq, wk, wv):
+    """x @ [wq; wk; wv].t() as one noop GEMM launch over the three weights (the fusion-only control's QKV GEMM)."""
+    nq, nkv = wq.shape[0], wk.shape[0]
+    out = torch.empty(x.shape[0], nq + 2 * nkv, dtype=common.BF16, device=x.device)
+    importlib.import_module("tk_noop_qkv").dispatch(x, wq, out, wk, wv, torch.cuda.current_stream().cuda_stream)
+    return out
+
+
 class Layer:
-    """Weights (shared by every implementation), HK operands, and the five phases of both implementations at one M."""
+    """Weights (shared by every implementation, used as they are) and the five phases of both implementations."""
 
     def __init__(self, cfg, M, gqa, native_gqa):
         self.M, self.d, self.d_ff = M, cfg["d"], cfg["d_ff"]
@@ -74,26 +86,15 @@ class Layer:
         self.g_attn, self.g_mlp = common.gamma(d), common.gamma(d)
         self.x = common.activation(M, d)
         self.cs = common.rope_table(M, self.Dh)                     # one head's table [M, Dh]
-        W, ga, gm = self.W, self.g_attn, self.g_mlp
-        # Every implementation reads these same tensors: the norms' gamma is folded into the weights that follow
-        # an RMSNorm once, untimed (hk.fold_gamma); the per-call RMSNorm is then the row scale r alone. PyTorch
-        # multiplies by W.t(), a view; HK reads W as it is. Only HK concatenates [Wq; Wk; Wv] (prepare_qkv).
-        self.Wf = dict(q=hk.fold_gamma(W["q"], ga), k=hk.fold_gamma(W["k"], ga), v=hk.fold_gamma(W["v"], ga),
-                       gu=hk.fold_gamma(W["gu"], gm))
-        Wf = self.Wf
-        folded = lambda t: hk.weight(t, gamma_folded=True)
-        self.Pqkv = hk.prepare_qkv(folded(Wf["q"]), folded(Wf["k"]), folded(Wf["v"]))
-        self.P = dict(o=hk.weight(W["o"]), gu=folded(Wf["gu"]), dn=hk.weight(W["dn"]))
+        # The HK layer's other inputs, as the previous layer's down phase would emit them (untimed here).
         self.r_attn = common.inv_rms(self.x)
+        self.xg = (self.x.float() * self.g_attn.float()[None, :]).to(common.BF16)
         self.gqa, self.native_gqa = gqa, native_gqa
-        # Fusion-only control: the same HK GEMMs with the noop epilogue (natural column order) on the same weight
-        # memory; the epilogue work, including the RMSNorm row scale with the same precomputed r, runs as eager
-        # torch on the inputs HK gets. This is the unfused form bench_epilogues.py uses for its rmsnorm_* rows.
-        self.Pf = dict(qkv=hk.weight(self.Pqkv.weight.tensor), gu=hk.weight(Wf["gu"]))
 
     # ---- HK phases ----
-    def hk_qkv(self, x, r):
-        return hk.qkv(x, self.Pqkv, r=r, cos_sin=self.cs)
+    def hk_qkv(self, xg, r):
+        W = self.W
+        return hk.qkv(xg, W["q"], W["k"], W["v"], r=r, cos_sin=self.cs)
 
     def hk_attention(self, q, k, v):
         M, H, H_KV, Dh = self.M, self.H, self.H_KV, self.Dh
@@ -103,45 +104,46 @@ class Layer:
         return o.view(M, H * Dh)
 
     def hk_out_proj(self, o, x):
-        return hk.residual_rms(o, self.P["o"], x)                   # h, r_mlp
+        return hk.residual_rms(o, self.W["o"], x, gamma=self.g_mlp)      # h, h * g_mlp, r_mlp
 
-    def hk_gate_up(self, h, r):
-        return hk.matmul(h, self.P["gu"], "rmsnorm_swiglu", r=r)
+    def hk_gate_up(self, hg, r):
+        return hk.matmul(hg, self.W["gu"], "rmsnorm_swiglu", r=r)
 
     def hk_down(self, g, h):
-        return hk.residual_rms(g, self.P["dn"], h)                  # x_out, r_next
+        # steady state of identical layers: the next layer's attention norm has this layer's gamma
+        return hk.residual_rms(g, self.W["dn"], h, gamma=self.g_attn)    # x_out, x_out * g_attn, r_next
 
     # ---- fusion-only control: HK noop GEMM + the HK epilogue's work as eager torch, on HK's inputs ----
     def eager_inv_rms(self, t):
         return torch.rsqrt(torch.linalg.vector_norm(t, dim=-1, dtype=torch.float32).square() / self.d + common.EPS)
 
     def row_scale(self, t, r):
-        return t * r.to(common.BF16)[:, None]                       # eager RMSNorm with r given, gamma folded
+        return t * r.to(common.BF16)[:, None]                       # eager RMSNorm with r given, gamma already in t
 
-    def f_qkv(self, x, r):
-        M, Dh, nq, nkv = self.M, self.Dh, self.d, self.H_KV * self.Dh
-        c = hk.matmul(self.row_scale(x, r), self.Pf["qkv"])          # one launch over [Wq; Wk; Wv]
+    def f_qkv(self, xg, r):
+        M, Dh, nq, nkv, W = self.M, self.Dh, self.d, self.H_KV * self.Dh, self.W
+        c = noop_qkv(self.row_scale(xg, r), W["q"], W["k"], W["v"])  # one launch over the three weights
         cs = self.cs.view(M, 1, Dh)
         q = common.rope(c[:, :nq].view(M, self.H, Dh), cs).reshape(M, nq)
         k = common.rope(c[:, nq:nq + nkv].view(M, self.H_KV, Dh), cs).reshape(M, nkv)
         return q, k, c[:, nq + nkv:].contiguous()
 
     def f_out_proj(self, o, x):
-        h = hk.matmul(o, self.P["o"]) + x
-        return h, self.eager_inv_rms(h)                             # h, r_mlp
+        h = hk.matmul(o, self.W["o"]) + x
+        return h, h * self.g_mlp, self.eager_inv_rms(h)            # h, h * g_mlp, r_mlp
 
-    def f_gate_up(self, h, r):
-        gu = hk.matmul(self.row_scale(h, r), self.Pf["gu"])
+    def f_gate_up(self, hg, r):
+        gu = hk.matmul(self.row_scale(hg, r), self.W["gu"])
         return F.silu(gu[:, :self.d_ff]) * gu[:, self.d_ff:]
 
     def f_down(self, g, h):
-        x_out = hk.matmul(g, self.P["dn"]) + h
-        return x_out, self.eager_inv_rms(x_out)                     # x_out, r_next
+        x_out = hk.matmul(g, self.W["dn"]) + h
+        return x_out, x_out * self.g_attn, self.eager_inv_rms(x_out)  # x_out, x_out * g_attn, r_next
 
-    # ---- torch phases (eager and torch.compile run this same code; gamma folded into self.Wf) ----
+    # ---- torch phases (eager and torch.compile run this same code; gamma applied per call by F.rms_norm) ----
     def t_qkv(self, x):
-        M, Dh, W = self.M, self.Dh, self.Wf
-        xn = F.rms_norm(x, (self.d,), None, common.EPS)
+        M, Dh, W = self.M, self.Dh, self.W
+        xn = F.rms_norm(x, (self.d,), self.g_attn, common.EPS)
         cs = self.cs.view(M, 1, Dh)
         q = common.rope((xn @ W["q"].t()).view(M, self.H, Dh), cs)
         k = common.rope((xn @ W["k"].t()).view(M, self.H_KV, Dh), cs)
@@ -160,7 +162,7 @@ class Layer:
         return x + o @ self.W["o"].t()
 
     def t_gate_up(self, h):
-        gu = F.rms_norm(h, (self.d,), None, common.EPS) @ self.Wf["gu"].t()
+        gu = F.rms_norm(h, (self.d,), self.g_mlp, common.EPS) @ self.W["gu"].t()
         return F.silu(gu[:, :self.d_ff]) * gu[:, self.d_ff:]
 
     def t_down(self, g, h):
@@ -191,6 +193,10 @@ class Layer:
         h = x.float() + o.float() @ self.W["o"].float().t()
         return h, common.inv_rms(h)
 
+    def ref_out_proj_hk(self, o, x):
+        h, r = self.ref_out_proj(o, x)
+        return h, h * self.g_mlp.float(), r                         # what HK's out_proj writes
+
     def ref_gate_up(self, h):
         hn = h.float() * common.inv_rms(h)[:, None] * self.g_mlp.float()
         gu = hn @ self.W["gu"].float().t()
@@ -200,14 +206,18 @@ class Layer:
         x_out = h.float() + g.float() @ self.W["dn"].float().t()
         return x_out, common.inv_rms(x_out)
 
+    def ref_down_hk(self, g, h):
+        x_out, r = self.ref_down(g, h)
+        return x_out, x_out * self.g_attn.float(), r                # what HK's down writes
+
     # ---- captured intermediates from one full run of each implementation ----
     def capture_hk(self):
-        x, r = self.x, self.r_attn
-        q, k, v = self.hk_qkv(x, r)
+        x, xg, r = self.x, self.xg, self.r_attn
+        q, k, v = self.hk_qkv(xg, r)
         o = self.hk_attention(q, k, v)
-        h, r_mlp = self.hk_out_proj(o, x)
-        g = self.hk_gate_up(h, r_mlp)
-        return dict(x=x, r=r, q=q, k=k, v=v, o=o, h=h, r_mlp=r_mlp, g=g)
+        h, hg, r_mlp = self.hk_out_proj(o, x)
+        g = self.hk_gate_up(hg, r_mlp)
+        return dict(x=x, xg=xg, r=r, q=q, k=k, v=v, o=o, h=h, hg=hg, r_mlp=r_mlp, g=g)
 
     def capture_torch(self):
         x = self.x
@@ -218,12 +228,13 @@ class Layer:
         return dict(x=x, q=q, k=k, v=v, o=o, h=h, g=g)
 
     # ---- full layer ----
-    def hk_layer(self, x, r):
-        q, k, v = self.hk_qkv(x, r)
+    def hk_layer(self, x, xg, r):
+        q, k, v = self.hk_qkv(xg, r)
         o = self.hk_attention(q, k, v)
-        h, r_mlp = self.hk_out_proj(o, x)
-        g = self.hk_gate_up(h, r_mlp)
-        return self.hk_down(g, h)                                   # x_out, r_next
+        h, hg, r_mlp = self.hk_out_proj(o, x)
+        g = self.hk_gate_up(hg, r_mlp)
+        x_out, xg_out, r_next = self.hk_down(g, h)
+        return x_out, r_next, xg_out                                # what the next layer reads
 
     def t_layer(self, x):
         q, k, v = self.t_qkv(x)
@@ -254,20 +265,20 @@ class Phase:
 def phases(L, a, b):
     S, V = common.STAGE_TOL, common.VECTOR_TOL
     return {
-        "qkv": Phase(lambda: L.hk_qkv(a["x"], a["r"]), L.t_qkv, (b["x"],),
+        "qkv": Phase(lambda: L.hk_qkv(a["xg"], a["r"]), L.t_qkv, (b["x"],),
                      lambda: L.ref_qkv(a["x"]), lambda: L.ref_qkv(b["x"]), (S, S, S), (S, S, S),
-                     lambda: L.f_qkv(a["x"], a["r"])),
+                     lambda: L.f_qkv(a["xg"], a["r"])),
         "attention": Phase(lambda: L.hk_attention(a["q"], a["k"], a["v"]), L.t_attention, (b["q"], b["k"], b["v"]),
                            lambda: L.ref_attention(a["q"], a["k"], a["v"]),
                            lambda: L.ref_attention(b["q"], b["k"], b["v"]), (S,), (S,)),
         "out_proj": Phase(lambda: L.hk_out_proj(a["o"], a["x"]), L.t_out_proj, (b["o"], b["x"]),
-                          lambda: L.ref_out_proj(a["o"], a["x"]), lambda: L.ref_out_proj(b["o"], b["x"])[:1],
-                          (S, V), (S,), lambda: L.f_out_proj(a["o"], a["x"])),
-        "gate_up": Phase(lambda: L.hk_gate_up(a["h"], a["r_mlp"]), L.t_gate_up, (b["h"],),
+                          lambda: L.ref_out_proj_hk(a["o"], a["x"]), lambda: L.ref_out_proj(b["o"], b["x"])[:1],
+                          (S, S, V), (S,), lambda: L.f_out_proj(a["o"], a["x"])),
+        "gate_up": Phase(lambda: L.hk_gate_up(a["hg"], a["r_mlp"]), L.t_gate_up, (b["h"],),
                          lambda: L.ref_gate_up(a["h"]), lambda: L.ref_gate_up(b["h"]), (S,), (S,),
-                         lambda: L.f_gate_up(a["h"], a["r_mlp"])),
+                         lambda: L.f_gate_up(a["hg"], a["r_mlp"])),
         "down": Phase(lambda: L.hk_down(a["g"], a["h"]), L.t_down, (b["g"], b["h"]),
-                      lambda: L.ref_down(a["g"], a["h"]), lambda: L.ref_down(b["g"], b["h"]), (S, V), (S, V),
+                      lambda: L.ref_down_hk(a["g"], a["h"]), lambda: L.ref_down(b["g"], b["h"]), (S, S, V), (S, V),
                       lambda: L.f_down(a["g"], a["h"])),
     }
 
@@ -321,12 +332,12 @@ PHASE_COLUMNS = [("M", "M", "d"), ("phase", "phase", ""), ("HK launches", "hk_la
 
 
 def run_full(L, timer, phase_rows):
-    hk_fn = lambda: L.hk_layer(L.x, L.r_attn)
+    hk_fn = lambda: L.hk_layer(L.x, L.xg, L.r_attn)
     eager = lambda: L.t_layer(L.x)
     compiled = torch.compile(L.t_layer, **COMPILE)
     comp = lambda: compiled(L.x)
     want = L.ref_layer(L.x)
-    ok_hk, rel_hk = common.layer_check(hk_fn(), want)
+    ok_hk, rel_hk = common.layer_check(hk_fn()[:2], want)            # x_out, r_next (xg_out: checked per phase)
     ok_eager, rel_eager = common.layer_check(eager(), want)
     ok_comp, rel_comp = common.layer_check(comp(), want)            # first call compiles + autotunes, untimed
     ok = ok_hk and ok_eager and ok_comp

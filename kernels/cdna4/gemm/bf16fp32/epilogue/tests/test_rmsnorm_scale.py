@@ -2,8 +2,8 @@
 The kernel multiplies by r, then by gamma, each one IEEE fp32 multiply, so c must be bit-identical to the
 reference stored the way the kernel stores bf16 (to_bf16_chopped).
 
-hk's "rmsnorm" epilogue runs the same kernel with the norm's gamma folded into b and ones as the column
-gamma: c = r[:, None] * (a @ (gamma * b).T), i.e. rmsnorm(a, gamma) @ b.T (the V projection)."""
+hk's "rmsnorm" epilogue runs the same kernel with ones as the column gamma: c = r[:, None] * (a @ b.T). The norm's
+gamma arrives with the input (or, in these tests, scales b's columns): rmsnorm(a, gamma) @ b.T (the V projection)."""
 import pytest
 import torch
 
@@ -80,10 +80,8 @@ def test_rmsnorm_folded(M, N, K):
     assert_bitexact(c, gemm_exact(a, folded) * r[:, None])            # times ones: unchanged
 
 
-def test_rmsnorm_needs_folded_weight():
+def test_rmsnorm_takes_only_r():
     a, b = inputs(256, 256, 128, "random")
     r, gamma = vectors(256, 256)
-    with pytest.raises(ValueError, match="gamma folded in"):
-        hk.matmul(a, weight(b), epilogue="rmsnorm", r=r)
-    with pytest.raises(TypeError, match="takes arguments"):            # gamma lives in the weight, not here
-        hk.matmul(a, weight(b, gamma=pow2_gamma(128)), epilogue="rmsnorm", r=r, gamma=gamma)
+    with pytest.raises(TypeError, match="takes arguments"):            # gamma comes with the input, not here
+        hk.matmul(a, weight(b), epilogue="rmsnorm", r=r, gamma=gamma)

@@ -18,8 +18,8 @@ but no GPU; running needs a gfx950 GPU and PyTorch.
 
 ```bash
 export THUNDERKITTENS_ROOT=$(cd ../../../../.. && pwd)   # this repository; an inherited root breaks every make
-for m in noop silu scale residual_add rmsnorm_scale swiglu rmsnorm_swiglu rope rmsnorm_rope \
-         partialrms residual_rms rms_reduce; do make KERNEL=$m; done
+for m in noop noop_qkv silu scale residual_add rmsnorm_scale swiglu rmsnorm_swiglu rope rmsnorm_rope \
+         rmsnorm_rope_qkv partialrms residual_rms residual_rms_gamma rms_reduce; do make KERNEL=$m; done
 make -C ..                                  # upstream base GEMM, for ab_noop_vs_base.py
 bench/build_attn.sh 32 8 128 2048 4096 8192 # attention for llama3-8b / pr1 (H, H_KV, Dh, M...)
 bench/build_attn.sh 64 8 128 2048 4096 8192 # attention for llama3-70b
@@ -63,11 +63,13 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
   (2 × 256 MiB on gfx950), so each call reads its inputs from HBM. GPU events bracket only the call.
 - **Median of 50 calls** after 10 warm-up calls; JSON also records p10 and p90.
 - **Outside the timer:** input creation (including the one-head `[M, Dh]` RoPE table HK reads, and its tiling
-  across heads for `bench_epilogues.py`'s eager reference), the RMSNorm gamma fold (`hk.fold_gamma`, once per
-  weight), HK's QKV concatenation (`hk.prepare_qkv`), and `torch.compile` compilation and autotuning.
-- **Same weights for every arm.** Weights are stored `[N, K]`, the `nn.Linear` layout, and gamma is folded into
-  them once. HK reads that tensor as it is; PyTorch multiplies by `W.t()`, a view that hipBLASLt reads in place.
-  The only HK-only preparation is the QKV concatenation; PyTorch runs Q, K and V as three matmuls.
+  across heads for `bench_epilogues.py`'s eager reference), HK's RMSNorm inputs a previous GEMM would produce
+  (`r` and `x · gamma`, see below), and `torch.compile` compilation and autotuning.
+- **Same weights for every arm, used as they are.** Weights are plain `[N, K]` tensors, the `nn.Linear` layout;
+  nothing is folded, permuted, transposed or concatenated. HK reads them in place (its QKV GEMM reads Wq, Wk and
+  Wv through three pointers); PyTorch multiplies by `W.t()`, a view that hipBLASLt reads in place.
+- **RMSNorm gamma:** HK applies it in the producing GEMM's epilogue (`hk.residual_rms(..., gamma=g)` also writes
+  `h · g`); PyTorch applies it per call (`F.rms_norm(x, ..., g)` in the layer, `x · r · g` in `bench_epilogues.py`).
 - **One compile mode:** `torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False)`. CUDA graphs
   are not used: both sides are limited by kernel time, not launch overhead.
 - Eager and compiled PyTorch are separate columns; there is no best-of number.
@@ -91,32 +93,36 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
   | noop | none | 0 |
   | silu, scale, residual_add | D | 2·MN |
   | rmsnorm_scale | D, D·r | 4·MN |
-  | rmsnorm | x·r (gamma folded into W on every side) | 2·MK |
+  | rmsnorm | x·r, x·r·g | 4·MK |
   | swiglu | D, silu(gate) (half width) | 3·MN |
-  | rmsnorm_swiglu | rmsnorm + swiglu | 2·MK + 3·MN |
+  | rmsnorm_swiglu | rmsnorm + swiglu | 4·MK + 3·MN |
   | rope | D, six half-width products and sums | 8·MN |
-  | rmsnorm_rope | rmsnorm + rope | 2·MK + 8·MN |
+  | rmsnorm_rope | rmsnorm + rope | 4·MK + 8·MN |
   | inv_rms | D | 2·MN − HK's fp32 partials, 2·(N/64)·M·4 |
-  | residual_rms | D, second read of h | 3·MN − HK's fp32 partials |
+  | residual_rms | D, second read of h (1/rms), third read of h (h·g) | 4·MN − HK's fp32 partials |
+
+  The `rmsnorm*` rows give HK `x · g` and `r` as its producer would write them; the producer's cost (the extra
+  `h · g` store) is in the `residual_rms` row, which runs the gamma-producing form.
 
 ## Layer phases and boundary rules
 
 | # | Phase | HK | PyTorch |
 |---|---|---|---|
-| 1 | qkv | `hk.qkv`: one `rmsnorm_rope` GEMM over `[Wq; Wk; Wv]` + 3 copies (4 launches) | `rms_norm` (gamma folded into the weights), three matmuls, RoPE on q and k |
+| 1 | qkv | `hk.qkv`: one `rmsnorm_rope` GEMM over Wq, Wk, Wv (three pointers) + 3 copies (4 launches) | `rms_norm(x, g_attn)`, three matmuls, RoPE on q and k |
 | 2 | attention | `gqa_causal` on contiguous q, k, v | transposes, then SDPA |
-| 3 | out_proj | `residual_rms(o, Wo, x)`: 2 launches | `x + o @ Wo.t()` |
-| 4 | gate_up | `rmsnorm_swiglu`: 1 launch | `rms_norm` (gamma folded), matmul, `silu(gate) * up` |
-| 5 | down | `residual_rms(g, Wd, h)`: 2 launches | `h + g @ Wd.t()`, then 1/rms for the next layer |
+| 3 | out_proj | `residual_rms(o, Wo, x, gamma=g_mlp)`: 2 launches, writes h, h·g_mlp, r | `x + o @ Wo.t()` |
+| 4 | gate_up | `rmsnorm_swiglu` on h·g_mlp: 1 launch | `rms_norm(h, g_mlp)`, matmul, `silu(gate) * up` |
+| 5 | down | `residual_rms(g, Wd, h, gamma=g_attn)`: 2 launches, writes x_out, x_out·g_attn, r | `h + g @ Wd.t()`, then 1/rms for the next layer |
 
-- HK splits RMSNorm across phases: the producing GEMM emits r = 1/rms, the consuming GEMM applies it.
+- HK splits RMSNorm across phases: the producing GEMM emits r = 1/rms and h·gamma, the consuming GEMM applies r.
   PyTorch normalizes in the consumer, so a single phase does not compare op-for-op.
-- HK's layer input `r_attn` is computed once outside timing (a previous layer would emit it). PyTorch
-  normalizes its input inside the timed qkv phase and also computes `r_next` in `down`, so a timed PyTorch
-  layer does one more RMS reduction than the HK layer; in a stack of layers PyTorch would not need `r_next`.
+- HK's layer inputs `r_attn` and `x · g_attn` are computed once outside timing (a previous layer's down phase
+  would emit them, as this layer's down phase emits the next layer's). PyTorch normalizes its input inside the
+  timed qkv phase and also computes `r_next` in `down`, so a timed PyTorch layer does one more RMS reduction than
+  the HK layer; in a stack of layers PyTorch would not need `r_next`.
 - **fusion-only control (`--phases`):** for every GEMM phase, the same HK GEMM(s) with the `noop` epilogue on
-  HK's own inputs, with the epilogue's work as eager PyTorch (QKV: `x · r` on gamma-folded weights, one GEMM over
-  `[Wq | Wk | Wv]`, RoPE and the V copy; out_proj/down: residual add and 1/rms; gate_up: `h · r`, then SwiGLU).
+  HK's own inputs, with the epilogue's work as eager PyTorch (QKV: `(x · g) · r`, one noop GEMM over the three
+  weights, RoPE and the V copy; out_proj/down: residual add, `h · g` and 1/rms; gate_up: `(h · g) · r`, SwiGLU).
 - **Control tolerance:** the control stores the GEMM output through HK's truncating bf16 store before its eager
   epilogue, which a fused kernel never does, and SwiGLU multiplies two such values. Its bf16 outputs are gated at
   `rtol 2.5e-2` (`CONTROL_TOL`) in both scripts; HK, eager and compiled PyTorch keep `rtol 1e-2`.

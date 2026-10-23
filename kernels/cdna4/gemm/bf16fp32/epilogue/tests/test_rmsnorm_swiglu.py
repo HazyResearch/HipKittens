@@ -1,5 +1,5 @@
 """tk_rmsnorm_swiglu: c = silu(gate) * value with [gate | value] = r[:, None] * (a @ b.T), [M, N] -> [M, N/2]
-(bf16, r = [M] fp32). b is the natural W_gate_up operand with the norm's gamma folded in. Fast SiLU allows
+(bf16, r = [M] fp32). The tests put the norm's gamma on b; in the layer it arrives on a. Fast SiLU allows
 one bf16 step."""
 import pytest
 import torch
@@ -48,8 +48,6 @@ def test_known_answer():
     r = torch.full((512,), 0.5, device=DEV)
     ones = torch.ones(256, dtype=torch.bfloat16, device=DEV)
     assert_within_bf16_step(run(a, eye, r, ones), torch.full((512, 128), SILU_HALF, device=DEV))
-    with pytest.raises(ValueError):                      # a weight without gamma folded is refused
-        hk.matmul(a, weight(eye), epilogue="rmsnorm_swiglu", r=r)
 
 
 @pytest.mark.parametrize("M,N,K", BAD_SHAPES)

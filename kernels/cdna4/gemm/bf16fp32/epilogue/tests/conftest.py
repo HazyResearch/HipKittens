@@ -24,7 +24,7 @@ BAD_SHAPES = [(384, 256, 128), (256, 256, 192)]                                 
 
 
 def hk_shape_error(M, N, K):
-    """(exception, message) hk raises for a BAD_SHAPES case: hk.weight (Python) checks K, launch (C++) checks M."""
+    """(exception, message) hk raises for a BAD_SHAPES case: hk (Python) checks K, launch (C++) checks M."""
     if K % 128:
         return ValueError, "K % 128 == 0"
     return RuntimeError, "M and N must be multiples of 256"
@@ -55,9 +55,9 @@ def stream():
 
 
 def weight(b, gamma=None):
-    """hk weight from a test operand b [N, K], with gamma folded into its columns when given."""
-    import hk
-    return hk.weight(b, gamma_folded=False) if gamma is None else hk.weight(hk.fold_gamma(b, gamma), gamma_folded=True)
+    """The [N, K] weight the kernels read for test operand b. With gamma, b's columns are scaled by it (fp32
+    product, one bf16 rounding): the same product the rmsnorm* epilogues compute when their input carries gamma."""
+    return b if gamma is None else (b.float() * gamma.float()[None, :]).to(torch.bfloat16)
 
 
 def pow2_gamma(K, seed=7):

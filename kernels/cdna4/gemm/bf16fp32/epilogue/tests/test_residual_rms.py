@@ -94,7 +94,23 @@ def test_rejects_wrong_residual_shape():
         run(a, b, residual_like(256, 512, 1.0))
 
 
-def test_rejects_gamma_folded_weight():
+@pytest.mark.parametrize("M,N,K", SHAPES)
+def test_gamma_output(M, N, K):
+    """With gamma, the same GEMM also writes hg = h * gamma (from h before its bf16 rounding); h and r are bitwise
+    the gamma-less call's, so r stays the norm of h, not of hg."""
+    module("residual_rms_gamma")
+    a, b = inputs(M, N, K, "random")
+    res = residual_like(M, N, 1.0)
+    gamma = pow2_gamma(N, seed=11)
+    h0, r0 = run(a, b, res)
+    h, hg, r = hk.residual_rms(a, weight(b), res, gamma=gamma)
+    assert torch.equal(h, h0) and torch.equal(r, r0)
+    h_ref, _ = reference(a, b, res)
+    assert_within_bf16_step(hg, h_ref * gamma.float()[None, :])
+
+
+def test_rejects_wrong_gamma():
+    module("residual_rms_gamma")
     a, b = inputs(256, 256, 128, "random")
-    with pytest.raises(ValueError, match="no gamma folded"):
-        hk.residual_rms(a, weight(b, gamma=pow2_gamma(128)), residual_like(256, 256, 1.0))
+    with pytest.raises(ValueError, match="gamma must be"):
+        hk.residual_rms(a, weight(b), residual_like(256, 256, 1.0), gamma=pow2_gamma(128))
