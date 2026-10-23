@@ -42,6 +42,21 @@ def test_strict_inputs():
         hk.matmul(a, w, epilogue="scale", alpha=True)
 
 
+@pytest.mark.skipif(torch.cuda.mem_get_info()[0] < 6 * 2**30, reason="needs 6 GiB free GPU memory")
+@pytest.mark.parametrize("big", ["a", "b"])
+def test_refuses_operand_of_4_gib(big):
+    """Buffer loads address A and B with 32-bit sizes: a 4 GiB operand would wrap and silently read zeros, so the
+    launcher refuses it before launching. Exactly one operand is 2^16 x 2^15 bf16 = 2^32 bytes; the other operand and
+    the output stay small (16 MiB, 32 MiB), so each case can only be caught by its own check."""
+    module("noop")
+    big_rows, K, small_rows = 2 ** 16, 2 ** 15, 256
+    M, N = (big_rows, small_rows) if big == "a" else (small_rows, big_rows)
+    a = torch.empty(M, K, dtype=torch.bfloat16, device=DEV)
+    w = torch.empty(N, K, dtype=torch.bfloat16, device=DEV)
+    with pytest.raises(RuntimeError, match="4 GiB"):
+        hk.matmul(a, w)
+
+
 def test_binding_still_checks_dtype():
     a, b = inputs(256, 256, 128, "random")
     c = torch.empty(256, 256, dtype=torch.bfloat16, device=DEV)

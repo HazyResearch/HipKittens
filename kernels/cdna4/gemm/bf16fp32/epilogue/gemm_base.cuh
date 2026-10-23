@@ -103,8 +103,9 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     const bf16* b_base = (bf16*)&gb[{0, 0, 0, 0}];
     const int a_row_stride = g.a.template stride<2>() * sizeof(bf16);
     const int b_row_stride = gb.template stride<2>() * sizeof(bf16);
-    i32x4 a_srsrc_base = make_srsrc(a_base, M * a_row_stride, a_row_stride);
-    i32x4 b_srsrc_base = make_srsrc(b_base, gb.rows() * b_row_stride, b_row_stride);
+    // Buffer-resource sizes are 32-bit (launch() rejects any operand of 4 GiB or more); unsigned math, no int overflow.
+    i32x4 a_srsrc_base = make_srsrc(a_base, uint32_t(M) * uint32_t(a_row_stride), a_row_stride);
+    i32x4 b_srsrc_base = make_srsrc(b_base, uint32_t(gb.rows()) * uint32_t(b_row_stride), b_row_stride);
 
     const int wid = warpid() % NUM_WARPS;
     constexpr int elem_per_warp = (16 / sizeof(bf16)) * kittens::WARP_THREADS;
@@ -363,6 +364,14 @@ void launch(Globals g, hipStream_t stream = 0) {
         if (g.c.rows() != M || g.c.cols() != out_cols)
             throw std::runtime_error("GEMM: output shape mismatch (need c=[M, out_cols(N)])");
     }
+    // The kernel addresses A and B through buffer resources with 32-bit sizes and offsets: an operand of 4 GiB or
+    // more would wrap, and loads past the wrapped size return 0. Refuse it (b before the RoPE view: same bytes).
+    auto fits = [](const auto& t) { return size_t(t.rows()) * size_t(t.cols()) * sizeof(bf16) <= size_t(UINT32_MAX); };
+    bool small = fits(g.a) && fits(g.b);
+    if constexpr (three_b) small = small && fits(g.b_k) && fits(g.b_v);
+    if constexpr (requires { g.c; }) small = small && fits(g.c);
+    if (!small)
+        throw std::runtime_error("GEMM: every operand must be smaller than 4 GiB (32-bit buffer addressing)");
     const size_t mem = MAX_SHARED_MEMORY;
     hip_check(hipFuncSetAttribute((void*)gemm_kernel<Epilogue, Globals>, hipFuncAttributeMaxDynamicSharedMemorySize, mem),
               "hipFuncSetAttribute");
