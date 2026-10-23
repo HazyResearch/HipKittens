@@ -218,6 +218,41 @@ struct st_subtile {
     using row_vec = sv<dtype, cols>;
 };
 
+/**
+ * @brief Non-owning view of a padded row-major shared tile that also carries an UNPADDED origin
+ * flat (origin_row*cols + origin_col). It lets the 2-arg `load(rt, st)` fill an rt_16x128 fp8 A
+ * subtile whose LDS address is `Shape::padded(origin + lane_flat)`: the padding is applied to the
+ * FULL origin+lane flat, so the origin cannot be folded into `data` (padded() is non-additive).
+ * Quacks like an st (ducks::st::identifier). Construct via `subtile_view(st, m_row, k_col)`.
+ */
+template<typename _ST>
+struct st_padded_view {
+    using identifier = ducks::st::identifier;
+    using ST     = _ST;
+    using T      = ST::T;
+    using T2     = ST::T2;
+    using dtype  = T;
+    using shape  = ST::shape;      // Shape::padded() lives here
+    using layout = ST::layout;     // row
+    static constexpr int rows = ST::rows;   // BLOCK_M
+    static constexpr int cols = ST::cols;   // KTILE -- the folded load reads this as the row stride
+
+    dtype *data;         // underlying tile base -- NOT pre-offset (padding is non-additive)
+    int    origin_flat;  // UNPADDED row-major element flat of the warp's subtile origin
+
+    __device__ __forceinline__ st_padded_view(const ST &src, int m_row, int k_col)
+        : data(const_cast<dtype*>(src.data)), origin_flat(m_row * ST::cols + k_col) {}
+
+    __device__ __forceinline__ static const uint32_t swizzle(int2 coord) { return ST::swizzle(coord); }
+};
+
+// Construct an st_padded_view (mirrors subtile_inplace's spelling). m_row/k_col are UNPADDED
+// element coords into the tile: origin_flat = m_row*cols + k_col.
+template<typename ST>
+__device__ __forceinline__ st_padded_view<ST> subtile_view(const ST &src, int m_row, int k_col) {
+    return st_padded_view<ST>(src, m_row, k_col);
+}
+
 /* ----------  CONCEPTS  ---------- */
 
 namespace ducks {

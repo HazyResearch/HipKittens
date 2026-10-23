@@ -28,6 +28,60 @@ namespace kittens {
 template<ducks::rt::row_layout RT, ducks::st::all ST>
 __device__ inline static void load(RT &dst, const ST &src) {
 
+    using Shape = typename ST::shape;
+    if constexpr (std::is_same_v<typename RT::shape, ducks::rt_shape::rt_16x128>) {
+        // 16x128 MXFP8 A operand, filled from a padded-subtile VIEW (st_padded_view) that carries the
+        // warp's UNPADDED origin flat. lane L -> row=L%16, half=L/16; each lane reads its 64 contiguous
+        // logical bytes as 4x b128 through the shape's padded map (padding lands only on pad_interval
+        // boundaries >= the 64B run, so no pad splits a lane's run). The manual copy is deliberate --
+        // inline-asm ds_read_b128 miscompiles the 1x4 configs. fp8-only; MXFP4 B uses load_b_preshuffled.
+        // Requires the view (src.origin_flat); a plain-st rt_16x128 call won't compile (use
+        // subtile_view(st,0,0) for a 0-origin load).
+        static_assert(std::is_same_v<typename RT::dtype, fp8e4m3_4>,
+            "16x128 shared->register load fills the MXFP8 A operand (fp4 B uses load_b_preshuffled)");
+        static_assert(ducks::st_shape::padded<Shape>,
+            "16x128 shared->register load requires a padded shape");
+        static_assert(Shape::pad_interval >= 64,
+            "16x128 fp8 shared->register load reads a lane's 64B run as 4x b128 from one padded() base, "
+            "so pad_interval must be >= 64 (the run length) or padding would split the run and the "
+            "contiguous ds_load_b128 sequence would read wrong data");
+        static_assert(sizeof(typename ST::dtype) == 1,
+            "16x128 shared->register load expects a 1-byte shared tile dtype (fp8 bytes); the "
+            "offset math below treats ST::cols as a byte stride");
+        static_assert(ST::rows % 16 == 0 && ST::cols % 128 == 0,
+            "FP8 shared->register load reads a 16x128 subtile from a BLOCK_M x KTILE padded tile");
+        static_assert(requires (const ST& s) { s.origin_flat; },
+            "rt_16x128 load requires a padded subtile view carrying origin_flat (padded() is "
+            "non-additive, so the unpadded origin can't be baked into .data); pass "
+            "subtile_view(st, origin_row, origin_col), not a plain st<>");
+
+        const int L    = kittens::laneid();
+        const int row  = L % 16;
+        const int half = L / 16;
+        const int flat = src.origin_flat + row * ST::cols + half * 64;   // padded() on FULL origin+lane
+        const int off  = Shape::padded(flat);
+
+        typedef float f4v __attribute__((ext_vector_type(4)));
+        using lds_f4 = f4v __attribute__((address_space(3)));
+        const lds_f4* sptr = reinterpret_cast<const lds_f4*>(
+            reinterpret_cast<uintptr_t>(src.data + off));
+
+        // dst.tiles[0][0].data is fp8e4m3_4 (4B) so writing via uint32_t* is aligned; 4x b128 = 64B.
+        uint32_t* d = reinterpret_cast<uint32_t*>(&dst.tiles[0][0].data[0]);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            f4v v = sptr[k];
+            uint32_t tmp[4];
+            __builtin_memcpy(tmp, &v, sizeof(tmp));   // read v's bytes without a strict-aliasing pun
+            d[k * 4 + 0] = tmp[0];
+            d[k * 4 + 1] = tmp[1];
+            d[k * 4 + 2] = tmp[2];
+            d[k * 4 + 3] = tmp[3];
+        }
+        return;
+    }
+    else {
+
     static_assert(RT::rows == ST::rows, "register tile and shared tile must match rows");
     static_assert(RT::cols == ST::cols,  "register tile and shared tile must match cols");
 
@@ -196,6 +250,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
     } else {
         static_assert(false, "Unsupported subtile sizes");
     }
+    }   // close the `else` wrapping the whole-tile (non-rt_16x128) path
 }
 
 template<ducks::rt::col_layout RT, ducks::st::all ST>
@@ -869,89 +924,94 @@ inline constexpr int st_subtile_padded_stride =
 template<ducks::rt::row_layout RT, ducks::st::all ST>
 __device__ inline void load(RT& dst, const ST& src, int warp_origin_flat)
 {
-    using E     = typename RT::T;
-    using T     = typename ST::dtype;
     using Shape = typename ST::shape;
-    constexpr int C = ST::cols;
 
-    static_assert(std::is_same_v<typename RT::shape, ducks::rt_shape::rt_16x32>,
-        "gfx1250 shared->register load fills the 16x32 WMMA operand layout");
-    static_assert(Shape::pad_interval > 0,
-        "gfx1250 shared->register load requires a padded tile (e.g. st_bf<R,C>)");
-    static_assert(sizeof(E) == 2 && sizeof(T) == 2,
-        "this load moves 16-bit operands (bf16 or fp16)");
+    // fp8 rt_16x128 moved to the 2-arg load(rt, st) via st_padded_view; this 3-arg overload is now the
+    // bf16 rt_16x32 padded path only (its callers are the gfx1250 GEMM ladder).
+    {
+        using E     = typename RT::T;
+        using T     = typename ST::dtype;
+        constexpr int C = ST::cols;
 
-    constexpr int sub_rows  = Shape::rows;   // 16
-    constexpr int sub_cols  = Shape::cols;   // 32
-    constexpr int height    = RT::rows / sub_rows;
-    constexpr int width     = RT::cols / sub_cols;
-    constexpr int half_cols = sub_cols / 2;  // 16
+        static_assert(std::is_same_v<typename RT::shape, ducks::rt_shape::rt_16x32>,
+            "gfx1250 shared->register load fills the 16x32 WMMA operand layout");
+        static_assert(Shape::pad_interval > 0,
+            "gfx1250 shared->register load requires a padded tile (e.g. st_bf<R,C>)");
+        static_assert(sizeof(E) == 2 && sizeof(T) == 2,
+            "this load moves 16-bit operands (bf16 or fp16)");
 
-    const int L    = kittens::laneid();
-    const int row  = L % sub_rows;
-    const int half = L / sub_rows;
+        constexpr int sub_rows  = Shape::rows;   // 16
+        constexpr int sub_cols  = Shape::cols;   // 32
+        constexpr int height    = RT::rows / sub_rows;
+        constexpr int width     = RT::cols / sub_cols;
+        constexpr int half_cols = sub_cols / 2;  // 16
 
-    /* The structural condition is necessary but the load body relies on the identity, so the identity
-     * is checked directly over a full padding period rather than inferred from the shape's name. A
-     * shape whose `padded()` is not of this form takes the general path. */
-    constexpr bool affine = [] {
-        if constexpr (!ducks::st_shape::padded<Shape>) return false;
-        else if constexpr (Shape::pad_interval <= 0 || C % Shape::pad_interval != 0) return false;
-        else {
-            constexpr int stride = st_subtile_padded_stride<Shape, C, sub_rows>;
-            for (int x = 0; x < 2 * Shape::pad_interval + C; x++)
-                for (int ti = 1; ti < height; ti++)
-                    if (Shape::padded(x + ti * sub_rows * C) != Shape::padded(x) + ti * stride)
-                        return false;
-            return true;
-        }
-    }();
+        const int L    = kittens::laneid();
+        const int row  = L % sub_rows;
+        const int half = L / sub_rows;
 
-    // Affine path: the top subtile's physical offset, one per subtile column.
-    int col_base[affine ? width : 1];
-    if constexpr (affine) {
-        #pragma unroll
-        for (int tj = 0; tj < width; tj++)
-            col_base[tj] = Shape::padded(warp_origin_flat + row * C
-                                      + tj * sub_cols + half * half_cols);
-    }
-
-    #pragma unroll
-    for (int ti = 0; ti < height; ti++) {
-        #pragma unroll
-        for (int tj = 0; tj < width; tj++) {
-            int padded_off;
-            if constexpr (affine) {
-                padded_off = col_base[tj]
-                           + ti * st_subtile_padded_stride<Shape, C, sub_rows>;
-            } else {
-                padded_off = Shape::padded(warp_origin_flat
-                                        + (ti * sub_rows + row) * C
-                                        + tj * sub_cols
-                                        + half * half_cols);
+        /* The structural condition is necessary but the load body relies on the identity, so the identity
+         * is checked directly over a full padding period rather than inferred from the shape's name. A
+         * shape whose `padded()` is not of this form takes the general path. */
+        constexpr bool affine = [] {
+            if constexpr (!ducks::st_shape::padded<Shape>) return false;
+            else if constexpr (Shape::pad_interval <= 0 || C % Shape::pad_interval != 0) return false;
+            else {
+                constexpr int stride = st_subtile_padded_stride<Shape, C, sub_rows>;
+                for (int x = 0; x < 2 * Shape::pad_interval + C; x++)
+                    for (int ti = 1; ti < height; ti++)
+                        if (Shape::padded(x + ti * sub_rows * C) != Shape::padded(x) + ti * stride)
+                            return false;
+                return true;
             }
+        }();
 
-            typedef float f4v __attribute__((ext_vector_type(4)));
-            using lds_f4 = f4v __attribute__((address_space(3)));
-            const lds_f4* sptr = reinterpret_cast<const lds_f4*>(
-                reinterpret_cast<uintptr_t>(src.data + padded_off));
-            f4v lo = sptr[0];
-            f4v hi = sptr[1];
+        // Affine path: the top subtile's physical offset, one per subtile column.
+        int col_base[affine ? width : 1];
+        if constexpr (affine) {
+            #pragma unroll
+            for (int tj = 0; tj < width; tj++)
+                col_base[tj] = Shape::padded(warp_origin_flat + row * C
+                                          + tj * sub_cols + half * half_cols);
+        }
 
-            // Pure bit move: the packed operand word is bf16_2 or half_2
-            // depending on E, and both are 32-bit pairs with identical layout.
-            using packed_t = std::remove_cvref_t<decltype(dst.tiles[0][0].data[0])>;
-            packed_t* lo_p = reinterpret_cast<packed_t*>(&lo);
-            packed_t* hi_p = reinterpret_cast<packed_t*>(&hi);
+        #pragma unroll
+        for (int ti = 0; ti < height; ti++) {
+            #pragma unroll
+            for (int tj = 0; tj < width; tj++) {
+                int padded_off;
+                if constexpr (affine) {
+                    padded_off = col_base[tj]
+                               + ti * st_subtile_padded_stride<Shape, C, sub_rows>;
+                } else {
+                    padded_off = Shape::padded(warp_origin_flat
+                                            + (ti * sub_rows + row) * C
+                                            + tj * sub_cols
+                                            + half * half_cols);
+                }
 
-            dst.tiles[ti][tj].data[0] = lo_p[0];
-            dst.tiles[ti][tj].data[1] = lo_p[1];
-            dst.tiles[ti][tj].data[2] = lo_p[2];
-            dst.tiles[ti][tj].data[3] = lo_p[3];
-            dst.tiles[ti][tj].data[4] = hi_p[0];
-            dst.tiles[ti][tj].data[5] = hi_p[1];
-            dst.tiles[ti][tj].data[6] = hi_p[2];
-            dst.tiles[ti][tj].data[7] = hi_p[3];
+                typedef float f4v __attribute__((ext_vector_type(4)));
+                using lds_f4 = f4v __attribute__((address_space(3)));
+                const lds_f4* sptr = reinterpret_cast<const lds_f4*>(
+                    reinterpret_cast<uintptr_t>(src.data + padded_off));
+                f4v lo = sptr[0];
+                f4v hi = sptr[1];
+
+                // Pure bit move: the packed operand word is bf16_2 or half_2
+                // depending on E, and both are 32-bit pairs with identical layout.
+                using packed_t = std::remove_cvref_t<decltype(dst.tiles[0][0].data[0])>;
+                packed_t* lo_p = reinterpret_cast<packed_t*>(&lo);
+                packed_t* hi_p = reinterpret_cast<packed_t*>(&hi);
+
+                dst.tiles[ti][tj].data[0] = lo_p[0];
+                dst.tiles[ti][tj].data[1] = lo_p[1];
+                dst.tiles[ti][tj].data[2] = lo_p[2];
+                dst.tiles[ti][tj].data[3] = lo_p[3];
+                dst.tiles[ti][tj].data[4] = hi_p[0];
+                dst.tiles[ti][tj].data[5] = hi_p[1];
+                dst.tiles[ti][tj].data[6] = hi_p[2];
+                dst.tiles[ti][tj].data[7] = hi_p[3];
+            }
         }
     }
 }

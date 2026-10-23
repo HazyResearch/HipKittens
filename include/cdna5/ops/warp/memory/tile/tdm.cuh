@@ -236,6 +236,39 @@ __device__ inline void load_async(st<T, ROWS, COLS, Shape>& dst, const GL& src,
 }
 
 /**
+ * @brief Raw-base TDM load: fill a shared tile from a precomputed global BASE POINTER rather than a
+ *        GL descriptor + coord. For sources whose per-tile base is not a row-major (b,d,r,c) tensor
+ *        element -- e.g. a per-expert / preshuffled MoE weight block -- the caller computes the byte
+ *        base itself; this issues the same 2D descriptor and tensor_load_to_lds as the GL overload.
+ *        Byte-addressed (1-byte packed operands); Shape carries the LDS pad/flat map. Drain with
+ *        sync::wait_tdm<>(). Disambiguated from the GL overload by the base-pointer second argument.
+ */
+// Shape/ROWS/COLS are the TDM DESCRIPTOR geometry, specified explicitly -- they may differ from the
+// destination tile's own storage shape (the descriptor can decompose the same contiguous LDS bytes
+// into a different row/col grid, e.g. a flat multi-block B buffer). `dst` supplies only the LDS base.
+template<ducks::st_shape::all Shape, int ROWS, int COLS, ducks::st::all ST>
+__device__ inline void load_async(ST& dst, const uint8_t* base,
+                                int tensor_rows, int tensor_cols, int row_stride,
+                                uint32_t cluster_mask = 0, uint32_t count = 1)
+{
+    static_assert(sizeof(typename ST::dtype) == 1,
+        "tdm::load_async(base) builds a byte-addressed descriptor; the destination tile must have a "
+        "1-byte dtype (fp8/fp4). A wider dtype would silently mis-describe the tensor.");
+    static_assert(!ducks::st_shape::swizzled<Shape, uint8_t>,
+        "the TDM engine cannot fill a swizzled shared tile: it deposits plain row-major with the "
+        "shape's periodic padding, so the shape's within-subtile permutation is never applied and "
+        "load(rt, st), which does honour it, would read the wrong elements. Use a padded shape.");
+    v4u32 g0;
+    v8u32 g1;
+    build_tdm_descriptor_2d<Shape, ROWS, COLS, uint8_t>(
+        g0, g1, base, reinterpret_cast<uint8_t*>(dst.data),
+        tensor_rows, tensor_cols, row_stride, cluster_mask, /*bar_lds_addr=*/0u, count);
+    v4u32 g2 = {0, 0, 0, 0};
+    v4u32 g3 = {0, 0, 0, 0};
+    emit_tensor_load_to_lds(g0, g1, g2, g3);
+}
+
+/**
  * @brief TDM load that also arrives at an LDS barrier when it retires.
  * @experimental
  *
