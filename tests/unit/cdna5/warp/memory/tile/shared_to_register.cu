@@ -43,6 +43,7 @@ struct sharedreg_load_store {
 
         const int row_stride = (int)input.cols();
         kittens::load<NW*kittens::WARP_THREADS>(shared_tile, input, {0, 0, 0, 0}, row_stride);
+        kittens::sync::wait_async<0>();
         kittens::sync::sync();
 
         kittens::rt<T, ST_SHAPE::rows, ST_SHAPE::cols, RL, RT_SHAPE> reg_tile;
