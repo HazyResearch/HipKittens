@@ -6,8 +6,13 @@
 struct SiluEpilogue {
     template<typename Globals, typename Accum>
     static __device__ inline void apply(const Globals& g, Accum& C, int row, int col, int wr, int wc) {
-        silu_op(C[0][0]); silu_op(C[0][1]);
-        silu_op(C[1][0]); silu_op(C[1][1]);
-        store_C(g, C, row, col, wr, wc);
+        subtile_coords co = block_coords(row, col, wr, wc);
+        #pragma unroll
+        for (int i = 0; i < SUBTILES_PER_DIM; i++)
+            #pragma unroll
+            for (int j = 0; j < SUBTILES_PER_DIM; j++) {
+                silu_op(C[i][j]);
+                store(g.c, C[i][j], {0, 0, co.m[i], co.n[j]});
+            }
     }
 };
