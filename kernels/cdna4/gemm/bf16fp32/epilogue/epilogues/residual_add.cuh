@@ -2,14 +2,13 @@
 #include <type_traits>
 #include "base.cuh"
 
-// out = (A @ B^T) + residual, with residual a bf16 [M, N] skip connection.
+// out = (A @ B^T) + residual
 struct ResidualAddGlobals {
     _gl_A a; _gl_B b; _gl_C c;
     gl<bf16, -1, -1, -1, -1> residual;   // [M, N] bf16
 };
 struct ResidualAddEpilogue {
-    // One sub-tile at a time: load its residual, add, store, then move on. Storing each sub-tile as
-    // soon as it is done ends its live range early.
+    // Per sub-tile load/add/store keeps live ranges short.
     template<typename Globals, typename Accum>
     static __device__ inline void apply(const Globals& g, Accum& C, int row, int col, int wr, int wc) {
         using Tile = std::remove_all_extents_t<Accum>;

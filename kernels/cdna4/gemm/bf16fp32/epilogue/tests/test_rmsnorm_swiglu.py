@@ -1,6 +1,5 @@
-"""tk_rmsnorm_swiglu: c = silu(gate) * value with [gate | value] = r[:, None] * (a @ b.T), [M, N] -> [M, N/2]
-(bf16, r = [M] fp32). The tests put the norm's gamma on b; in the layer it arrives on a. Fast SiLU allows
-one bf16 step."""
+"""tk_rmsnorm_swiglu: c = silu(gate) * value, [gate | value] = r[:, None] * (a @ b.T), [M, N] -> [M, N/2] (bf16);
+within one bf16 step."""
 import pytest
 import torch
 
@@ -22,8 +21,8 @@ def run(a, b, r, gamma):
 
 
 def reference(a, b, r, gamma):
-    folded = (b.float() * gamma.float()[None, :]).to(torch.bfloat16)   # gamma scales b's K axis
-    h = gemm_exact(a, folded) * r[:, None]              # r first, as the kernel does
+    folded = (b.float() * gamma.float()[None, :]).to(torch.bfloat16)   # gamma over K
+    h = gemm_exact(a, folded) * r[:, None]              # r first
     d = h.shape[1] // 2
     return silu_kernel(h[:, :d]) * h[:, d:]
 
@@ -42,7 +41,7 @@ def test_zeros():
 
 
 def test_known_answer():
-    # b = I and r = 0.5: gate = 0.5 * 1, value = 0.5 * 2, so c = silu(0.5) * 1.
+    # gate = 0.5, value = 1: c = silu(0.5)
     a = torch.cat([torch.ones(512, 128), 2 * torch.ones(512, 128)], dim=1).to(torch.bfloat16).to(DEV)
     eye = torch.eye(256, dtype=torch.bfloat16, device=DEV)
     r = torch.full((512,), 0.5, device=DEV)

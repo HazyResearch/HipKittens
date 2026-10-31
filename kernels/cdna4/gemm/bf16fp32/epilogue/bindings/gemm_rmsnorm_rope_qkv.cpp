@@ -5,16 +5,14 @@
 #include "pyutils/pyutils.cuh"
 #include "checked_bind.cuh"
 
-// "rmsnorm_rope" over Q, K and V as ONE launch with three separate weights (no concatenated copy): output block
-// columns [0, q_blocks) read Wq, [q_blocks, qk_blocks) read Wk, the rest Wv. gemm_kernel picks the B tensor per
-// block (gemm_base.cuh); the epilogue is RmsnormRopeEpilogue unchanged. q_blocks / qk_blocks are set by launch().
+// rmsnorm_rope over three unconcatenated weights Wq, Wk, Wv in one launch.
 struct RmsnormRopeQkvGlobals {
     _gl_A a; _gl_B b; _gl_C c;          // b = Wq [Nq, K]
     gl<float, -1, -1, -1, -1> r;        // [M] fp32
-    gl<bf16, -1, -1, -1, -1> cos_sin;   // [M, Dh] bf16, one head's natural table
-    int rope_cols;                      // columns [0, rope_cols) are rotated (Q and K), the rest (V) stored as is
+    gl<bf16, -1, -1, -1, -1> cos_sin;   // [M, Dh] bf16, one head
+    int rope_cols;                      // rotated: [0, rope_cols) (Q, K)
     _gl_B b_k, b_v;                     // Wk, Wv [Nkv, K]
-    int q_blocks, qk_blocks;            // 256-column block boundaries, set by launch()
+    int q_blocks, qk_blocks;            // set by launch()
 };
 
 void dispatch(RmsnormRopeQkvGlobals g, hipStream_t stream) {

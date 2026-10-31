@@ -1,5 +1,4 @@
-"""tk_residual_add: c = a @ b.T + residual (bf16, residual = [M, N] bf16). The add is one IEEE fp32 add,
-so c must be bit-identical to the reference stored the way the kernel stores bf16 (to_bf16_chopped)."""
+"""tk_residual_add: c = a @ b.T + residual (bf16 [M, N]), bit-exact."""
 import pytest
 import torch
 
@@ -41,7 +40,7 @@ def test_known_answer():
     residual = torch.full((512, 256), 2.5, dtype=torch.bfloat16, device=DEV)
     c = run(a, eye, residual)
     assert torch.equal(c, torch.full_like(c, 3.5))       # 1 + 2.5
-    with pytest.raises(TypeError):                       # residual passed under the wrong name
+    with pytest.raises(TypeError):                       # wrong name
         hk.matmul(a, weight(eye), epilogue="residual_add", skip=residual)
 
 

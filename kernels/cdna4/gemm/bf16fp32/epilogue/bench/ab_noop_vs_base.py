@@ -1,11 +1,7 @@
-"""Refactor-neutrality A/B: tk_noop (the epilogue chassis with NoOpEpilogue) against upstream's untouched
-base GEMM (kernels/cdna4/gemm/bf16fp32/256_256_64_32_with16x32.cpp). Both compute C = A @ Bt.T in bf16.
+"""tk_noop vs the upstream base GEMM: C must be bitwise identical.
 
-Per shape: C must be bitwise identical. Timing is interleaved over ROUNDS rounds (alternating which arm
-goes first); each arm's time is the median of its round medians. noop at most 3% slower: PASS. 3-5%
-slower: RERUN (repeat in 3 fresh processes, use the median of process medians). Over 5%: FAIL.
-
-Build first: `make KERNEL=noop` in the epilogue directory and `make` in kernels/cdna4/gemm/bf16fp32.
+Arms alternate over ROUNDS rounds; time = median of round medians. noop <= 3% slower: PASS; 3-5%: RERUN
+(3 fresh processes, median of medians); > 5%: FAIL. Build: `make KERNEL=noop` here and `make` in the parent.
 """
 import importlib
 
@@ -17,7 +13,7 @@ ROUNDS = 5
 
 
 def shapes(cfg, Ms):
-    """Unique (M, K, N) over the layer GEMMs at every M, plus the 8192^3 square."""
+    """Unique layer (M, K, N) plus 8192^3."""
     out = []
     for M in Ms:
         for K, N in common.layer_gemms(cfg).values():
@@ -39,7 +35,7 @@ def main():
     rows = []
     for M, K, N in shapes(args.cfg, args.M):
         a = common.activation(M, K)
-        bt = common.weight(K, N)                                    # [N, K]: both kernels read B this way
+        bt = common.weight(K, N)                                    # [N, K]
         c_noop = torch.empty(M, N, dtype=common.BF16, device="cuda")
         c_base = torch.empty_like(c_noop)
         run_noop = lambda: noop.dispatch(a, bt, c_noop, stream)

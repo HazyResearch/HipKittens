@@ -3,15 +3,10 @@
 #include <type_traits>
 #include "base.cuh"
 
-// Interleaved RoPE: out[2k] = x*cos + y*sin, out[2k+1] = y*cos - x*sin, stored in natural column order.
-// split_rope_pairs (gemm_base.cuh) loads pair k's two weight rows as B halves 0 and 1, so x is in C[i][0] and
-// y in C[i][1] of the same thread (pair k -> columns k%128 and k%128 + 128 of 256-column block k/128).
-// g.cos_sin is ONE head's natural interleaved table [M, Dh] ([m, 2j] = cos, [m, 2j+1] = sin of head pair j),
-// shared by every head: pair k uses head pair j = k % (Dh/2). Columns >= g.rope_cols (a multiple of 256, so a
-// whole block either side) are stored unrotated (cos 1, sin 0): fused QKV leaves V unrotated this way.
-// Each rotated pair is written as one round-to-nearest bf16x2 word at columns (2k, 2k+1); c must be
-// 4-byte aligned. Lane L of a 16x16 base tile owns column L%16, so its pair is
-// k = col*128 + wc*32 + j*16 + L%16.
+// out[2k] = x*cos + y*sin, out[2k+1] = y*cos - x*sin, natural column order; x in C[i][0], y in C[i][1].
+// cos_sin is one head's [M, Dh] table ([m, 2j] cos, [m, 2j+1] sin), pair k uses j = k % (Dh/2).
+// Columns >= rope_cols (multiple of 256) stay unrotated (V in fused QKV).
+// Each pair is stored as one bf16x2 word (c 4-byte aligned). Lane L's pair: k = col*128 + wc*32 + j*16 + L%16.
 template<typename Globals, typename Accum>
 __device__ inline void apply_rope_store_natural(const Globals& g, Accum& C, int row, int col, int wr, int wc) {
     using Tile = std::remove_all_extents_t<Accum>;
@@ -28,14 +23,13 @@ __device__ inline void apply_rope_store_natural(const Globals& g, Accum& C, int 
     const int lane_col = lane % Tile::base_tile_cols;
     const int lane_row = Tile::base_tile_stride * (lane / Tile::base_tile_cols);
     const int pair_base = col * HALF_BLOCK_SIZE + wc * Tile::cols;
-    const bool rotate = col * BLOCK_SIZE < g.rope_cols;     // uniform per block (rope_cols % 256 == 0)
+    const bool rotate = col * BLOCK_SIZE < g.rope_cols;     // block-uniform
     const int dh = g.cos_sin.cols();
     const int half_dh = dh / 2;
 
     #pragma unroll
     for (int i = 0; i < SUBTILES_PER_DIM; ++i) {
-        // cos_t / sin_t in C[i]'s register layout: element (tile_row, tile_col, reg) is pair
-        // pair_base + tile_col*16 + lane_col at rows out_row (.x) and out_row + 1 (.y), as in the store below.
+        // cos_t / sin_t in C[i]'s register layout (.x row out_row, .y row out_row + 1).
         #pragma unroll
         for (int tile_row = 0; tile_row < Tile::height; ++tile_row) {
             #pragma unroll
@@ -58,7 +52,7 @@ __device__ inline void apply_rope_store_natural(const Globals& g, Accum& C, int 
             }
         }
         mul(t0, C[i][1], sin_t);                             // y * sin
-        mul(t1, C[i][1], cos_t);                             // y * cos (y no longer needed)
+        mul(t1, C[i][1], cos_t);                             // y * cos
         mul(C[i][1], C[i][0], sin_t);
         sub(C[i][1], t1, C[i][1]);                           // odd  = y * cos - x * sin
         mul(C[i][0], C[i][0], cos_t);

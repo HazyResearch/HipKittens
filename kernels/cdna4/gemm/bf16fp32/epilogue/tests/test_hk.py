@@ -1,4 +1,4 @@
-"""hk: the API's own behavior: refusals, stream and graph safety, inv_rms."""
+"""hk API: refusals, stream and graph safety, inv_rms."""
 import pytest
 import torch
 
@@ -33,22 +33,20 @@ def test_argument_names():
 def test_strict_inputs():
     a, b = inputs(256, 256, 128, "random")
     w = weight(b)
-    for bad in (a.float(), a.t().contiguous().t(), a.cpu()):          # fp32, non-contiguous, CPU
+    for bad in (a.float(), a.t().contiguous().t(), a.cpu()):
         with pytest.raises(ValueError, match="must be"):
             hk.matmul(bad, w)
-    for bad in (b.float(), b.t()):                                  # fp32; a [K, N] view of an [N, K] weight
+    for bad in (b.float(), b.t()):
         with pytest.raises(ValueError, match="must be"):
             hk.matmul(a, bad)
-    with pytest.raises(TypeError, match="alpha must be a torch.Tensor"):  # bool is not a number here
+    with pytest.raises(TypeError, match="alpha must be a torch.Tensor"):  # bool rejected
         hk.matmul(a, w, epilogue="scale", alpha=True)
 
 
 @pytest.mark.skipif(torch.cuda.mem_get_info()[0] < 6 * 2**30, reason="needs 6 GiB free GPU memory")
 @pytest.mark.parametrize("big", ["a", "b"])
 def test_refuses_operand_of_4_gib(big):
-    """Buffer loads address A and B with 32-bit sizes: a 4 GiB operand would wrap and silently read zeros, so the
-    launcher refuses it before launching. Exactly one operand is 2^16 x 2^15 bf16 = 2^32 bytes; the other operand and
-    the output stay small (16 MiB, 32 MiB), so each case can only be caught by its own check."""
+    """A 4 GiB operand (32-bit buffer addressing) is refused; only the parametrized operand is big."""
     module("noop")
     big_rows, K, small_rows = 2 ** 16, 2 ** 15, 256
     M, N = (big_rows, small_rows) if big == "a" else (small_rows, big_rows)
@@ -81,27 +79,27 @@ def test_output_shapes():
 
 
 def test_side_stream():
-    """Inputs produced on stream s, matmul on s with no sync in between: the kernel must run on s."""
+    """matmul runs on the current side stream."""
     module("noop")
     a0, b = inputs(4096, 4096, 4096, "random")
     w = weight(b)
     torch.cuda.synchronize()
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
-        a = a0 * 1                                               # written on s
+        a = a0 * 1
         out = hk.matmul(a, w)
     s.synchronize()
     assert_bitexact(out, gemm_exact(a0, b))
 
 
 def test_graph_capture():
-    """hk.matmul is captured into a graph and replays correctly on new inputs."""
+    """hk.matmul captures into a graph and replays on new inputs."""
     module("noop")
     a1, b = inputs(256, 256, 128, "random", seed=1)
     a2, _ = inputs(256, 256, 128, "random", seed=2)
     w = weight(b)
     static_a = a1.clone()
-    hk.matmul(static_a, w)                                       # warm-up (loads the module's code object)
+    hk.matmul(static_a, w)                                       # warm-up
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -113,23 +111,21 @@ def test_graph_capture():
 
 
 def test_rmsnorm_ones_made_under_capture():
-    """"rmsnorm" passes the kernel a ones vector. Made for the first time during capture, it is only
-    filled when the graph replays, so it must not be cached: an eager call before any replay would read
-    an unfilled buffer."""
+    """"rmsnorm"'s ones vector made during capture must not be cached (filled only on replay)."""
     module("rmsnorm_scale")
-    a, b = inputs(256, 768, 128, "random")                       # N = 768: a size no other test uses
+    a, b = inputs(256, 768, 128, "random")                       # N unused elsewhere
     gamma = pow2_gamma(128)
     w = weight(b, gamma=gamma)
     r = torch.full((256,), 0.5, device=DEV)
     want = gemm_exact(a, (b.float() * gamma.float()[None, :]).to(torch.bfloat16)) * 0.5
     ones = torch.ones(768, dtype=torch.bfloat16, device=DEV)
-    hk.matmul(a, weight(b), epilogue="rmsnorm_scale", r=r, out_gamma=ones)   # warm-up without making hk's ones
+    hk.matmul(a, weight(b), epilogue="rmsnorm_scale", r=r, out_gamma=ones)   # warm-up
     hk._ONES.pop((768, a.device), None)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         static_out = hk.matmul(a, w, epilogue="rmsnorm", r=r)
-    assert_bitexact(hk.matmul(a, w, epilogue="rmsnorm", r=r), want)  # eager, before the graph ever replays
+    assert_bitexact(hk.matmul(a, w, epilogue="rmsnorm", r=r), want)  # eager, before replay
     graph.replay()
     torch.cuda.synchronize()
     assert_bitexact(static_out, want)
@@ -149,8 +145,7 @@ def test_inv_rms():
     ("residual_add", lambda a, w, c, t: (a, w, c, t)),                        # 3-D residual
 ])
 def test_tk_modules_refuse_3d(module_name, args):
-    """The raw tk_* modules pad tensors to 4-D, so a 3-D [B, M, K] tensor would silently compute only slice 0:
-    every tensor argument must be 1-D or 2-D."""
+    """tk_* modules reject 3-D tensors."""
     a, b = inputs(256, 256, 256, "random")
     c = torch.empty(256, 256, dtype=torch.bfloat16, device=DEV)
     t = a.unsqueeze(0).expand(2, 256, 256).contiguous()
@@ -160,8 +155,7 @@ def test_tk_modules_refuse_3d(module_name, args):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
 def test_cross_device():
-    """GPU 0 current, every tensor on GPU 1: hk must launch on x's GPU and its current stream. Launching on
-    the current device's stream instead faults with hipErrorIllegalAddress (seen on 2x MI355X)."""
+    """GPU 0 current, tensors on GPU 1: hk launches on x's GPU."""
     module("noop"), module("residual_add"), module("partialrms"), module("rms_reduce")
     module("residual_rms_gamma"), module("rmsnorm_rope_qkv")
     d0, d1 = torch.device("cuda", 0), torch.device("cuda", 1)

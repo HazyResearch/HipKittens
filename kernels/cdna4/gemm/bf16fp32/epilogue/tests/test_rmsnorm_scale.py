@@ -1,11 +1,5 @@
-"""tk_rmsnorm_scale (hk "rmsnorm_scale", an output RMSNorm): c = (a @ b.T) * r[:, None] * out_gamma[None, :] (bf16),
-r = [M] fp32, out_gamma = [N] bf16 over the output columns. The kernel multiplies by r, then by out_gamma, each one
-IEEE fp32 multiply, so c must be bit-identical to the reference stored the way the kernel stores bf16
-(to_bf16_chopped).
-
-hk's "rmsnorm" epilogue runs the same kernel with ones as the column gain: c = r[:, None] * (a @ b.T), where a is the
-RMSNorm input already times its gamma. In these tests gamma scales b's K columns instead, which gives the same
-product: (a * gamma) @ b.T == a @ (b * gamma).T."""
+"""tk_rmsnorm_scale: c = (a @ b.T) * r[:, None] * out_gamma[None, :] (bf16), r fp32 [M], out_gamma bf16 [N];
+bit-exact. "rmsnorm" is the same kernel with out_gamma = ones."""
 import pytest
 import torch
 
@@ -15,7 +9,7 @@ from conftest import (BAD_SHAPES, DEV, SHAPES, assert_bitexact, gemm_exact, hk_s
 
 
 def vectors(M, N, seed=2):
-    """fp32 r in [0.5, 2) (like 1/rms) and bf16 gamma in [0.25, 1.75)."""
+    """fp32 r in [0.5, 2), bf16 gamma in [0.25, 1.75)."""
     g = torch.Generator(device=DEV).manual_seed(seed)
     r = torch.rand(M, generator=g, device=DEV) * 1.5 + 0.5
     gamma = (torch.rand(N, generator=g, device=DEV) * 1.5 + 0.25).to(torch.bfloat16)
@@ -45,17 +39,17 @@ def test_zeros():
 
 
 def test_known_answer():
-    # b = I, so the GEMM returns a = 1; then c[m, n] = r[m] * gamma[n].
+    # c[m, n] = r[m] * gamma[n]
     a = torch.ones(512, 256, dtype=torch.bfloat16, device=DEV)
     eye = torch.eye(256, dtype=torch.bfloat16, device=DEV)
-    r = torch.tensor([1.0, 2.0], device=DEV).repeat(256)                           # alternates per row
-    gamma = torch.tensor([4.0, 8.0], device=DEV).repeat(128).to(torch.bfloat16)    # alternates per column
+    r = torch.tensor([1.0, 2.0], device=DEV).repeat(256)                           # per row
+    gamma = torch.tensor([4.0, 8.0], device=DEV).repeat(128).to(torch.bfloat16)    # per column
     c = run(a, eye, r, gamma)
     assert torch.equal(c, (r[:, None] * gamma.float()[None, :]).to(torch.bfloat16))
-    with pytest.raises(ValueError):                      # r and out_gamma swapped: wrong dtypes and shapes
+    with pytest.raises(ValueError):                      # swapped
         hk.matmul(a, weight(eye), epilogue="rmsnorm_scale", r=gamma, out_gamma=r)
-    with pytest.raises(TypeError, match="takes arguments"):            # the old name, easy to confuse with the
-        hk.matmul(a, weight(eye), epilogue="rmsnorm_scale", r=r, gamma=gamma)   # pre-norm gamma, is refused
+    with pytest.raises(TypeError, match="takes arguments"):            # `gamma` is not an argument
+        hk.matmul(a, weight(eye), epilogue="rmsnorm_scale", r=r, gamma=gamma)
 
 
 @pytest.mark.parametrize("M,N,K", BAD_SHAPES)
@@ -75,18 +69,18 @@ def test_rejects_wrong_dtype():
 
 @pytest.mark.parametrize("M,N,K", SHAPES)
 def test_rmsnorm_input_gamma(M, N, K):
-    """"rmsnorm" with the norm's gamma on the input side (here scaling b's K columns, equivalent to a * gamma)."""
+    """"rmsnorm" with gamma on the input side, bit-exact."""
     a, b = inputs(M, N, K, "random")
     r, _ = vectors(M, N)
     gamma = pow2_gamma(K)
     module("rmsnorm_scale")
     c = hk.matmul(a, weight(b, gamma=gamma), epilogue="rmsnorm", r=r)
-    folded = (b.float() * gamma.float()[None, :]).to(torch.bfloat16)   # gamma scales b's K axis
-    assert_bitexact(c, gemm_exact(a, folded) * r[:, None])            # times ones: unchanged
+    folded = (b.float() * gamma.float()[None, :]).to(torch.bfloat16)   # gamma over K
+    assert_bitexact(c, gemm_exact(a, folded) * r[:, None])            # times ones
 
 
 def test_rmsnorm_takes_only_r():
     a, b = inputs(256, 256, 128, "random")
     r, gamma = vectors(256, 256)
-    with pytest.raises(TypeError, match="takes arguments"):            # gamma comes with the input, not here
+    with pytest.raises(TypeError, match="takes arguments"):            # gamma comes with the input
         hk.matmul(a, weight(b), epilogue="rmsnorm", r=r, gamma=gamma)

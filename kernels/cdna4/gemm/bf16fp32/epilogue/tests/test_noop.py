@@ -1,5 +1,4 @@
-"""tk_noop: c = a @ b.T (bf16). The GEMM is exact, so c must equal the exact product stored the way
-the kernel stores bf16 (to_bf16_chopped)."""
+"""tk_noop: c = a @ b.T (bf16), bit-exact vs the chopped exact product."""
 import pytest
 import torch
 

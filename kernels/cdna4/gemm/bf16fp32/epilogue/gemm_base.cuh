@@ -3,7 +3,6 @@
 
 using G = kittens::group<NUM_WARPS>;
 
-// Plain GEMM: store the accumulator unchanged. The default epilogue of gemm_kernel.
 struct NoOpEpilogue {
     template<typename Globals, typename Accum>
     static __device__ inline void apply(const Globals& g, Accum& C, int row, int col, int wr, int wc) {
@@ -11,42 +10,34 @@ struct NoOpEpilogue {
     }
 };
 
-// An epilogue that sets `static constexpr bool split_gate_up = true` takes the natural gate_up weight
-// (b rows [0, N/2) = gate, [N/2, N) = value). Its block `col` loads gate rows [col*128, col*128+128) as B
-// half 0 and the matching value rows N/2 later as half 1, so each thread holds gate j in C[*][0] and
-// value j in C[*][1] without any weight permutation. Every other epilogue loads 256 contiguous rows.
+// split_gate_up: b rows [0, N/2) gate, [N/2, N) value. Block col loads gate rows [col*128, +128) as B half 0
+// and the value rows N/2 later as half 1, so gate j is in C[*][0] and value j in C[*][1].
 template<typename Epilogue>
 constexpr bool splits_gate_up() {
     if constexpr (requires { Epilogue::split_gate_up; }) return Epilogue::split_gate_up;
     else return false;
 }
 
-// An epilogue that sets `static constexpr bool split_rope_pairs = true` takes the natural weight (b = [N, K],
-// RoPE pair k in rows 2k and 2k+1). launch() hands the kernel b viewed as [N/2, 2K] (same memory), whose row p
-// holds row 2p in columns [0, K) and row 2p+1 in columns [K, 2K). Block `col` loads view rows
-// [col*128, col*128+128): their first K columns (the even rows) as B half 0 and their last K columns (the odd
-// rows) as half 1, so pair k's x is in C[*][0] and its y in C[*][1] of the same thread.
+// split_rope_pairs: pair k is b rows 2k, 2k+1. launch() views b as [N/2, 2K]; block col loads view rows
+// [col*128, +128), first K columns as B half 0 and last K as half 1, so x is in C[*][0] and y in C[*][1].
 template<typename Epilogue>
 constexpr bool splits_rope_pairs() {
     if constexpr (requires { Epilogue::split_rope_pairs; }) return Epilogue::split_rope_pairs;
     else return false;
 }
 
-// Globals with b_k, b_v, q_blocks and qk_blocks read three B tensors (hk.qkv: b = Wq, b_k = Wk, b_v = Wv) in one
-// launch; gemm_kernel picks one per 256-column block and launch() sets the block boundaries.
+// Three B tensors (b = Wq, b_k = Wk, b_v = Wv) in one launch, picked per 256-column block.
 template<typename Globals>
 constexpr bool has_three_b = requires(const Globals& g) { g.b_k; g.b_v; g.q_blocks; g.qk_blocks; };
 
-// gemm_kernel is a copy of the base GEMM's micro_tk (kernels/cdna4/gemm/bf16fp32/256_256_64_32_with16x32.cpp).
-// Re-copy the loop if the base changes, then re-apply every change below:
-//   1. Templated on <Epilogue, Globals>; the accumulator type is named Accum and checked against Epilogue::apply.
-//   2. The unused debug variable `condition` is removed.
-//   3. Three-B globals: each block picks its B tensor gb and its column bcol within it before the loop.
-//   4. Every B access uses gb: prefill_swizzled_offsets, the base pointer, the row stride and the buffer resource,
-//      whose range is gb.rows() * stride instead of N * stride.
-//   5. Buffer-resource sizes are computed in unsigned 32-bit math (launch() refuses operands of 4 GiB or more).
-//   6. B loads use b_half0 / b_half1 / b_k1 (split_gate_up, split_rope_pairs above) instead of col*2 / col*2 + 1.
-//   7. The four final stores are replaced by Epilogue::apply(...).
+// Copy of micro_tk in 256_256_64_32_with16x32.cpp, with these changes:
+//   1. Templated on <Epilogue, Globals>; Accum checked against Epilogue::apply.
+//   2. Unused `condition` removed.
+//   3. Per-block B tensor gb and column bcol (three-B globals).
+//   4. All B accesses use gb; buffer range is gb.rows() * stride.
+//   5. Buffer sizes in unsigned 32-bit math.
+//   6. B loads use b_half0 / b_half1 / b_k1 instead of col*2 / col*2 + 1.
+//   7. Final stores replaced by Epilogue::apply.
 template<typename Epilogue = NoOpEpilogue, typename Globals = gemm_args_base>
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void gemm_kernel(const Globals g, int M, int N, int K) {
@@ -89,16 +80,14 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     // Assign the tile's row/column based on the pid_m and pid_n.
     int row = pid_m; 
     int col = pid_n;  
-    // Three-B globals (b = Wq, b_k = Wk, b_v = Wv; hk.qkv): every 256-column output block lies inside one of the
-    // three, so the block picks its B tensor and its column within it once, here. All B addressing below uses gb.
+    // Each 256-column block lies in one of Wq, Wk, Wv.
     _gl_B gb = g.b;
     int bcol = col;
     if constexpr (has_three_b<Globals>) {
         if (col >= g.qk_blocks)     { gb = g.b_v; bcol = col - g.qk_blocks; }
         else if (col >= g.q_blocks) { gb = g.b_k; bcol = col - g.q_blocks; }
     }
-    // B half-tile indices (units of HALF_BLOCK_SIZE rows) for this block's two 128-column halves, and the
-    // K-tile offset of half 1 (non-zero only for split_rope_pairs, whose half 1 is the view's second K columns).
+    // B half-tile row indices (units of 128) and half 1's K-tile offset (split_rope_pairs only).
     const int b_half0 = splits_gate_up<Epilogue>() || splits_rope_pairs<Epilogue>() ? bcol : bcol * 2;
     const int b_half1 = splits_gate_up<Epilogue>()   ? N / BLOCK_SIZE + bcol
                       : splits_rope_pairs<Epilogue>() ? bcol
@@ -116,7 +105,6 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     const bf16* b_base = (bf16*)&gb[{0, 0, 0, 0}];
     const int a_row_stride = g.a.template stride<2>() * sizeof(bf16);
     const int b_row_stride = gb.template stride<2>() * sizeof(bf16);
-    // Buffer-resource sizes are 32-bit (launch() rejects any operand of 4 GiB or more); unsigned math, no int overflow.
     i32x4 a_srsrc_base = make_srsrc(a_base, uint32_t(M) * uint32_t(a_row_stride), a_row_stride);
     i32x4 b_srsrc_base = make_srsrc(b_base, uint32_t(gb.rows()) * uint32_t(b_row_stride), b_row_stride);
 
@@ -347,8 +335,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     Epilogue::apply(g, C_accum, row, col, warp_row, warp_col);
 }
 
-// Check shapes, then launch gemm_kernel<Epilogue>. a = [M,K], b = [N,K], c = [M,N]
-// (or [M, Epilogue::out_cols(N)] for epilogues that narrow the output).
+// a = [M,K], b = [N,K], c = [M, out_cols(N)] (default N).
 template<typename Epilogue, typename Globals>
 void launch(Globals g, hipStream_t stream = 0) {
     constexpr bool three_b = has_three_b<Globals>;
@@ -371,14 +358,13 @@ void launch(Globals g, hipStream_t stream = 0) {
         g.q_blocks = g.b.rows() / BLOCK_SIZE;
         g.qk_blocks = g.q_blocks + g.b_k.rows() / BLOCK_SIZE;
     }
-    if constexpr (requires { g.c; }) {                  // partials-only epilogues have no c
-        int out_cols = N;                               // dim-reducing epilogues narrow the output
+    if constexpr (requires { g.c; }) {                  // partialrms has no c
+        int out_cols = N;
         if constexpr (requires { Epilogue::out_cols(N); }) out_cols = Epilogue::out_cols(N);
         if (g.c.rows() != M || g.c.cols() != out_cols)
             throw std::runtime_error("GEMM: output shape mismatch (need c=[M, out_cols(N)])");
     }
-    // The kernel addresses A and B through buffer resources with 32-bit sizes and offsets: an operand of 4 GiB or
-    // more would wrap, and loads past the wrapped size return 0. Refuse it (b before the RoPE view: same bytes).
+    // Buffer resources use 32-bit sizes: larger operands would wrap and read 0.
     auto fits = [](const auto& t) { return size_t(t.rows()) * size_t(t.cols()) * sizeof(bf16) <= size_t(UINT32_MAX); };
     bool small = fits(g.a) && fits(g.b);
     if constexpr (three_b) small = small && fits(g.b_k) && fits(g.b_v);
@@ -388,7 +374,7 @@ void launch(Globals g, hipStream_t stream = 0) {
     const size_t mem = MAX_SHARED_MEMORY;
     hip_check(hipFuncSetAttribute((void*)gemm_kernel<Epilogue, Globals>, hipFuncAttributeMaxDynamicSharedMemorySize, mem),
               "hipFuncSetAttribute");
-    if constexpr (splits_rope_pairs<Epilogue>()) {      // same memory as b = [N, K]; see split_rope_pairs
+    if constexpr (splits_rope_pairs<Epilogue>()) {      // view b as [N/2, 2K]
         g.b = decltype(g.b)(g.b.raw_ptr, 1, 1, g.b.rows() / 2, 2 * K);
         if constexpr (three_b) {
             g.b_k = decltype(g.b_k)(g.b_k.raw_ptr, 1, 1, g.b_k.rows() / 2, 2 * K);

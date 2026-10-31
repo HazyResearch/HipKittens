@@ -4,10 +4,8 @@
 #include <stdexcept>
 #include <string>
 
-// Argument checks shared by the RoPE bindings (rope, rmsnorm_rope, rmsnorm_rope_qkv). n is the output width; the
-// head dim Dh must divide every part in `parts` (N for one weight; Nq and Nkv for QKV) so each head starts at
-// table column 0. The epilogue reads [cos, sin] as one bf16x2 word and stores rotated pairs as bf16x2, so the
-// table and the output must be 4-byte aligned.
+// Shared RoPE checks. Dh must divide each of `parts` so every head starts at table column 0.
+// cos_sin and c need 4-byte alignment: both are accessed as bf16x2.
 template<typename Globals>
 void check_rope_args(const char* name, const Globals& g, int n, std::initializer_list<int> parts) {
     const std::string who(name);

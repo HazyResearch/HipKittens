@@ -2,13 +2,11 @@
 #include "pyutils/pyutils.cuh"
 #include "checked_bind.cuh"
 
-// The noop GEMM over Q, K and V as ONE launch with three separate weights (no concatenated copy): output block
-// columns [0, q_blocks) read Wq, [q_blocks, qk_blocks) read Wk, the rest Wv (gemm_kernel picks the B tensor per
-// block). Used by the fusion-only control, so its QKV stage runs the same three-weight GEMM as hk.qkv.
+// One-launch QKV GEMM over three unconcatenated weights (fusion-only control for hk.qkv).
 struct NoopQkvGlobals {
     _gl_A a; _gl_B b; _gl_C c;          // b = Wq [Nq, K], c = [M, Nq + 2 Nkv]
     _gl_B b_k, b_v;                     // Wk, Wv [Nkv, K]
-    int q_blocks, qk_blocks;            // 256-column block boundaries, set by launch()
+    int q_blocks, qk_blocks;            // set by launch()
 };
 
 void dispatch(NoopQkvGlobals g, hipStream_t stream) {

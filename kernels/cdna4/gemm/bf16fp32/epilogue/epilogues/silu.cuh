@@ -2,7 +2,7 @@
 #include "base.cuh"
 #include "activations.cuh"
 
-// out = silu(A @ B^T). No extra inputs, so it uses gemm_args_base.
+// out = silu(A @ B^T)
 struct SiluEpilogue {
     template<typename Globals, typename Accum>
     static __device__ inline void apply(const Globals& g, Accum& C, int row, int col, int wr, int wc) {

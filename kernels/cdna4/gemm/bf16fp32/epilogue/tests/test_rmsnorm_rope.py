@@ -1,6 +1,4 @@
-"""tk_rmsnorm_rope: c = RoPE(r[:, None] * (a @ b.T)), interleaved pairs, natural column order (bf16),
-r = [M] fp32. Same store and rule as tk_rope (assert_rope_close). Here the rule's fp32 term matters: x and y
-are r-scaled, so x*cos and y*sin carry fp32 rounding that is all that is left when they nearly cancel."""
+"""tk_rmsnorm_rope: c = RoPE(r[:, None] * (a @ b.T)) (bf16), r fp32 [M]. Bound: assert_rope_close."""
 import pytest
 import torch
 
@@ -20,10 +18,10 @@ def run(a, b, r, cos_sin, gamma):
 
 
 def folded(b, gamma):
-    return (b.float() * gamma.float()[None, :]).to(torch.bfloat16)   # gamma scales b's K axis
+    return (b.float() * gamma.float()[None, :]).to(torch.bfloat16)   # gamma over K
 
 
-@pytest.mark.parametrize("dh", ["N", 128])                # one head spanning N, or 128-wide heads sharing a table
+@pytest.mark.parametrize("dh", ["N", 128])                # one head, or 128-wide heads
 @pytest.mark.parametrize("kind", ["random", "large"])
 @pytest.mark.parametrize("M,N,K", SHAPES)
 def test_shapes(M, N, K, kind, dh):
@@ -39,7 +37,7 @@ def test_zeros():
 
 
 def test_known_answer():
-    # b = I, r = 0.5, 90-degree rotation: out[2k] = 0.5 * a[2k+1], out[2k+1] = -0.5 * a[2k]. Exact.
+    # b = I, r = 0.5, 90-degree rotation: exact.
     a = ((torch.arange(256, device=DEV) % 7) - 3).float().repeat(512, 1).to(torch.bfloat16)
     eye = torch.eye(256, dtype=torch.bfloat16, device=DEV)
     cs = torch.zeros(512, 256, device=DEV)
@@ -67,5 +65,5 @@ def test_rejects_wrong_dtype():
 def test_rejects_misaligned_output():
     a, b = inputs(256, 256, 128, "random")
     misaligned = torch.empty(256 * 256 + 1, dtype=torch.bfloat16, device=DEV)[1:].view(256, 256)
-    with pytest.raises(RuntimeError, match="4-byte alignment"):     # hk always allocates aligned output
+    with pytest.raises(RuntimeError, match="4-byte alignment"):     # raw module only
         module("rmsnorm_rope").dispatch(a, b, misaligned, r_like(256), cos_sin_table(256, 256), 256, stream())

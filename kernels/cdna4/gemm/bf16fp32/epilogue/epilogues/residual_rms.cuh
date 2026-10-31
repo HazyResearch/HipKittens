@@ -3,12 +3,11 @@
 #include "base.cuh"
 #include "reductions.cuh"
 
-// h = (A @ B^T) + residual; stores h (bf16 [M, N], the next residual stream) and per-row partial sums
-// of squares of h (fp32, before rounding to bf16), which rms_reduce turns into r = 1/rms(h).
+// h = (A @ B^T) + residual; stores h and per-row partial sums of squares of fp32 h (pre-rounding).
 struct ResidualRMSGlobals {
     _gl_A a; _gl_B b; _gl_C c;
     gl<bf16, -1, -1, -1, -1> residual;    // [M, N] bf16
-    gl<float, -1, -1, -1, -1> partials;   // [N/64, M] fp32; as a 4-D gl: [1, 1, N/64, M] (row on the last axis)
+    gl<float, -1, -1, -1, -1> partials;   // [N/64, M] fp32
 };
 struct ResidualRMSEpilogue {
     template<typename Globals, typename Accum>

@@ -1,7 +1,5 @@
-"""hk.qkv: one "rmsnorm_rope" GEMM over three separate weights Wq, Wk, Wv (no concatenated copy), rotating only the
-Q and K columns, with one head's [M, Dh] cos/sin table. Q and K must equal the separate "rmsnorm_rope" calls bitwise
-(same GEMM per column, same epilogue arithmetic). V must be within one bf16 step of the "rmsnorm" call: identical
-fp32 values, but this store rounds to nearest and that one truncates."""
+"""hk.qkv: Q and K equal separate "rmsnorm_rope" calls bitwise; V is within one bf16 step of "rmsnorm" (round to
+nearest vs truncation)."""
 import pytest
 import torch
 
@@ -16,7 +14,7 @@ MODULES = ("rmsnorm_rope_qkv", "rmsnorm_rope", "rmsnorm_scale")
 
 
 def weights(K, Nq, Nkv):
-    """[N, K] bf16 Wq, Wk, Wv with exact products (conftest inputs)."""
+    """bf16 Wq, Wk, Wv."""
     return [inputs(256, N, K, "random", seed=s)[1] for s, N in ((1, Nq), (2, Nkv), (3, Nkv))]
 
 
@@ -31,8 +29,8 @@ def assert_matches_separate_calls(a, wq, wk, wv, r, cs, q, k, v):
 @pytest.mark.parametrize("M,Nq,Nkv,K,Dh", [
     (256, 512, 256, 128, 128),
     (2048, 4096, 1024, 4096, 128),
-    (256, 256, 256, 128, 128),            # Nq == Nkv (MHA): the Q / K block boundary is one block in
-    (512, 2048, 512, 2048, 64),           # Dh = 64 (Llama-3.2-1B): heads restart every 32 pairs
+    (256, 256, 256, 128, 128),            # Nq == Nkv (MHA)
+    (512, 2048, 512, 2048, 64),           # Dh = 64
 ])
 def test_matches_separate_calls(M, Nq, Nkv, K, Dh):
     for name in MODULES:
@@ -44,8 +42,7 @@ def test_matches_separate_calls(M, Nq, Nkv, K, Dh):
 
 
 def test_side_stream():
-    """Input written on stream s, then qkv (one launch and three copies) on s with no sync in between: all four
-    must run on s."""
+    """qkv (launch and copies) runs on the current side stream."""
     for name in MODULES:
         module(name)
     a0, _ = inputs(4096, 256, 4096, "random")
@@ -54,14 +51,14 @@ def test_side_stream():
     torch.cuda.synchronize()
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
-        a = a0 * 1                                               # written on s
+        a = a0 * 1
         q, k, v = hk.qkv(a, wq, wk, wv, r=r, cos_sin=cs)
     s.synchronize()
     assert_matches_separate_calls(a0, wq, wk, wv, r, cs, q, k, v)
 
 
 def test_graph_capture():
-    """qkv is captured into a graph and replays correctly on new inputs."""
+    """qkv captures into a graph and replays on new inputs."""
     for name in MODULES:
         module(name)
     a1, _ = inputs(256, 256, 128, "random", seed=1)
@@ -69,7 +66,7 @@ def test_graph_capture():
     wq, wk, wv = weights(128, 512, 256)
     r, cs = r_like(256), cos_sin_table(256, 128)
     static_a = a1.clone()
-    hk.qkv(static_a, wq, wk, wv, r=r, cos_sin=cs)                 # warm-up (loads the module's code object)
+    hk.qkv(static_a, wq, wk, wv, r=r, cos_sin=cs)                 # warm-up
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -81,8 +78,7 @@ def test_graph_capture():
 
 
 def test_chain_gamma_into_qkv():
-    """The layer's attention input: the previous down GEMM, residual_rms(gamma=g), writes hg = h * g; qkv multiplies
-    hg by the PLAIN weights and applies r. Must match RoPE(rmsnorm(h, g) @ W.t()) from h, g and an fp64 r."""
+    """residual_rms(gamma=g) -> qkv matches RoPE(rmsnorm(h, g) @ W.t()) (fp64 r), normwise 1e-2."""
     module("residual_rms_gamma"), module("rms_reduce"), module("rmsnorm_rope_qkv")
     a, b = inputs(256, 256, 128, "random")
     res = residual_like(256, 256, 1.0)
@@ -103,12 +99,12 @@ def test_chain_gamma_into_qkv():
 def test_rejects_mismatched_kv():
     wq, wk, _ = weights(128, 512, 256)
     a, _ = inputs(256, 256, 128, "random")
-    with pytest.raises(ValueError, match="wv"):                     # V must match K's shape
+    with pytest.raises(ValueError, match="wv"):                     # V shape != K shape
         hk.qkv(a, wq, wk, weights(128, 512, 512)[1], r=r_like(256), cos_sin=cos_sin_table(256, 128))
 
 
 def test_rejects_unaligned_split():
-    # Nq + 2 * Nkv = 512 would be a valid N as one weight, but each part must hold whole 256-column blocks
+    # each part must be whole 256-column blocks
     a, _ = inputs(256, 256, 128, "random")
     wq = torch.zeros(384, 128, dtype=torch.bfloat16, device=DEV)
     wkv = torch.zeros(64, 128, dtype=torch.bfloat16, device=DEV)
@@ -117,7 +113,7 @@ def test_rejects_unaligned_split():
 
 
 def test_rejects_head_dim_not_dividing_split():
-    # Nq + 2 * Nkv = 1024 is a multiple of Dh = 512, but Nkv = 256 is not: K's heads would start mid-table
+    # Dh must divide Nkv too
     a, _ = inputs(256, 256, 128, "random")
     wq, wk, wv = weights(128, 512, 256)
     with pytest.raises(ValueError, match="must be even and divide Nq"):

@@ -1,23 +1,19 @@
-"""hk: Python API over the compiled GEMM-epilogue kernels (the tk_<name> modules).
+"""hk: Python API over the tk_<name> GEMM-epilogue kernels.
 
-Weights are plain [N, K] bf16 tensors, the layout of nn.Linear.weight, read as they are: there is no weight
-preparation. An RMSNorm is split across two GEMMs: the PRODUCER of its input (a residual_rms GEMM) also writes
-x * gamma and the per-row partial sums that give r = 1 / rms(x); the CONSUMER multiplies x * gamma by its weight and
-applies r in its epilogue. So rmsnorm(x, gamma) @ W.t() == r * ((x * gamma) @ W.t()).
+Weights are plain [N, K] bf16 (nn.Linear.weight layout). An RMSNorm is split across two GEMMs: the producer
+writes x * gamma and r = 1 / rms(x); the consumer applies r: rmsnorm(x, gamma) @ W.t() == r * ((x * gamma) @ W.t()).
 
     h, hg, r = hk.residual_rms(o, Wo, x, gamma=g_mlp)    # h = o @ Wo.t() + x, hg = h * g_mlp, r = 1 / rms(h)
     y  = hk.matmul(hg, Wgu, epilogue="rmsnorm_swiglu", r=r)
-    v  = hk.matmul(xg, Wv, epilogue="rmsnorm", r=r)                    # xg = x * gamma, from its producer
+    v  = hk.matmul(xg, Wv, epilogue="rmsnorm", r=r)                    # xg = x * gamma
     q  = hk.matmul(xg, Wq, epilogue="rmsnorm_rope", r=r, cos_sin=cs)   # cs: one head's [M, Dh]
-    q, k, v = hk.qkv(xg, Wq, Wk, Wv, r=r, cos_sin=cs)    # one GEMM launch over the three weights; V is not rotated
+    q, k, v = hk.qkv(xg, Wq, Wk, Wv, r=r, cos_sin=cs)    # one launch; V not rotated
     r  = hk.inv_rms(x, W2)                               # [M] fp32 = 1 / rms(x @ W2.t())
     h, _, r = hk.residual_rms(x, Wo, residual)           # without gamma: hg is None
     hk.available()                                       # {epilogue: [argument names]}
 
-Every call launches on torch.cuda.current_stream() of the inputs' GPU and does not synchronize. Inputs are never
-converted: a wrong dtype, shape or device raises ValueError (a wrong argument name, TypeError). A scalar `alpha` may
-be a Python number. Shapes: M and N multiples of 256, K a multiple of 128. The tk_<name> modules must be built
-(make KERNEL=<name>) and importable; they are internal (they do not select the GPU), so call them through hk.
+Calls launch on the inputs' GPU current stream without syncing. Bad dtype/shape/device: ValueError; bad argument
+name: TypeError. `alpha` may be a Python number. M, N % 256 == 0, K % 128 == 0. Build with make KERNEL=<name>.
 """
 import importlib
 from dataclasses import dataclass
@@ -33,7 +29,7 @@ class _Spec:
     module: str
     args: tuple = ()             # ((name, kind), ...); kind: scalar | row | col | tile | rope
     half_width: bool = False
-    unit_gamma: bool = False     # the kernel takes an output-column gamma; pass ones (gamma came with the input)
+    unit_gamma: bool = False     # pass ones as the kernel's out_gamma
 
 
 _EPILOGUES = {
@@ -53,9 +49,7 @@ _ONES = {}
 
 
 def _ones(n, device):
-    """bf16 ones [n] on device, made once. Not cached while a CUDA graph is capturing: a tensor made during
-    capture is only filled when the graph replays. The first eager fill is synchronized so a later call on
-    another stream cannot read it early."""
+    """Cached bf16 ones [n]. Not cached during graph capture (filled only on replay); first fill is synced."""
     key = (n, device)
     if key not in _ONES:
         t = torch.ones(n, dtype=BF16, device=device)
@@ -72,8 +66,7 @@ def available():
 
 
 def _require(t, name, dtype, shape, device=None):
-    """Raise unless t is a contiguous GPU tensor of `dtype` and `shape` (None matches any extent),
-    on `device` when given."""
+    """Raise unless t is a contiguous GPU `dtype` tensor of `shape` (None = any) on `device`."""
     if not isinstance(t, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor, got {type(t).__name__}")
     shape_ok = t.dim() == len(shape) and all(s is None or s == d for s, d in zip(shape, t.shape))
@@ -87,7 +80,7 @@ def _require(t, name, dtype, shape, device=None):
 
 
 def _weight(x, w, name="w"):
-    """Check x [M, K] and the weight w [N, K] (bf16, contiguous, M and N % 256 == 0, K % 128 == 0); return (M, N, K)."""
+    """Check x [M, K] and w [N, K]; return (M, N, K)."""
     _require(w, name, BF16, (None, None))
     N, K = w.shape
     if K % 128 or N % 256:
@@ -105,13 +98,13 @@ def _argument(name, kind, value, M, N, device):
             return torch.full((1,), float(value), dtype=FP32, device=device)
         _require(value, name, FP32, (1,), device)
         return value
-    if kind == "rope":                                    # one head's natural interleaved table, shared by heads
+    if kind == "rope":                                    # one head's [M, Dh] table
         _require(value, name, BF16, (M, None), device)
         dh = value.shape[1]
         if dh == 0 or dh % 2 or N % dh:
             raise ValueError(f"{name} must be one head's [M, Dh] table with Dh even and N % Dh == 0, got "
                              f"{tuple(value.shape)} for N={N}")
-        if value.data_ptr() % 4:                          # the kernel reads [cos, sin] as one bf16x2 word
+        if value.data_ptr() % 4:                          # read as bf16x2
             raise ValueError(f"{name} must start at a 4-byte aligned address")
         return value
     dtype, shape = {"row": (FP32, (M,)), "col": (BF16, (N,)), "tile": (BF16, (M, N))}[kind]
@@ -120,13 +113,11 @@ def _argument(name, kind, value, M, N, device):
 
 
 def matmul(x, w, epilogue=None, **args):
-    """GEMM x @ w.t() with a fused epilogue; returns a new bf16 output ([M, N], or [M, N/2] for swiglu variants).
+    """x @ w.t() with a fused epilogue; returns bf16 [M, N] ([M, N/2] for swiglu variants).
 
-    x: bf16 [M, K]. For "rmsnorm", "rmsnorm_swiglu" and "rmsnorm_rope" (and hk.qkv), x is the RMSNorm input
-    already multiplied by its gamma, as hk.residual_rms(..., gamma=g) writes it: an unscaled x silently gives an
-    RMSNorm without gamma, which hk cannot detect. "rmsnorm_scale" instead normalizes the GEMM's OUTPUT: pass the raw
-    x, r = hk.inv_rms(x, w) and out_gamma, the norm's weight over the N output columns. w: bf16 [N, K]. args: the
-    epilogue's inputs by name (see hk.available()). Launches on torch.cuda.current_stream()."""
+    x: bf16 [M, K], w: bf16 [N, K]. For "rmsnorm*" except "rmsnorm_scale", x must already be times gamma (an
+    unscaled x silently drops gamma). "rmsnorm_scale" normalizes the output: raw x, r = hk.inv_rms(x, w), out_gamma [N].
+    args: the epilogue's inputs (hk.available())."""
     name = "noop" if epilogue is None else epilogue
     spec = _EPILOGUES.get(name)
     if spec is None:
@@ -137,9 +128,9 @@ def matmul(x, w, epilogue=None, **args):
     M, N, K = _weight(x, w)
     values = [_argument(a, kind, args[a], M, N, x.device) for a, kind in spec.args]
     if any(kind == "rope" for _, kind in spec.args):
-        values.append(N)                                  # rotate every column
+        values.append(N)                                  # rope_cols
     out = torch.empty(M, N // 2 if spec.half_width else N, dtype=BF16, device=x.device)
-    with torch.cuda.device(x.device):                     # launch on x's GPU, on its current stream
+    with torch.cuda.device(x.device):                     # x's GPU, current stream
         stream = torch.cuda.current_stream(x.device).cuda_stream
         if spec.unit_gamma:
             values.append(_ones(N, x.device))
@@ -148,12 +139,11 @@ def matmul(x, w, epilogue=None, **args):
 
 
 def inv_rms(x, w):
-    """r = 1 / rms(x @ w.t()) per row, fp32 [M] (eps 1e-5), via partialrms + rms_reduce. Does not return
-    x @ w.t() itself."""
+    """r = 1 / rms(x @ w.t()) per row, fp32 [M], eps 1e-5."""
     M, N, K = _weight(x, w)
     partials = torch.empty(N // 64, M, dtype=FP32, device=x.device)
     r = torch.empty(M, dtype=FP32, device=x.device)
-    with torch.cuda.device(x.device):                     # launch on x's GPU, on its current stream
+    with torch.cuda.device(x.device):                     # x's GPU, current stream
         stream = torch.cuda.current_stream(x.device).cuda_stream
         importlib.import_module("tk_partialrms").dispatch(x, w, partials, stream)
         importlib.import_module("tk_rms_reduce").dispatch(partials, r, stream)
@@ -161,18 +151,16 @@ def inv_rms(x, w):
 
 
 class ResidualRMS(NamedTuple):
-    """hk.residual_rms's result: one fixed layout, so out[1] is always hg and out.r always r."""
-    h: torch.Tensor                 # bf16 [M, N], the next residual stream
-    hg: Optional[torch.Tensor]      # bf16 [M, N] h * gamma when gamma is given, else None
+    """(h, hg, r); hg is None without gamma."""
+    h: torch.Tensor                 # bf16 [M, N]
+    hg: Optional[torch.Tensor]      # bf16 [M, N] h * gamma, or None
     r: torch.Tensor                 # fp32 [M], 1 / rms(h)
 
 
 def residual_rms(x, w, residual, gamma=None):
-    """h = x @ w.t() + residual (bf16 [M, N], the next residual stream) and r = 1 / rms(h) per row (fp32 [M],
-    eps 1e-5, from h before its bf16 rounding), via one GEMM + rms_reduce. Returns ResidualRMS(h, hg, r).
+    """h = x @ w.t() + residual (bf16 [M, N]), r = 1 / rms(h) (fp32 [M], eps 1e-5, from fp32 h).
 
-    With gamma (bf16 [N], the gain of the RMSNorm that h feeds), the same GEMM also writes hg = h * gamma, the
-    input of the consuming GEMM; without it hg is None. r is always computed from h, not hg."""
+    With gamma (bf16 [N]) also writes hg = h * gamma, else hg is None."""
     M, N, K = _weight(x, w)
     _require(residual, "residual", BF16, (M, N), x.device)
     if gamma is not None:
@@ -180,7 +168,7 @@ def residual_rms(x, w, residual, gamma=None):
     h = torch.empty(M, N, dtype=BF16, device=x.device)
     partials = torch.empty(N // 64, M, dtype=FP32, device=x.device)
     r = torch.empty(M, dtype=FP32, device=x.device)
-    with torch.cuda.device(x.device):                     # launch on x's GPU, on its current stream
+    with torch.cuda.device(x.device):                     # x's GPU, current stream
         stream = torch.cuda.current_stream(x.device).cuda_stream
         if gamma is None:
             importlib.import_module("tk_residual_rms").dispatch(x, w, h, residual, partials, stream)
@@ -192,12 +180,11 @@ def residual_rms(x, w, residual, gamma=None):
 
 
 def qkv(x, wq, wk, wv, r, cos_sin):
-    """q, k, v = RoPE(r * (x @ wq.t())), RoPE(r * (x @ wk.t())), r * (x @ wv.t()) as ONE GEMM launch that reads the
-    three weights where they are (no concatenated copy), rotating only the Q and K columns; then q, k and v are
-    copied out as contiguous bf16 [M, Nq], [M, Nkv], [M, Nkv] (attention takes contiguous inputs). x is the
-    attention RMSNorm's input times its gamma; wq [Nq, K], wk and wv [Nkv, K]; cos_sin one head's natural [M, Dh]
-    table; r = 1 / rms(x) fp32 [M]. q and k equal separate "rmsnorm_rope" calls bitwise; v is within one bf16 step
-    of the "rmsnorm" call (this store rounds to nearest, that one truncates)."""
+    """q, k, v = RoPE(r * x @ wq.t()), RoPE(r * x @ wk.t()), r * x @ wv.t() in one GEMM launch.
+
+    x: input times gamma; wq [Nq, K], wk/wv [Nkv, K]; cos_sin one head's [M, Dh]; r fp32 [M]. Returns contiguous
+    bf16 [M, Nq], [M, Nkv], [M, Nkv]. q, k match "rmsnorm_rope" bitwise; v is within one bf16 step of "rmsnorm"
+    (rounds to nearest; that one truncates)."""
     M, nq, K = _weight(x, wq, "wq")
     _, nkv, _ = _weight(x, wk, "wk")
     _require(wv, "wv", BF16, (nkv, K), x.device)
@@ -207,10 +194,10 @@ def qkv(x, wq, wk, wv, r, cos_sin):
     if dh == 0 or dh % 2 or nq % dh or nkv % dh:
         raise ValueError(f"cos_sin's head dim {dh} must be even and divide Nq={nq} and Nkv={nkv}, so every "
                          f"Q and K head starts at table column 0")
-    if cos_sin.data_ptr() % 4:                            # the kernel reads [cos, sin] as one bf16x2 word
+    if cos_sin.data_ptr() % 4:                            # read as bf16x2
         raise ValueError("cos_sin must start at a 4-byte aligned address")
     out = torch.empty(M, nq + 2 * nkv, dtype=BF16, device=x.device)
-    with torch.cuda.device(x.device):                     # launch on x's GPU, on its current stream
+    with torch.cuda.device(x.device):                     # x's GPU, current stream
         stream = torch.cuda.current_stream(x.device).cuda_stream
         importlib.import_module("tk_rmsnorm_rope_qkv").dispatch(x, wq, out, r, cos_sin, nq + nkv, wk, wv, stream)
     return out[:, :nq].contiguous(), out[:, nq:nq + nkv].contiguous(), out[:, nq + nkv:].contiguous()

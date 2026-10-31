@@ -1,18 +1,10 @@
-"""Each fused epilogue against PyTorch eager and torch.compile, on the layer GEMM where it belongs.
+"""Each fused epilogue vs PyTorch eager and torch.compile on its layer GEMMs (cold cache); see README.md.
 
-Arms (all cold cache):
-  HK           one fused HipKittens call (hk.matmul, hk.inv_rms or hk.residual_rms)
-  eager        torch.matmul(x, W.t()) (hipBLASLt) plus the epilogue as lean bf16 eager torch
-  compile      the same eager function under torch.compile (common.COMPILE); Dynamo is reset per row so every
-               row compiles fresh instead of hitting the recompile limit and silently running eager
-  fusion-only  HK noop GEMM plus the same eager torch: the same GEMM as HK, so the ratio isolates fusion
-HBM saved: one analytical formula per epilogue (saved= in make_case): the bytes of every [M, N] / [M, K]
-intermediate the eager code writes and reads back, minus HK's own fp32 partial sums and, for rmsnorm*, the producer's
-extra x * gamma store. It ignores cache, so
-it is an upper bound. Every row is checked against fp32 torch (HK and eager outputs) before timing; a
-failing row is not timed, and the script then exits 1.
+Arms: HK (one fused call), eager (hipBLASLt + bf16 torch), compile (eager under torch.compile, Dynamo reset per
+row), fusion-only (HK noop GEMM + eager torch). HBM saved is an analytical upper bound (saved= in make_case).
+Rows are checked against fp32 torch before timing; failing rows are not timed and the script exits 1.
 
-Build first, in the epilogue directory: make KERNEL=<m> for every m in MODULES.
+Build: make KERNEL=<m> for every m in MODULES.
 """
 import torch
 import torch._dynamo
@@ -24,7 +16,7 @@ import hk
 MODULES = ["noop", "silu", "scale", "residual_add", "rmsnorm_scale", "swiglu", "rmsnorm_swiglu",
            "rope", "rmsnorm_rope", "partialrms", "residual_rms_gamma", "rms_reduce"]
 
-# epilogue -> the layer GEMMs it runs on
+# epilogue -> layer GEMMs
 PLACEMENT = {
     "noop": ["Wq", "Wk", "Wo", "Wgu", "Wd"],
     "rope": ["Wq", "Wk"], "rmsnorm_rope": ["Wq", "Wk"],
@@ -35,49 +27,43 @@ PLACEMENT = {
 
 
 def rms_scale(t, r, g):
-    """Eager per-row and per-column scale with a given inverse RMS r (fp32 [M]) and gain g (bf16): t * r * g."""
+    """t * r[:, None] * g in bf16."""
     return t * r.to(common.BF16)[:, None] * g
 
 
 def row_scale(t, r):
-    """Eager input RMSNorm with r given on an input that already carries the gain: t * r in bf16."""
+    """t * r[:, None] in bf16."""
     return t * r.to(common.BF16)[:, None]
 
 
 def swiglu(D):
-    """silu(gate) * up, with D = [gate | up] along columns."""
+    """silu(gate) * up, D = [gate | up]."""
     n = D.shape[1] // 2
     return F.silu(D[:, :n]) * D[:, n:]
 
 
 def inv_rms_eager(D):
-    """fp32 [M] 1 / rms per row with one bf16 read of D."""
+    """fp32 [M] 1 / rms per row, one read of D."""
     return torch.rsqrt(torch.linalg.vector_norm(D, dim=-1, dtype=torch.float32).square() / D.shape[1] + common.EPS)
 
 
 def make_case(name, M, K, N, Dh):
-    """One epilogue at [M, K] x [N, K].t(). Every arm reads the same plain weight W [N, K] (nn.Linear layout):
-    eager = post(torch.matmul(pre(x), W.t())); fusion-only = post(hk noop(...)) on HK's inputs; ref() is fp32.
-    Input-RMSNorm rows: HK reads x * gamma as its producer (residual_rms with gamma) writes it, plus r, both
-    untimed here; eager and compile apply x * r * gamma per call (rms_scale); fusion-only scales HK's x * gamma by
-    r eagerly. residual_rms is the producer form: it also writes h * gamma. saved = HBM bytes HK avoids: every
-    [M, N] / [M, K] intermediate the eager code writes and reads back (bf16, write + read), minus HK's own fp32
-    partial-sum round trip and, for input-RMSNorm rows, the producer's x * gamma store. Vector-sized tensors are
-    ignored. The README lists the same formulas."""
+    """One epilogue at [M, K] x [N, K].t(): eager = post(torch.matmul(pre(x), W.t())), ref() in fp32.
+    Input-RMSNorm rows give HK untimed x * gamma and r; eager applies x * r * gamma per call. saved: see README."""
     x, W = common.activation(M, K), common.weight(K, N)
     f = lambda t: t.float()
     xw = lambda: f(x) @ f(W).t()
     ident = lambda t: t
-    MN, MK = M * N * 2, M * K * 2                 # bf16 bytes of an [M, N] / [M, K] tensor
-    partials = 2 * (N // 64) * M * 4              # HK's fp32 partial sums, written then read by rms_reduce
+    MN, MK = M * N * 2, M * K * 2                 # bf16 bytes
+    partials = 2 * (N // 64) * M * 4              # HK's fp32 partials, write + read
 
     def case(hk_fn, pre, post, ref, saved, tol=(common.STAGE_TOL,), fusion=None):
-        """fusion: the fusion-only control when it differs from post(hk noop(pre(x)))."""
+        """fusion: override for post(hk noop(pre(x)))."""
         fusion = fusion or (lambda: post(hk.matmul(pre(x), W)))
         return dict(x=x, W=W, hk=hk_fn, pre=pre, post=post, ref=ref, saved=saved, tol=list(tol), fusion=fusion)
 
     def scaled(g):
-        """HK's input for an input-RMSNorm row: x * gamma, as the producer writes it (fp32 product, one rounding)."""
+        """x * gamma as the producer writes it."""
         return (f(x) * f(g)[None, :]).to(common.BF16)
 
     if name == "noop":
@@ -110,9 +96,8 @@ def make_case(name, M, K, N, Dh):
                     lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W).t()), saved=3 * MK + 3 * MN,
                     fusion=lambda: swiglu(hk.matmul(row_scale(xg, r), W)))
     if name in ("rope", "rmsnorm_rope"):          # D, six half-width products and sums
-        head = common.rope_table(M, Dh)                            # one head's table [M, Dh]: every arm's operand
-        cs = head.repeat(1, N // Dh)                              # tiled across heads, for the fp32 references only
-        # Timed arms broadcast one head's table over the heads, as HK reads it (and as bench_layer does).
+        head = common.rope_table(M, Dh)                            # [M, Dh], one head
+        cs = head.repeat(1, N // Dh)                              # fp32 references only
         post = lambda D: common.rope(D.view(M, N // Dh, Dh), head.view(M, 1, Dh)).reshape(M, N)
         if name == "rope":
             return case(lambda: hk.matmul(x, W, "rope", cos_sin=head), ident, post,
@@ -125,7 +110,7 @@ def make_case(name, M, K, N, Dh):
     if name == "inv_rms":                         # D
         return case(lambda: hk.inv_rms(x, W), ident, inv_rms_eager, lambda: common.inv_rms(xw()),
                     saved=2 * MN - partials, tol=(common.VECTOR_TOL,))
-    if name == "residual_rms":                    # D, second read of h, third read of h (for h * g)
+    if name == "residual_rms":                    # D, second and third reads of h
         res, g = common.activation(M, N), common.gamma(N)
 
         def post(D):
@@ -153,7 +138,7 @@ def run_row(name, gemm, M, K, N, Dh, timer):
     comp = lambda: compiled(x, W)
     fusion = c["fusion"]
     want = c["ref"]()
-    arms = dict(hk=hk_fn, eager=eager, compile=comp, fusion=fusion)   # compile's first call compiles + autotunes
+    arms = dict(hk=hk_fn, eager=eager, compile=comp, fusion=fusion)   # first compile call autotunes
     checks = {arm: common.check(fn(), want, common.control_tols(c["tol"]) if arm == "fusion" else c["tol"])
               for arm, fn in arms.items()}
     failed = [arm for arm, (ok, _) in checks.items() if not ok]

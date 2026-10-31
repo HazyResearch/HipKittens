@@ -1,31 +1,29 @@
 # Epilogue benchmarks (gfx950)
 
-Benchmarks for the fused GEMM-epilogue kernels in this directory, against PyTorch eager and
-`torch.compile`. Every script checks its outputs against an fp32 PyTorch reference before timing,
-prints a table, and exits non-zero if any row fails.
+Fused GEMM-epilogue kernels vs PyTorch eager and `torch.compile`. Each script checks outputs against an
+fp32 PyTorch reference before timing, prints a table, and exits non-zero if any row fails.
 
 | Script | Question |
 |---|---|
-| `ab_noop_vs_base.py` | Does the epilogue chassis (`tk_noop`) cost anything versus upstream's original GEMM? |
-| `bench_epilogues.py` | How much time and HBM traffic does each fused epilogue save versus eager PyTorch and `torch.compile`? |
-| `bench_layer.py --phases` | Per phase of one forward layer: HK vs eager vs `torch.compile`, plus a fusion-only control per GEMM phase. |
+| `ab_noop_vs_base.py` | Does `tk_noop` cost anything versus the upstream base GEMM? |
+| `bench_epilogues.py` | Time and HBM traffic each fused epilogue saves versus eager and `torch.compile`. |
+| `bench_layer.py --phases` | Per layer phase: HK vs eager vs `torch.compile`, plus a fusion-only control per GEMM phase. |
 | `bench_layer.py --full` | The whole layer: HK vs eager vs `torch.compile`. |
 
 ## Build
 
-From this directory's parent (the epilogue directory). Building needs a ROCm `hipcc` that targets gfx950
-but no GPU; running needs a gfx950 GPU and PyTorch.
+From the epilogue directory. Building needs a gfx950 `hipcc` (no GPU); running needs a gfx950 GPU and PyTorch.
 
 ```bash
-export THUNDERKITTENS_ROOT=$(cd ../../../../.. && pwd)   # this repository; an inherited root breaks every make
+export THUNDERKITTENS_ROOT=$(cd ../../../../.. && pwd)   # override any inherited root
 for m in noop noop_qkv silu scale residual_add rmsnorm_scale swiglu rmsnorm_swiglu rope rmsnorm_rope \
          rmsnorm_rope_qkv partialrms residual_rms residual_rms_gamma rms_reduce; do make KERNEL=$m; done
-make -C ..                                  # upstream base GEMM, for ab_noop_vs_base.py
+make -C ..                                  # base GEMM, for ab_noop_vs_base.py
 bench/build_attn.sh 32 8 128 2048 4096 8192 # attention for llama3-8b / pr1 (H, H_KV, Dh, M...)
 bench/build_attn.sh 64 8 128 2048 4096 8192 # attention for llama3-70b
 ```
 
-Build on a local disk: a network filesystem can make each module's build many times slower.
+Build on a local disk; network filesystems are much slower.
 
 ## Run
 
@@ -36,13 +34,12 @@ python3 bench/bench_layer.py --phases --full
 ```
 
 Common flags: `--config llama3-8b`, `--M 2048,4096`, `--iters 50`, `--warmup 10`, `--json out.json`,
-`--markdown`. `torch.compile` autotuning can pick different kernels in different processes, so run each
-script in 3 fresh processes and report the spread, not the best run.
+`--markdown`. `torch.compile` autotuning varies across processes: run each script in 3 fresh processes and
+report the spread, not the best run.
 
 ## Config
 
-Single-sequence causal prefill (batch 1) at M ∈ {2048, 4096, 8192} tokens. Configs, in `CONFIGS` in
-`common.py`:
+Batch-1 causal prefill at M ∈ {2048, 4096, 8192} tokens. `CONFIGS` in `common.py`:
 
 | `--config` | Model | d | d_ff | H | H_KV | Dh | Attention build |
 |---|---|---:|---:|---:|---:|---:|---|
@@ -53,41 +50,36 @@ Single-sequence causal prefill (batch 1) at M ∈ {2048, 4096, 8192} tokens. Con
 | `llama3-405b` | Llama-3.1-405B (one layer) | 16384 | 53248 | 128 | 8 | 128 | `build_attn.sh 128 8 128 ...` |
 | `pr1` | PR #1's shape: Llama-2-7B widths with GQA (not a real model) | 4096 | 11008 | 32 | 8 | 128 | `build_attn.sh 32 8 128 ...` |
 
-Widths come from each model's Hugging Face `config.json`. One layer of each fits on one MI355X (288 GB), so the
-shapes are unsharded (no tensor parallelism). The fp32 attention reference holds `[H, M, M]` fp32 scores, so its
-memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alone, plus a second copy in softmax.
+Widths are from each model's Hugging Face `config.json`, unsharded (one layer fits on one 288 GB MI355X). The fp32
+attention reference holds `[H, M, M]` scores: 405B at M = 16384 needs about 128 GiB, plus a copy in softmax.
 
 ## How timing works
 
-- **Cold cache.** Before every timed call, the timer overwrites a buffer twice the last-level cache
-  (2 × 256 MiB on gfx950), so each call reads its inputs from HBM. GPU events bracket only the call.
+- **Cold cache.** Before every timed call the timer overwrites 2 × LLC (2 × 256 MiB on gfx950). GPU events
+  bracket only the call.
 - **Median of 50 calls** after 10 warm-up calls; JSON also records p10 and p90.
-- **Outside the timer:** input creation (including the one-head `[M, Dh]` RoPE table, which every timed arm reads
-  broadcast over the heads; `bench_epilogues.py` tiles it across heads only for its fp32 reference), HK's RMSNorm
-  inputs a previous GEMM would produce (`r` and `x · gamma`, see below), and `torch.compile` compilation and
-  autotuning.
-- **Same weights for every arm, used as they are.** Weights are plain `[N, K]` tensors, the `nn.Linear` layout;
-  nothing is folded, permuted, transposed or concatenated. HK reads them in place (its QKV GEMM reads Wq, Wk and
-  Wv through three pointers); PyTorch multiplies by `W.t()`, a view that hipBLASLt reads in place.
-- **RMSNorm gamma:** HK applies it in the producing GEMM's epilogue (`hk.residual_rms(..., gamma=g)` also writes
-  `h · g`); PyTorch applies it per call (`F.rms_norm(x, ..., g)` in the layer, `x · r · g` in `bench_epilogues.py`).
-- **One compile mode:** `torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False)`. CUDA graphs
-  are not used: both sides are limited by kernel time, not launch overhead.
+- **Outside the timer:** input creation (including the one-head `[M, Dh]` RoPE table, broadcast over heads by
+  every timed arm), HK's RMSNorm inputs from a previous GEMM (`r`, `x · gamma`), and `torch.compile` compilation
+  and autotuning.
+- **Same plain `[N, K]` weights for every arm**, never folded, permuted, transposed or concatenated. HK reads
+  them in place (QKV via three pointers); PyTorch multiplies by the `W.t()` view.
+- **RMSNorm gamma:** HK applies it in the producer (`hk.residual_rms(..., gamma=g)` writes `h · g`); PyTorch per
+  call (`F.rms_norm(x, ..., g)` in the layer, `x · r · g` in `bench_epilogues.py`).
+- **One compile mode:** `torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False)`. No CUDA graphs:
+  both sides are kernel-bound.
 - Eager and compiled PyTorch are separate columns; there is no best-of number.
 
 ## Columns in `bench_epilogues.py`
 
 - **HK:** one fused HipKittens call.
-- **eager:** `torch.matmul(x, W.t())` (hipBLASLt) followed by the epilogue written as lean bf16 eager PyTorch.
-- **compile:** the same eager function under `torch.compile`. Dynamo is reset before each row, so every row
-  compiles fresh rather than hitting the recompile limit and silently running eager.
-- **fusion-only:** HK's `noop` GEMM followed by the same eager PyTorch. HK and fusion-only share one
-  GEMM, so `fusion-only/HK` is the speedup from fusion alone; `eager/HK` also includes the GEMM difference.
-- **HBM saved:** an analytical estimate, not a hardware measurement. Each epilogue has one formula in
-  `bench_epilogues.py` (`saved=` in `make_case`): the bytes of every [M, N] or [M, K] intermediate the
-  eager code writes to HBM and reads back, counted once for the write and once for the read. Vectors
-  ([M] or [N]) are ignored. It ignores cache: a small intermediate may stay in the 256 MiB Infinity Cache,
-  so the real saving can be lower. With bf16 sizes `MN = M·N·2` and `MK = M·K·2` bytes:
+- **eager:** `torch.matmul(x, W.t())` (hipBLASLt), then the epilogue in bf16 eager PyTorch.
+- **compile:** the eager function under `torch.compile`; Dynamo is reset per row so no row hits the recompile
+  limit and silently runs eager.
+- **fusion-only:** HK's `noop` GEMM, then the same eager PyTorch. `fusion-only/HK` isolates fusion;
+  `eager/HK` also includes the GEMM difference.
+- **HBM saved:** an analytical upper bound (`saved=` in `make_case`): each [M, N] or [M, K] intermediate the
+  eager code writes and reads back, counted once per write and read. Vectors ([M], [N]) and caching (256 MiB
+  Infinity Cache) are ignored. With bf16 sizes `MN = M·N·2` and `MK = M·K·2` bytes:
 
   | Epilogue | Eager intermediates | Saved |
   |---|---|---|
@@ -102,8 +94,8 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
   | inv_rms | D | 2·MN − HK's fp32 partials, 2·(N/64)·M·4 |
   | residual_rms | D, second read of h (1/rms), third read of h (h·g) | 4·MN − HK's fp32 partials |
 
-  The `rmsnorm*` rows give HK `x · g` and `r` as its producer would write them. The bounds are net of that
-  producer's extra `h · g` store (one MK), which eager PyTorch does not write.
+  `rmsnorm*` rows give HK `x · g` and `r` as its producer writes them; bounds are net of that producer's extra
+  `h · g` store (one MK).
 
 ## Layer phases and boundary rules
 
@@ -115,21 +107,19 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
 | 4 | gate_up | `rmsnorm_swiglu` on h·g_mlp: 1 launch | `rms_norm(h, g_mlp)`, matmul, `silu(gate) * up` |
 | 5 | down | `residual_rms(g, Wd, h, gamma=g_attn)`: 2 launches, writes x_out, x_out·g_attn, r | `h + g @ Wd.t()` |
 
-- HK splits RMSNorm across phases: the producing GEMM emits r = 1/rms and h·gamma, the consuming GEMM applies r.
-  PyTorch normalizes in the consumer, so a single phase does not compare op-for-op.
-- HK's layer inputs `r_attn` and `x · g_attn` are computed once outside timing (a previous layer's down phase
-  would emit them, as this layer's down phase emits the next layer's). Each timed layer does two RMS reductions:
-  HK in its producers (`r_mlp` in out_proj, `r_next` in down), PyTorch in its consumers (`rms_norm` in qkv and
-  gate_up).
-- **fusion-only control (`--phases`):** for every GEMM phase, the same HK GEMM(s) with the `noop` epilogue on
-  HK's own inputs, with the epilogue's work as eager PyTorch (QKV: `(x · g) · r`, one noop GEMM over the three
-  weights, RoPE and the V copy; out_proj/down: residual add, `h · g` and 1/rms; gate_up: `(h · g) · r`, SwiGLU).
-- **Control tolerance:** the control stores the GEMM output through HK's truncating bf16 store before its eager
-  epilogue, which a fused kernel never does, and SwiGLU multiplies two such values. Its bf16 outputs are gated at
-  `rtol 2.5e-2` (`CONTROL_TOL`) in both scripts; HK, eager and compiled PyTorch keep `rtol 1e-2`.
+- HK's producing GEMM emits r = 1/rms and h·gamma; the consumer applies r. PyTorch normalizes in the consumer,
+  so single phases do not compare op-for-op.
+- HK's `r_attn` and `x · g_attn` are computed untimed (a previous down phase would emit them, as this layer's
+  down emits the next layer's). Each timed layer does two RMS reductions: HK in its producers (`r_mlp` in
+  out_proj, `r_next` in down), PyTorch in its consumers (`rms_norm` in qkv and gate_up).
+- **fusion-only control (`--phases`):** per GEMM phase, the same HK GEMM(s) with `noop` on HK's inputs, then
+  the epilogue as eager PyTorch (QKV: `(x · g) · r`, one noop GEMM over the three weights, RoPE, V copy;
+  out_proj/down: residual add, `h · g`, 1/rms; gate_up: `(h · g) · r`, SwiGLU).
+- **Control tolerance:** the control's GEMM output passes through HK's truncating bf16 store, and SwiGLU
+  multiplies two such values, so its bf16 outputs are gated at `rtol 2.5e-2` (`CONTROL_TOL`) in both scripts;
+  HK, eager and compiled PyTorch keep `rtol 1e-2`.
 - Each phase is timed on intermediates captured from a full run of the same implementation.
-- `--phases` compiles each PyTorch phase separately; `--full` compiles the whole layer as one function.
+- `--phases` compiles each PyTorch phase separately; `--full` compiles the layer as one function.
   `compile full - phases` shows what cross-phase fusion buys PyTorch.
-- **Attention baseline:** the script uses the strongest fused SDPA backend available (flash, then
-  memory-efficient), with native GQA if that backend supports it, else KV expanded to all heads. The math
-  backend is disabled. The chosen backend is printed and saved in the JSON.
+- **Attention baseline:** the strongest available fused SDPA backend (flash, then memory-efficient), native GQA
+  if supported, else KV expanded. The math backend is disabled. The backend is printed and saved in the JSON.

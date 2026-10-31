@@ -1,6 +1,5 @@
-"""tk_rms_reduce: r[m] = 1 / sqrt(sum(partials[:, m]) / N + 1e-5), partials = [N/64, M] fp32, r = [M] fp32.
-Allowed difference vs an fp64 reference: fp32 rounding of the G-term sum, the division and rsqrt,
-i.e. relative error <= (G + 4) * 2^-24."""
+"""tk_rms_reduce: r[m] = 1 / sqrt(sum(partials[:, m]) / N + 1e-5), partials fp32 [N/64, M], r fp32 [M].
+Relative error <= (G + 4) * 2^-24."""
 import math
 
 import pytest
@@ -10,7 +9,7 @@ import hk
 from conftest import DEV, SHAPES, assert_rel_close, inputs, module, stream, weight
 
 EPS = 1e-5
-GROUP_CASES = [(256, 4), (4096, 64), (8192, 32), (4096, 172)]   # (M, G); G = N / 64, 172 <-> N = 11008
+GROUP_CASES = [(256, 4), (4096, 64), (8192, 32), (4096, 172)]   # (M, G), G = N / 64
 
 
 def rel(G):
@@ -42,16 +41,16 @@ def test_zeros():
 
 
 def test_known_answer():
-    # 64 groups of 2.0: sum 128, N = 4096, mean 1/32, r = 1 / sqrt(1/32 + 1e-5).
+    # sum 128 over N = 4096: mean 1/32
     r = run(torch.full((64, 512), 2.0, device=DEV))
     assert_rel_close(r.double(), torch.full((512,), 1 / math.sqrt(1 / 32 + EPS), device=DEV, dtype=torch.float64), rel(64))
-    with pytest.raises(RuntimeError):                    # partials and r swapped: shapes do not fit
+    with pytest.raises(RuntimeError):                    # swapped
         module("rms_reduce").dispatch(torch.empty(512, device=DEV), torch.full((64, 512), 2.0, device=DEV), stream())
 
 
 @pytest.mark.parametrize("M,N,K", SHAPES)
 def test_chain_with_partialrms(M, N, K):
-    """hk.inv_rms (partialrms -> rms_reduce) gives 1 / rms of each row of the exact GEMM."""
+    """hk.inv_rms gives 1 / rms of each exact GEMM row."""
     a, b = inputs(M, N, K, "random")
     module("partialrms"), module("rms_reduce")
     h = a.double() @ b.double().T
@@ -60,9 +59,9 @@ def test_chain_with_partialrms(M, N, K):
 
 
 def test_bad_shapes():
-    with pytest.raises(RuntimeError):                    # partials' M does not match r
+    with pytest.raises(RuntimeError):                    # M mismatch
         module("rms_reduce").dispatch(torch.zeros(4, 257, device=DEV), torch.empty(256, device=DEV), stream())
-    with pytest.raises(RuntimeError):                    # r is not a vector
+    with pytest.raises(RuntimeError):                    # r not 1-D
         module("rms_reduce").dispatch(torch.zeros(4, 256, device=DEV), torch.empty(2, 256, device=DEV), stream())
 
 

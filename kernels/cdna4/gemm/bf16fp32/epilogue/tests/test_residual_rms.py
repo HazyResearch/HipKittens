@@ -1,7 +1,5 @@
-"""hk.residual_rms (tk_residual_rms + tk_rms_reduce): h = a @ b.T + residual (bf16 [M, N]) and
-r = 1 / sqrt(mean(h^2) + 1e-5) (fp32 [M]), with r taken from h in fp32 before it is rounded to bf16.
-h is one IEEE fp32 add stored chopped, so it must be bit-identical; r may differ from fp64 by the fp32
-rounding of 64 squares per group, G = N/64 group sums, the division and rsqrt: (64 + G + 4) * 2^-24."""
+"""hk.residual_rms: h = a @ b.T + residual (bf16 [M, N], bit-exact), r = 1 / sqrt(mean(h^2) + 1e-5) from fp32 h
+(fp32 [M], relative error <= (64 + G + 4) * 2^-24, G = N/64)."""
 import pytest
 import torch
 
@@ -21,7 +19,7 @@ def run(a, b, residual):
 
 
 def reference(a, b, residual):
-    h = gemm_exact(a, b) + residual.float()                       # fp32, as the kernel holds it
+    h = gemm_exact(a, b) + residual.float()                       # fp32
     return h, torch.rsqrt(h.double().square().mean(1) + EPS)
 
 
@@ -48,8 +46,7 @@ def test_zeros():
 
 
 def test_known_answer():
-    """a @ I = ones; residual row m holds m % 4, so h row m is 1 + m % 4 and r[m] = 1 / sqrt((1 + m % 4)^2 + eps).
-    A residual read with rows and columns swapped would make h vary along columns instead."""
+    """residual row m = m % 4, so h row m = 1 + m % 4 (catches a transposed residual)."""
     a = torch.ones(512, 256, dtype=torch.bfloat16, device=DEV)
     eye = torch.eye(256, dtype=torch.bfloat16, device=DEV)
     m4 = (torch.arange(512, device=DEV) % 4).float()
@@ -60,14 +57,13 @@ def test_known_answer():
 
 
 def test_chain_gamma_into_rmsnorm_swiglu():
-    """The layer's MLP input: residual_rms(gamma=g) writes hg = h * g, and rmsnorm_swiglu multiplies hg by the PLAIN
-    gate_up weight and applies r. Must match swiglu(rmsnorm(h, g) @ W.t()) computed from h, g and an fp64 r."""
+    """residual_rms(gamma=g) -> rmsnorm_swiglu matches swiglu(rmsnorm(h, g) @ W.t()) (fp64 r), normwise 1e-2."""
     module("residual_rms_gamma"), module("rms_reduce"), module("rmsnorm_swiglu")
     a, b = inputs(256, 256, 128, "random")
     res = residual_like(256, 256, 1.0)
     g = general_gamma(256, seed=13)
     out = hk.residual_rms(a, weight(b), res, gamma=g)
-    _, w = inputs(256, 1024, 256, "random", seed=1)                # W_gate_up [2*d_ff, d_model]
+    _, w = inputs(256, 1024, 256, "random", seed=1)                # W_gate_up
     y = hk.matmul(out.hg, w, epilogue="rmsnorm_swiglu", r=out.r)
     h_ref, r_ref = reference(a, b, res)
     gu = (h_ref.double() * r_ref[:, None] * g.double()[None, :]) @ w.double().T
@@ -96,9 +92,7 @@ def test_rejects_wrong_residual_shape():
 
 @pytest.mark.parametrize("M,N,K", SHAPES)
 def test_gamma_output(M, N, K):
-    """With gamma, the same GEMM also writes hg = h * gamma from h in fp32, before h's bf16 rounding; h and r are
-    bitwise the gamma-less call's, so r stays the norm of h, not of hg. A non-power-of-two gamma makes rounding h
-    first give different bits, so the bit-exact check pins the order."""
+    """hg = fp32 h * gamma bit-exact (before rounding h); h and r bitwise equal the gamma-less call."""
     module("residual_rms_gamma")
     a, b = inputs(M, N, K, "random")
     res = residual_like(M, N, 1.0)
@@ -109,7 +103,7 @@ def test_gamma_output(M, N, K):
     h_ref, _ = reference(a, b, res)
     assert_bitexact(hg, h_ref * gamma.float()[None, :])
     rounded_first = to_bf16_chopped(to_bf16_chopped(h_ref).float() * gamma.float()[None, :])
-    assert (rounded_first != hg).any()                            # the data can tell the two orders apart
+    assert (rounded_first != hg).any()                            # order is observable
 
 
 def test_rejects_wrong_gamma():

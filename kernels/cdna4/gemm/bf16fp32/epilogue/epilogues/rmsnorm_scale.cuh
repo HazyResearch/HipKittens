@@ -2,13 +2,12 @@
 #include "base.cuh"
 #include "vec.cuh"
 
-// Output RMSNorm: out = (A @ B^T) * r[:, None] * gamma[None, :]. It normalizes the GEMM's OUTPUT: r is the
-// precomputed per-row 1/rms of A @ B^T (hk.inv_rms(x, w)) and gamma is that norm's weight over the N output
-// columns (hk calls it out_gamma). Not the pre-norm gamma of A, which has K entries. r first, then gamma.
+// Output RMSNorm: out = (A @ B^T) * r[:, None] * gamma[None, :]. r = 1/rms of A @ B^T; gamma has N entries
+// (out_gamma), not the K-entry pre-norm gamma.
 struct RMSNormScaleGlobals {
     _gl_A a; _gl_B b; _gl_C c;
-    gl<float, -1, -1, -1, -1> r;      // [M] fp32; as a 4-D gl: [1, 1, 1, M]
-    gl<bf16, -1, -1, -1, -1> gamma;   // [N] bf16; as a 4-D gl: [1, 1, 1, N]
+    gl<float, -1, -1, -1, -1> r;      // [M] fp32
+    gl<bf16, -1, -1, -1, -1> gamma;   // [N] bf16
 };
 struct RMSNormScaleEpilogue {
     template<typename Globals, typename Accum>

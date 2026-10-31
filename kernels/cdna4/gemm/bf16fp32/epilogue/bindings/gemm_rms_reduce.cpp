@@ -8,7 +8,7 @@ void dispatch(RmsReduceGlobals g, hipStream_t stream) {
         throw std::runtime_error("rms_reduce: r must be [M]");
     if (g.partials.cols() != M || g.partials.rows() < 1)
         throw std::runtime_error("rms_reduce: partials must be [N/64, M] with M = r's length");
-    constexpr int THREADS = 256;                             // 4 wavefronts per block, one row each
+    constexpr int THREADS = 256;                             // one row per wavefront
     const long long total = (long long)M * kittens::WARP_THREADS;
     rms_reduce<<<(int)((total + THREADS - 1) / THREADS), THREADS, 0, stream>>>(g.partials, g.r);
     hip_check(hipGetLastError(), "rms_reduce launch");

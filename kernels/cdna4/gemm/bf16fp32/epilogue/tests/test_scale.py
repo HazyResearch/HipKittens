@@ -1,6 +1,4 @@
-"""tk_scale: c = alpha * (a @ b.T) (bf16), alpha a 1-element fp32 tensor. alpha * x is one IEEE fp32
-multiply on both sides, so c must be bit-identical to the reference stored the way the kernel
-stores bf16 (to_bf16_chopped)."""
+"""tk_scale: c = alpha * (a @ b.T) (bf16), alpha a 1-element fp32 tensor; bit-exact."""
 import pytest
 import torch
 
@@ -18,7 +16,7 @@ def run(a, b, alpha):
 
 
 def reference(a, b, alpha):
-    return gemm_exact(a, b) * alpha[0]          # fp32 * fp32
+    return gemm_exact(a, b) * alpha[0]
 
 
 @pytest.mark.parametrize("kind", ["random", "large"])
@@ -38,7 +36,7 @@ def test_known_answer():
     a = torch.ones(512, 256, dtype=torch.bfloat16, device=DEV)
     eye = torch.eye(256, dtype=torch.bfloat16, device=DEV)
     c = run(a, eye, alpha_tensor(0.5))
-    assert torch.equal(c, torch.full_like(c, 0.5))            # 0.5, not 2.0: alpha multiplies
+    assert torch.equal(c, torch.full_like(c, 0.5))            # not 2.0
 
 
 @pytest.mark.parametrize("M,N,K", BAD_SHAPES)

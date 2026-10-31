@@ -1,6 +1,4 @@
-"""tk_silu: c = silu(a @ b.T) (bf16). The reference is silu_kernel (0 where the hardware reciprocal
-flushes) stored as the kernel stores bf16. The fast SiLU differs from torch's by <= 2e-6 relative, so c
-may differ from it by at most one bf16 step."""
+"""tk_silu: c = silu(a @ b.T) (bf16), within one bf16 step of silu_kernel."""
 import pytest
 import torch
 
@@ -8,7 +6,7 @@ import hk
 from conftest import (BAD_SHAPES, DEV, SHAPES, assert_within_bf16_step, gemm_exact, hk_shape_error, inputs, module,
                       silu_kernel, weight)
 
-SILU_1 = 0.7310585786300049          # silu(1) = 1 / (1 + e^-1)
+SILU_1 = 0.7310585786300049          # silu(1)
 
 
 def run(a, b):

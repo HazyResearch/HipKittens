@@ -1,8 +1,5 @@
-"""tk_rope: c = RoPE(a @ b.T) with interleaved pairs (2k, 2k+1), natural column order (bf16). b is natural;
-cos_sin is one head's natural [M, Dh] table, shared by all heads. The output store rounds to nearest (packed
-v_cvt_pk_bf16_f32). Allowed difference (assert_rope_close): one bf16 step of the result plus the fp32
-rounding of the rotation's two products and sum, 4 * 2^-24 * (|x||cos| + |y||sin|), which only matters
-when the two products nearly cancel."""
+"""tk_rope: c = RoPE(a @ b.T), interleaved pairs, natural order (bf16, rounded to nearest). Bound: one bf16 step
++ 4 * 2^-24 * (|x||cos| + |y||sin|)."""
 import pytest
 import torch
 
@@ -11,7 +8,7 @@ from conftest import BAD_SHAPES, DEV, SHAPES, bf16_step, gemm_exact, hk_shape_er
 
 
 def cos_sin_table(M, N, base=10000.0):
-    """bf16 [M, N] natural interleaved table: [m, 2k] = cos(m * theta_k), [m, 2k+1] = sin(m * theta_k)."""
+    """bf16 [M, N]: [m, 2k] = cos(m * theta_k), [m, 2k+1] = sin(m * theta_k)."""
     k = torch.arange(N // 2, device=DEV)
     angle = torch.arange(M, device=DEV).float()[:, None] * base ** (-2.0 * k / N)[None, :]
     table = torch.empty(M, N, device=DEV)
@@ -20,7 +17,7 @@ def cos_sin_table(M, N, base=10000.0):
 
 
 def rotate(h, cos_sin):
-    """Interleaved RoPE in fp32 on natural columns, in the kernel's operation order."""
+    """fp32 RoPE in the kernel's operation order."""
     cs = cos_sin.float()
     x, y, cos, sin = h[:, 0::2], h[:, 1::2], cs[:, 0::2], cs[:, 1::2]
     out = torch.empty_like(h)
@@ -30,8 +27,7 @@ def rotate(h, cos_sin):
 
 
 def assert_rope_close(got, h, cos_sin):
-    """got (bf16) vs rotate(h, cos_sin) rounded to nearest: <= 1 bf16 step + 4 * 2^-24 * magnitude, where
-    magnitude is |x||cos| + |y||sin| for even outputs and |y||cos| + |x||sin| for odd outputs."""
+    """got within 1 bf16 step + 4 * 2^-24 * (|x||cos| + |y||sin|) of rotate(h, cos_sin) rounded to nearest."""
     cs = cos_sin.float()
     x, y, cos, sin = h[:, 0::2].abs(), h[:, 1::2].abs(), cs[:, 0::2].abs(), cs[:, 1::2].abs()
     magnitude = torch.empty_like(h)
@@ -50,7 +46,7 @@ def run(a, b, cos_sin):
     return hk.matmul(a, weight(b), epilogue="rope", cos_sin=cos_sin)
 
 
-@pytest.mark.parametrize("dh", ["N", 128])                # one head spanning N, or 128-wide heads sharing a table
+@pytest.mark.parametrize("dh", ["N", 128])                # one head, or 128-wide heads
 @pytest.mark.parametrize("kind", ["random", "large"])
 @pytest.mark.parametrize("M,N,K", SHAPES)
 def test_shapes(M, N, K, kind, dh):
@@ -65,7 +61,7 @@ def test_zeros():
 
 
 def test_known_answer():
-    # b = I and a 90-degree rotation (cos 0, sin 1): out[2k] = a[2k+1], out[2k+1] = -a[2k]. Exact.
+    # 90-degree rotation: out[2k] = a[2k+1], out[2k+1] = -a[2k]
     a = ((torch.arange(256, device=DEV) % 7) - 3).float().repeat(512, 1).to(torch.bfloat16)
     eye = torch.eye(256, dtype=torch.bfloat16, device=DEV)
     cs = torch.zeros(512, 256, device=DEV)
@@ -74,7 +70,7 @@ def test_known_answer():
     want = torch.empty_like(a)
     want[:, 0::2], want[:, 1::2] = a[:, 1::2], -a[:, 0::2]
     assert torch.equal(out, want)
-    with pytest.raises(ValueError, match="N % Dh"):         # a table width that does not divide N is refused
+    with pytest.raises(ValueError, match="N % Dh"):         # Dh must divide N
         run(a, eye, cs[:, :96].contiguous().to(torch.bfloat16))
 
 
@@ -95,12 +91,12 @@ def test_rejects_wrong_dtype():
 def test_rejects_misaligned_output():
     a, b = inputs(256, 256, 128, "random")
     misaligned = torch.empty(256 * 256 + 1, dtype=torch.bfloat16, device=DEV)[1:].view(256, 256)
-    with pytest.raises(RuntimeError, match="4-byte alignment"):     # hk always allocates aligned output
+    with pytest.raises(RuntimeError, match="4-byte alignment"):     # raw module only
         module("rope").dispatch(a, b, misaligned, cos_sin_table(256, 256), 256, stream())
 
 
 def test_rejects_misaligned_table():
-    """The epilogue reads [cos, sin] as one bf16x2 word: a table starting at an odd bf16 element is refused."""
+    """A cos_sin table not 4-byte aligned is refused (read as bf16x2)."""
     a, b = inputs(256, 256, 128, "random")
     cs = torch.empty(256 * 256 + 1, dtype=torch.bfloat16, device=DEV)[1:].view(256, 256)
     cs.copy_(cos_sin_table(256, 256))

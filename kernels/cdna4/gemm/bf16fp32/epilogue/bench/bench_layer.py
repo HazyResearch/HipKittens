@@ -1,24 +1,12 @@
-"""One pre-norm GQA Transformer forward layer: HK vs PyTorch eager vs torch.compile.
+"""One pre-norm GQA Transformer layer: HK vs PyTorch eager vs torch.compile (rules in README.md).
 
---phases  each of the five phases timed on its own, on intermediates captured from a full run of the same
-          implementation. Each torch phase is compiled separately. Every GEMM phase also times a fusion-only
-          control on HK's inputs: the same HK GEMM with the noop epilogue, then the HK epilogue's work as eager
-          torch (fusion-only/HK isolates fusion from GEMM speed). Attention has no epilogue and no control.
---full    the whole layer. torch.compile sees the whole layer as one function, so it may fuse across phase
-          boundaries. Also prints the compiled full layer minus the sum of the separately compiled phases
-          (negative = what cross-phase fusion buys torch). --full times the phases too, for that line.
+--phases  each phase timed alone on captured intermediates, plus a fusion-only control per GEMM phase.
+--full    the whole layer (compiled as one function), and compiled full minus the sum of compiled phases.
 
-Phases (HK launches): qkv (4: one hk.qkv GEMM over the three weights + 3 copies), attention (1), out_proj (2),
-gate_up (1), down (2). HK splits RMSNorm across phases: the producer GEMM (out_proj, down) emits r = 1/rms(h) and
-h * gamma, the consumer GEMM (gate_up, the next layer's qkv) multiplies h * gamma by a plain weight and applies r.
-Torch normalizes in the consumer with F.rms_norm(x, gamma). Every implementation reads the same plain [N, K] weights;
-nothing is prepared. The HK layer's inputs r_attn = 1/rms(x) and x * gamma_attn are computed once, outside timing (a
-previous layer's down phase emits both, and this layer's down phase pays for the next layer's). Each timed layer does
-two RMS reductions: HK in its producers (r_mlp in out_proj, r_next in down), torch in its consumers (F.rms_norm in
-qkv and gate_up). Per-phase times do not line up op-for-op.
+HK launches per phase: qkv 4, attention 1, out_proj 2, gate_up 1, down 2. HK's producers emit r and h * gamma
+for the next consumer; torch normalizes in the consumer. Per-phase times do not line up op-for-op.
 
-Build first: make KERNEL=<m> in the epilogue directory for every m in MODULES, and the attention kernel per
-M with bench/build_attn.sh <H> <H_KV> <Dh> <M>...
+Build: make KERNEL=<m> for every m in MODULES, and bench/build_attn.sh <H> <H_KV> <Dh> <M>...
 """
 import dataclasses
 import importlib
@@ -37,8 +25,7 @@ COMPILE = common.COMPILE
 
 
 def choose_sdpa(H, H_KV, Dh):
-    """Pick the strongest fused SDPA path: flash before memory-efficient, native GQA before expanded KV.
-    Disables the math backend globally so torch never falls back to it. Returns (backend name, native GQA)."""
+    """(backend name, native GQA) of the best fused SDPA path; disables the math backend globally."""
     q = torch.randn(1, H, 256, Dh, device="cuda", dtype=common.BF16)
     kv = torch.randn(1, H_KV, 256, Dh, device="cuda", dtype=common.BF16)
     for backend in (SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION):
@@ -59,15 +46,14 @@ def choose_sdpa(H, H_KV, Dh):
 
 
 def load_gqa(cfg, M):
-    """The gqa_causal build for this shape. build_attn.sh gives every build its own module name; Python returns
-    the first-loaded module for any later load of the same name, so a shared name would run the wrong shape."""
+    """The gqa_causal build for this shape (unique module name per build)."""
     name = f"tk_attn_H{cfg['H']}_KV{cfg['H_KV']}_D{cfg['Dh']}_N{M}"
     hint = f"{common.BENCH / 'build_attn.sh'} {cfg['H']} {cfg['H_KV']} {cfg['Dh']} {M}"
     return common.load_extension(common.find_extension(common.BENCH / "attn_build", name, hint), name=name)
 
 
 def noop_qkv(x, wq, wk, wv):
-    """x @ [wq; wk; wv].t() as one noop GEMM launch over the three weights (the fusion-only control's QKV GEMM)."""
+    """x @ [wq; wk; wv].t() in one noop launch."""
     nq, nkv = wq.shape[0], wk.shape[0]
     out = torch.empty(x.shape[0], nq + 2 * nkv, dtype=common.BF16, device=x.device)
     importlib.import_module("tk_noop_qkv").dispatch(x, wq, out, wk, wv, torch.cuda.current_stream().cuda_stream)
@@ -75,18 +61,18 @@ def noop_qkv(x, wq, wk, wv):
 
 
 class Layer:
-    """Weights (shared by every implementation, used as they are) and the five phases of both implementations."""
+    """Shared weights and the five phases of each implementation."""
 
     def __init__(self, cfg, M, gqa, native_gqa):
         self.M, self.d, self.d_ff = M, cfg["d"], cfg["d_ff"]
         self.H, self.H_KV, self.Dh = cfg["H"], cfg["H_KV"], cfg["Dh"]
         d, kv = self.d, self.H_KV * self.Dh
         self.W = dict(q=common.weight(d, d), k=common.weight(d, kv), v=common.weight(d, kv), o=common.weight(d, d),
-                      gu=common.weight(d, 2 * self.d_ff), dn=common.weight(self.d_ff, d))   # each [N, K]
+                      gu=common.weight(d, 2 * self.d_ff), dn=common.weight(self.d_ff, d))
         self.g_attn, self.g_mlp = common.gamma(d), common.gamma(d)
         self.x = common.activation(M, d)
-        self.cs = common.rope_table(M, self.Dh)                     # one head's table [M, Dh]
-        # The HK layer's other inputs, as the previous layer's down phase would emit them (untimed here).
+        self.cs = common.rope_table(M, self.Dh)                     # [M, Dh], one head
+        # HK inputs a previous layer's down phase would emit.
         self.r_attn = common.inv_rms(self.x)
         self.xg = (self.x.float() * self.g_attn.float()[None, :]).to(common.BF16)
         self.gqa, self.native_gqa = gqa, native_gqa
@@ -110,19 +96,19 @@ class Layer:
         return hk.matmul(hg, self.W["gu"], "rmsnorm_swiglu", r=r)
 
     def hk_down(self, g, h):
-        # steady state of identical layers: the next layer's attention norm has this layer's gamma
+        # identical layers: the next attention norm uses g_attn
         return hk.residual_rms(g, self.W["dn"], h, gamma=self.g_attn)    # x_out, x_out * g_attn, r_next
 
-    # ---- fusion-only control: HK noop GEMM + the HK epilogue's work as eager torch, on HK's inputs ----
+    # ---- fusion-only control ----
     def eager_inv_rms(self, t):
         return torch.rsqrt(torch.linalg.vector_norm(t, dim=-1, dtype=torch.float32).square() / self.d + common.EPS)
 
     def row_scale(self, t, r):
-        return t * r.to(common.BF16)[:, None]                       # eager RMSNorm with r given, gamma already in t
+        return t * r.to(common.BF16)[:, None]
 
     def f_qkv(self, xg, r):
         M, Dh, nq, nkv, W = self.M, self.Dh, self.d, self.H_KV * self.Dh, self.W
-        c = noop_qkv(self.row_scale(xg, r), W["q"], W["k"], W["v"])  # one launch over the three weights
+        c = noop_qkv(self.row_scale(xg, r), W["q"], W["k"], W["v"])
         cs = self.cs.view(M, 1, Dh)
         q = common.rope(c[:, :nq].view(M, self.H, Dh), cs).reshape(M, nq)
         k = common.rope(c[:, nq:nq + nkv].view(M, self.H_KV, Dh), cs).reshape(M, nkv)
@@ -140,7 +126,7 @@ class Layer:
         x_out = hk.matmul(g, self.W["dn"]) + h
         return x_out, x_out * self.g_attn, self.eager_inv_rms(x_out)  # x_out, x_out * g_attn, r_next
 
-    # ---- torch phases (eager and torch.compile run this same code; gamma applied per call by F.rms_norm) ----
+    # ---- torch phases (eager and compiled) ----
     def t_qkv(self, x):
         M, Dh, W = self.M, self.Dh, self.W
         xn = F.rms_norm(x, (self.d,), self.g_attn, common.EPS)
@@ -166,9 +152,9 @@ class Layer:
         return F.silu(gu[:, :self.d_ff]) * gu[:, self.d_ff:]
 
     def t_down(self, g, h):
-        return h + g @ self.W["dn"].t()                             # x_out; the next layer normalizes it in its qkv
+        return h + g @ self.W["dn"].t()                             # x_out
 
-    # ---- fp32 references, applied to either implementation's captured inputs ----
+    # ---- fp32 references ----
     def ref_qkv(self, x):
         M, Dh, W = self.M, self.Dh, self.W
         xn = x.float() * common.inv_rms(x)[:, None] * self.g_attn.float()
@@ -208,7 +194,7 @@ class Layer:
         x_out, r = self.ref_down(g, h)
         return x_out, x_out * self.g_attn.float(), r                # what HK's down writes
 
-    # ---- captured intermediates from one full run of each implementation ----
+    # ---- captured intermediates ----
     def capture_hk(self):
         x, xg, r = self.x, self.xg, self.r_attn
         q, k, v = self.hk_qkv(xg, r)
@@ -291,7 +277,7 @@ def run_phases(L, timer):
         ok_hk, rel = common.check(p.hk(), p.ref_hk(), p.tol_hk)
         ref_t = p.ref_torch()
         ok_eager, _ = common.check(eager(), ref_t, p.tol_torch)
-        ok_comp, _ = common.check(comp(), ref_t, p.tol_torch)     # first call compiles + autotunes, untimed
+        ok_comp, _ = common.check(comp(), ref_t, p.tol_torch)     # first call compiles
         ok_fusion = True
         if p.fusion is not None:
             ok_fusion, _ = common.check(p.fusion(), p.ref_hk(), common.control_tols(p.tol_hk))
@@ -335,9 +321,9 @@ def run_full(L, timer, phase_rows):
     compiled = torch.compile(L.t_layer, **COMPILE)
     comp = lambda: compiled(L.x)
     want = L.ref_layer(L.x)
-    ok_hk, rel_hk = common.layer_check(hk_fn()[:2], want)            # x_out, r_next (xg_out: checked per phase)
+    ok_hk, rel_hk = common.layer_check(hk_fn()[:2], want)            # x_out, r_next
     ok_eager, rel_eager = common.layer_check((eager(),), want[:1])  # torch: x_out only
-    ok_comp, rel_comp = common.layer_check((comp(),), want[:1])     # first call compiles + autotunes, untimed
+    ok_comp, rel_comp = common.layer_check((comp(),), want[:1])     # first call compiles
     ok = ok_hk and ok_eager and ok_comp
     row = dict(M=L.M, rel_hk=rel_hk, rel_eager=rel_eager, rel_compile=rel_comp, status="PASS" if ok else "FAIL")
     if ok:

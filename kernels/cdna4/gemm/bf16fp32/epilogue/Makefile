@@ -1,4 +1,4 @@
-# Build one epilogue binding as a Python extension: make KERNEL=<noop|silu|...>
+# make KERNEL=<noop|silu|...>
 GPU_TARGET ?= CDNA4
 KERNEL     ?= noop
 TARGET     ?= tk_$(KERNEL)

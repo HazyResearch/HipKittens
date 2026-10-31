@@ -1,9 +1,4 @@
-"""Shared helpers for the epilogue correctness tests.
-
-Inputs are small integers times a power of two, so the fp32 GEMM is exact in any summation order:
-the kernel and the reference start from identical numbers, and the only differences a test allows
-are the ones it names.
-"""
+"""Shared test helpers. Inputs make the fp32 GEMM exact, so tests allow only the differences they name."""
 import importlib
 import math
 import os
@@ -14,17 +9,17 @@ import sys
 import torch
 
 EPI = pathlib.Path(__file__).resolve().parents[1]   # kernels/cdna4/gemm/bf16fp32/epilogue
-BASE = EPI.parent                                    # kernels/cdna4/gemm/bf16fp32 (upstream base GEMM)
+BASE = EPI.parent                                    # base GEMM
 DEV = "cuda"
 if str(EPI) not in sys.path:
-    sys.path.insert(0, str(EPI))                    # so tests can `import hk`
+    sys.path.insert(0, str(EPI))                    # for `import hk`
 
 SHAPES = [(256, 256, 128), (4096, 4096, 128), (8192, 2048, 4096), (4096, 4096, 4096)]  # (M, N, K)
 BAD_SHAPES = [(384, 256, 128), (256, 256, 192)]                                         # M % 256, K % 128
 
 
 def hk_shape_error(M, N, K):
-    """(exception, message) hk raises for a BAD_SHAPES case: hk (Python) checks K and M before any launch."""
+    """(exception, message) hk raises for a BAD_SHAPES case."""
     if K % 128:
         return ValueError, "K % 128 == 0"
     return ValueError, "M % 256 == 0"
@@ -50,37 +45,31 @@ def module(name):
 
 
 def stream():
-    """torch's current stream, as the trailing argument every tk_<name>.dispatch takes."""
+    """Current stream handle for tk_<name>.dispatch."""
     return torch.cuda.current_stream().cuda_stream
 
 
 def weight(b, gamma=None):
-    """The plain [N, K] weight the kernels read for test operand b. With gamma, b's K columns are scaled by it (fp32
-    product, one bf16 rounding): the tests' stand-in for an input that carries the norm's gamma, since
-    (a * gamma) @ b.T == a @ (b * gamma).T. hk itself never folds gamma into a weight."""
+    """b, or b * gamma over K (stands in for an input carrying gamma: (a * gamma) @ b.T == a @ (b * gamma).T)."""
     return b if gamma is None else (b.float() * gamma.float()[None, :]).to(torch.bfloat16)
 
 
 def pow2_gamma(K, seed=7):
-    """bf16 gamma of powers of two (0.5, 1, 2), so scaling b's columns by it keeps the GEMM exact."""
+    """bf16 gamma in {0.5, 1, 2}: keeps the GEMM exact."""
     g = torch.Generator(device=DEV).manual_seed(seed)
     return (2.0 ** torch.randint(-1, 2, (K,), generator=g, device=DEV).float()).to(torch.bfloat16)
 
 
 def general_gamma(n, seed=7):
-    """bf16 gamma in [0.5, 1.5), not powers of two: multiplying by it changes the mantissa, so a result rounded
-    before the multiply differs from one rounded after (unlike pow2_gamma)."""
+    """bf16 gamma in [0.5, 1.5): not powers of two, so rounding order is observable."""
     g = torch.Generator(device=DEV).manual_seed(seed)
     return (torch.rand(n, generator=g, device=DEV) + 0.5).to(torch.bfloat16)
 
 
 def inputs(M, N, K, kind, seed=0):
-    """bf16 a [M, K] and b [N, K] whose product is exact in fp32. kind: "random", "large" or "zeros".
+    """bf16 a [M, K], b [N, K] with an fp32-exact product. kind: "random" (outputs ~1), "large" (~1e3), "zeros".
 
-    Entries are integers in [-2, 2]; a is scaled by 2^exp. Each product is a multiple of 2^exp with
-    magnitude <= 4, so any partial sum is at most 4K units of 2^exp, far below fp32's 2^24.
-    random: exp = -round(log2(2 sqrt K)) gives outputs with standard deviation ~1.
-    large:  exp = 3 gives outputs ~1e3.
+    Integers in [-2, 2], a scaled by 2^exp: partial sums stay below 4K units of 2^exp << 2^24.
     """
     if kind == "zeros":
         return (torch.zeros(M, K, dtype=torch.bfloat16, device=DEV),
@@ -93,12 +82,12 @@ def inputs(M, N, K, kind, seed=0):
 
 
 def gemm_exact(a, b):
-    """a @ b.T in fp64 (exact for inputs() data), returned as fp32 (still exact)."""
+    """Exact a @ b.T as fp32."""
     return (a.double() @ b.double().T).float()
 
 
 def bf16_step(x):
-    """Spacing between adjacent bf16 values at |x|; 0 where x == 0. x is an fp32 tensor."""
+    """bf16 spacing at |x| (0 at 0)."""
     return torch.where(x == 0, torch.zeros_like(x), torch.exp2(torch.floor(torch.log2(x.abs())) - 7))
 
 
@@ -109,39 +98,36 @@ def _report(bad, got, want, what):
 
 
 def to_bf16_chopped(x):
-    """fp32 -> bf16 the way HipKittens' store does it: keep the top 16 bits (round toward zero).
-    torch's .to(torch.bfloat16) rounds to nearest instead, which differs by one bf16 step."""
+    """fp32 -> bf16 by truncation, as HipKittens' store does (torch rounds to nearest)."""
     return (x.float().contiguous().view(torch.int32) & -65536).view(torch.float32).to(torch.bfloat16)
 
 
 def silu_kernel(x):
-    """SiLU as the kernel computes it: torch's SiLU, except exactly 0 where sigmoid(x) is below fp32's
-    smallest normal (2^-126, x < about -87), because the hardware reciprocal returns 0 there."""
+    """torch SiLU, but 0 where sigmoid(x) < 2^-126 (the hardware reciprocal flushes)."""
     return torch.where(torch.sigmoid(x) < 2.0 ** -126, x * 0, torch.nn.functional.silu(x))
 
 
 def assert_bitexact(got, ref):
-    """bf16 got must equal fp32 ref stored the way the kernel stores it (to_bf16_chopped)."""
+    """got == to_bf16_chopped(ref)."""
     want = to_bf16_chopped(ref)
     bad = got != want
     assert not bad.any(), _report(bad, got, want, "differ")
 
 
 def assert_within_bf16_step(got, ref):
-    """bf16 got may differ from fp32 ref stored as the kernel does by at most one bf16 step
-    (0 where ref is 0)."""
+    """got within one bf16 step of to_bf16_chopped(ref)."""
     want = to_bf16_chopped(ref).float()
     bad = (got.float() - want).abs() > bf16_step(want)
     assert not bad.any(), _report(bad, got.float(), want, "differ by more than 1 bf16 step")
 
 
 def assert_rel_close(got, ref, rel):
-    """|got - ref| <= rel * |ref| elementwise (so ref == 0 requires got == 0)."""
+    """|got - ref| <= rel * |ref| elementwise."""
     bad = (got - ref).abs() > rel * ref.abs()
     assert not bad.any(), _report(bad, got, ref, f"exceed relative error {rel:.2e}")
 
 
 def assert_norm_close(got, want, rel):
-    """||got - want|| <= rel * ||want||: for chains of kernels whose rounding is not element-exact."""
+    """||got - want|| <= rel * ||want||."""
     err = ((got.double() - want.double()).norm() / want.double().norm()).item()
     assert err <= rel, f"normwise relative error {err:.2e} > {rel:.0e}"

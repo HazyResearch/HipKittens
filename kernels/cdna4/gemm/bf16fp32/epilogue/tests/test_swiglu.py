@@ -1,6 +1,4 @@
-"""tk_swiglu: c = silu(gate) * value, [M, N] -> [M, N/2] (bf16). b is the natural W_gate_up operand
-(rows [0, N/2) gate, [N/2, N) value); the kernel pairs them (epilogues/swiglu.cuh). Fast SiLU allows one
-bf16 step."""
+"""tk_swiglu: c = silu(gate) * value, [M, N] -> [M, N/2] (bf16), b rows [gate | value]; within one bf16 step."""
 import pytest
 import torch
 
@@ -36,7 +34,7 @@ def test_zeros():
 
 
 def test_known_answer():
-    # b = I, so the GEMM returns a: gate columns hold 1, value columns hold 2.
+    # gate = 1, value = 2
     a = torch.cat([torch.ones(512, 128), 2 * torch.ones(512, 128)], dim=1).to(torch.bfloat16).to(DEV)
     eye = torch.eye(256, dtype=torch.bfloat16, device=DEV)
     out = run(a, eye)
