@@ -4,10 +4,10 @@
 #include "rotary.cuh"
 
 // RMSNorm + RoPE: out = RoPE(r[:, None] * (A @ B^T)), interleaved pairs, natural column order.
-// r is the precomputed per-row 1/rms. The caller folds the norm's gamma into B's rows; B is otherwise natural,
-// paired in registers by split_rope_pairs (gemm_base.cuh). cos_sin is one head's natural [M, Dh] table, shared
-// by all heads; columns >= rope_cols stay unrotated (ops/rotary.cuh). r is per-row, so it commutes with the
-// rotation.
+// r is the precomputed per-row 1/rms. A is the RMSNorm input already times the norm's gamma (hg, written by the
+// producing residual_rms_gamma GEMM); B is the plain [N, K] weight, paired in registers by split_rope_pairs
+// (gemm_base.cuh). cos_sin is one head's natural [M, Dh] table, shared by all heads; columns >= rope_cols stay
+// unrotated (ops/rotary.cuh). r is per-row, so it commutes with the rotation.
 struct RmsnormRopeGlobals {
     _gl_A a; _gl_B b; _gl_C c;
     gl<float, -1, -1, -1, -1> r;        // [M] fp32; as a 4-D gl: [1, 1, 1, M]

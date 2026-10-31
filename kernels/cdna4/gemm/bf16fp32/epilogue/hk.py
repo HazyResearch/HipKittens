@@ -11,16 +11,17 @@ applies r in its epilogue. So rmsnorm(x, gamma) @ W.t() == r * ((x * gamma) @ W.
     q  = hk.matmul(xg, Wq, epilogue="rmsnorm_rope", r=r, cos_sin=cs)   # cs: one head's [M, Dh]
     q, k, v = hk.qkv(xg, Wq, Wk, Wv, r=r, cos_sin=cs)    # one GEMM launch over the three weights; V is not rotated
     r  = hk.inv_rms(x, W2)                               # [M] fp32 = 1 / rms(x @ W2.t())
-    h, r = hk.residual_rms(x, Wo, residual)              # without gamma: h and r only
+    h, _, r = hk.residual_rms(x, Wo, residual)           # without gamma: hg is None
     hk.available()                                       # {epilogue: [argument names]}
 
-Every call launches on torch.cuda.current_stream() and does not synchronize. Inputs are never
-converted: a wrong dtype, shape or device raises. A scalar `alpha` may be a Python number.
-Shapes: M and N multiples of 256, K a multiple of 128. The tk_<name> modules must be built
-(make KERNEL=<name>) and importable.
+Every call launches on torch.cuda.current_stream() of the inputs' GPU and does not synchronize. Inputs are never
+converted: a wrong dtype, shape or device raises ValueError (a wrong argument name, TypeError). A scalar `alpha` may
+be a Python number. Shapes: M and N multiples of 256, K a multiple of 128. The tk_<name> modules must be built
+(make KERNEL=<name>) and importable; they are internal (they do not select the GPU), so call them through hk.
 """
 import importlib
 from dataclasses import dataclass
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -40,7 +41,7 @@ _EPILOGUES = {
     "silu":           _Spec("tk_silu"),
     "scale":          _Spec("tk_scale", (("alpha", "scalar"),)),
     "residual_add":   _Spec("tk_residual_add", (("residual", "tile"),)),
-    "rmsnorm_scale":  _Spec("tk_rmsnorm_scale", (("r", "row"), ("gamma", "col"))),
+    "rmsnorm_scale":  _Spec("tk_rmsnorm_scale", (("r", "row"), ("out_gamma", "col"))),   # output RMSNorm
     "rmsnorm":        _Spec("tk_rmsnorm_scale", (("r", "row"),), unit_gamma=True),
     "swiglu":         _Spec("tk_swiglu", half_width=True),
     "rmsnorm_swiglu": _Spec("tk_rmsnorm_swiglu", (("r", "row"),), half_width=True),
@@ -86,12 +87,14 @@ def _require(t, name, dtype, shape, device=None):
 
 
 def _weight(x, w, name="w"):
-    """Check x [M, K] and the weight w [N, K] (bf16, contiguous, N % 256 == 0, K % 128 == 0); return (M, N, K)."""
+    """Check x [M, K] and the weight w [N, K] (bf16, contiguous, M and N % 256 == 0, K % 128 == 0); return (M, N, K)."""
     _require(w, name, BF16, (None, None))
     N, K = w.shape
     if K % 128 or N % 256:
         raise ValueError(f"{name} must be [N, K] with N % 256 == 0 and K % 128 == 0, got {tuple(w.shape)}")
     _require(x, "x", BF16, (None, K))
+    if x.shape[0] % 256:
+        raise ValueError(f"x must be [M, K] with M % 256 == 0, got {tuple(x.shape)}")
     _require(w, name, BF16, (N, K), x.device)
     return x.shape[0], N, K
 
@@ -119,9 +122,11 @@ def _argument(name, kind, value, M, N, device):
 def matmul(x, w, epilogue=None, **args):
     """GEMM x @ w.t() with a fused epilogue; returns a new bf16 output ([M, N], or [M, N/2] for swiglu variants).
 
-    x: bf16 [M, K]; for the rmsnorm* epilogues, the RMSNorm input already multiplied by its gamma (as
-    hk.residual_rms(..., gamma=g) writes it). w: bf16 [N, K]. args: the epilogue's inputs by name (see
-    hk.available()). Launches on torch.cuda.current_stream()."""
+    x: bf16 [M, K]. For "rmsnorm", "rmsnorm_swiglu" and "rmsnorm_rope" (and hk.qkv), x is the RMSNorm input
+    already multiplied by its gamma, as hk.residual_rms(..., gamma=g) writes it: an unscaled x silently gives an
+    RMSNorm without gamma, which hk cannot detect. "rmsnorm_scale" instead normalizes the GEMM's OUTPUT: pass the raw
+    x, r = hk.inv_rms(x, w) and out_gamma, the norm's weight over the N output columns. w: bf16 [N, K]. args: the
+    epilogue's inputs by name (see hk.available()). Launches on torch.cuda.current_stream()."""
     name = "noop" if epilogue is None else epilogue
     spec = _EPILOGUES.get(name)
     if spec is None:
@@ -155,12 +160,19 @@ def inv_rms(x, w):
     return r
 
 
+class ResidualRMS(NamedTuple):
+    """hk.residual_rms's result: one fixed layout, so out[1] is always hg and out.r always r."""
+    h: torch.Tensor                 # bf16 [M, N], the next residual stream
+    hg: Optional[torch.Tensor]      # bf16 [M, N] h * gamma when gamma is given, else None
+    r: torch.Tensor                 # fp32 [M], 1 / rms(h)
+
+
 def residual_rms(x, w, residual, gamma=None):
     """h = x @ w.t() + residual (bf16 [M, N], the next residual stream) and r = 1 / rms(h) per row (fp32 [M],
-    eps 1e-5, from h before its bf16 rounding), via one GEMM + rms_reduce. Returns (h, r).
+    eps 1e-5, from h before its bf16 rounding), via one GEMM + rms_reduce. Returns ResidualRMS(h, hg, r).
 
     With gamma (bf16 [N], the gain of the RMSNorm that h feeds), the same GEMM also writes hg = h * gamma, the
-    input of the consuming GEMM, and returns (h, hg, r). r is always computed from h, not hg."""
+    input of the consuming GEMM; without it hg is None. r is always computed from h, not hg."""
     M, N, K = _weight(x, w)
     _require(residual, "residual", BF16, (M, N), x.device)
     if gamma is not None:
@@ -176,7 +188,7 @@ def residual_rms(x, w, residual, gamma=None):
             hg = torch.empty_like(h)
             importlib.import_module("tk_residual_rms_gamma").dispatch(x, w, h, residual, partials, gamma, hg, stream)
         importlib.import_module("tk_rms_reduce").dispatch(partials, r, stream)
-    return (h, r) if gamma is None else (h, hg, r)
+    return ResidualRMS(h, None if gamma is None else hg, r)
 
 
 def qkv(x, wq, wk, wv, r, cos_sin):

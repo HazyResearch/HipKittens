@@ -24,10 +24,10 @@ BAD_SHAPES = [(384, 256, 128), (256, 256, 192)]                                 
 
 
 def hk_shape_error(M, N, K):
-    """(exception, message) hk raises for a BAD_SHAPES case: hk (Python) checks K, launch (C++) checks M."""
+    """(exception, message) hk raises for a BAD_SHAPES case: hk (Python) checks K and M before any launch."""
     if K % 128:
         return ValueError, "K % 128 == 0"
-    return RuntimeError, "M and N must be multiples of 256"
+    return ValueError, "M % 256 == 0"
 
 
 _modules = {}
@@ -55,15 +55,23 @@ def stream():
 
 
 def weight(b, gamma=None):
-    """The [N, K] weight the kernels read for test operand b. With gamma, b's columns are scaled by it (fp32
-    product, one bf16 rounding): the same product the rmsnorm* epilogues compute when their input carries gamma."""
+    """The plain [N, K] weight the kernels read for test operand b. With gamma, b's K columns are scaled by it (fp32
+    product, one bf16 rounding): the tests' stand-in for an input that carries the norm's gamma, since
+    (a * gamma) @ b.T == a @ (b * gamma).T. hk itself never folds gamma into a weight."""
     return b if gamma is None else (b.float() * gamma.float()[None, :]).to(torch.bfloat16)
 
 
 def pow2_gamma(K, seed=7):
-    """bf16 gamma of powers of two (0.5, 1, 2), so folding it into b keeps the GEMM exact."""
+    """bf16 gamma of powers of two (0.5, 1, 2), so scaling b's columns by it keeps the GEMM exact."""
     g = torch.Generator(device=DEV).manual_seed(seed)
     return (2.0 ** torch.randint(-1, 2, (K,), generator=g, device=DEV).float()).to(torch.bfloat16)
+
+
+def general_gamma(n, seed=7):
+    """bf16 gamma in [0.5, 1.5), not powers of two: multiplying by it changes the mantissa, so a result rounded
+    before the multiply differs from one rounded after (unlike pow2_gamma)."""
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    return (torch.rand(n, generator=g, device=DEV) + 0.5).to(torch.bfloat16)
 
 
 def inputs(M, N, K, kind, seed=0):
@@ -131,3 +139,9 @@ def assert_rel_close(got, ref, rel):
     """|got - ref| <= rel * |ref| elementwise (so ref == 0 requires got == 0)."""
     bad = (got - ref).abs() > rel * ref.abs()
     assert not bad.any(), _report(bad, got, ref, f"exceed relative error {rel:.2e}")
+
+
+def assert_norm_close(got, want, rel):
+    """||got - want|| <= rel * ||want||: for chains of kernels whose rounding is not element-exact."""
+    err = ((got.double() - want.double()).norm() / want.double().norm()).item()
+    assert err <= rel, f"normwise relative error {err:.2e} > {rel:.0e}"

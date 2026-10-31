@@ -6,17 +6,18 @@ import pytest
 import torch
 
 import hk
-from conftest import (BAD_SHAPES, DEV, SHAPES, assert_bitexact, assert_rel_close, assert_within_bf16_step,
-                      gemm_exact, hk_shape_error, inputs, module, pow2_gamma, weight)
+from conftest import (BAD_SHAPES, DEV, SHAPES, assert_bitexact, assert_norm_close, assert_rel_close, gemm_exact,
+                      general_gamma, hk_shape_error, inputs, module, silu_kernel, to_bf16_chopped, weight)
 from test_residual_add import residual_like
-from test_rmsnorm_swiglu import reference as rmsnorm_swiglu_reference
 
 EPS = 1e-5
 
 
 def run(a, b, residual):
     module("residual_rms"), module("rms_reduce")
-    return hk.residual_rms(a, weight(b), residual)
+    out = hk.residual_rms(a, weight(b), residual)
+    assert out.hg is None
+    return out.h, out.r
 
 
 def reference(a, b, residual):
@@ -58,20 +59,19 @@ def test_known_answer():
     assert_rel_close(r.double(), torch.rsqrt((1 + m4.double()) ** 2 + EPS), rel(256))
 
 
-def test_chain_rmsnorm_swiglu():
-    """residual_rms -> rmsnorm_swiglu: out = swiglu(rmsnorm(a @ b.T + residual, gamma) @ W_gate_up).
-    Small integer inputs keep h exact in bf16 and the second GEMM exact in fp32, so the only allowed
-    difference is fast SiLU's one bf16 step."""
-    a, b = inputs(256, 256, 128, "random")                         # a scaled by 2^-4
-    g = torch.Generator(device=DEV).manual_seed(9)
-    residual = (torch.randint(-2, 3, (256, 256), generator=g, device=DEV).float() * 2.0 ** -4).to(torch.bfloat16)
-    h, r = run(a, b, residual)
-    assert torch.equal(h.float(), gemm_exact(a, b) + residual.float())   # h exact: no rounding in the chain input
-    _, b2 = inputs(256, 1024, 256, "random", seed=1)               # W_gate_up as [2*d_ff, d_model]
-    gamma = pow2_gamma(256)
-    module("rmsnorm_swiglu")
-    out = hk.matmul(h, weight(b2, gamma=gamma), epilogue="rmsnorm_swiglu", r=r)
-    assert_within_bf16_step(out, rmsnorm_swiglu_reference(h, b2, r, gamma))
+def test_chain_gamma_into_rmsnorm_swiglu():
+    """The layer's MLP input: residual_rms(gamma=g) writes hg = h * g, and rmsnorm_swiglu multiplies hg by the PLAIN
+    gate_up weight and applies r. Must match swiglu(rmsnorm(h, g) @ W.t()) computed from h, g and an fp64 r."""
+    module("residual_rms_gamma"), module("rms_reduce"), module("rmsnorm_swiglu")
+    a, b = inputs(256, 256, 128, "random")
+    res = residual_like(256, 256, 1.0)
+    g = general_gamma(256, seed=13)
+    out = hk.residual_rms(a, weight(b), res, gamma=g)
+    _, w = inputs(256, 1024, 256, "random", seed=1)                # W_gate_up [2*d_ff, d_model]
+    y = hk.matmul(out.hg, w, epilogue="rmsnorm_swiglu", r=out.r)
+    h_ref, r_ref = reference(a, b, res)
+    gu = (h_ref.double() * r_ref[:, None] * g.double()[None, :]) @ w.double().T
+    assert_norm_close(y, silu_kernel(gu[:, :512].float()).double() * gu[:, 512:], 1e-2)
 
 
 @pytest.mark.parametrize("M,N,K", BAD_SHAPES)
@@ -96,21 +96,24 @@ def test_rejects_wrong_residual_shape():
 
 @pytest.mark.parametrize("M,N,K", SHAPES)
 def test_gamma_output(M, N, K):
-    """With gamma, the same GEMM also writes hg = h * gamma (from h before its bf16 rounding); h and r are bitwise
-    the gamma-less call's, so r stays the norm of h, not of hg."""
+    """With gamma, the same GEMM also writes hg = h * gamma from h in fp32, before h's bf16 rounding; h and r are
+    bitwise the gamma-less call's, so r stays the norm of h, not of hg. A non-power-of-two gamma makes rounding h
+    first give different bits, so the bit-exact check pins the order."""
     module("residual_rms_gamma")
     a, b = inputs(M, N, K, "random")
     res = residual_like(M, N, 1.0)
-    gamma = pow2_gamma(N, seed=11)
+    gamma = general_gamma(N, seed=11)
     h0, r0 = run(a, b, res)
     h, hg, r = hk.residual_rms(a, weight(b), res, gamma=gamma)
     assert torch.equal(h, h0) and torch.equal(r, r0)
     h_ref, _ = reference(a, b, res)
-    assert_within_bf16_step(hg, h_ref * gamma.float()[None, :])
+    assert_bitexact(hg, h_ref * gamma.float()[None, :])
+    rounded_first = to_bf16_chopped(to_bf16_chopped(h_ref).float() * gamma.float()[None, :])
+    assert (rounded_first != hg).any()                            # the data can tell the two orders apart
 
 
 def test_rejects_wrong_gamma():
     module("residual_rms_gamma")
     a, b = inputs(256, 256, 128, "random")
     with pytest.raises(ValueError, match="gamma must be"):
-        hk.residual_rms(a, weight(b), residual_like(256, 256, 1.0), gamma=pow2_gamma(128))
+        hk.residual_rms(a, weight(b), residual_like(256, 256, 1.0), gamma=general_gamma(128))

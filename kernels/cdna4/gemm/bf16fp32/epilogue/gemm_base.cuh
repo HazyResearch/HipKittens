@@ -32,16 +32,29 @@ constexpr bool splits_rope_pairs() {
     else return false;
 }
 
-// gemm_kernel is a copy of the base GEMM's micro_tk (kernels/cdna4/gemm/bf16fp32/256_256_64_32_with16x32.cpp)
-// with four changes: it is templated on <Epilogue, Globals>, an unused debug variable is removed, the B
-// loads use b_half0/b_half1/b_k1 (split_gate_up, split_rope_pairs above), and the four final stores are
-// replaced by Epilogue::apply(...). Re-copy the loop if the base changes.
+// Globals with b_k, b_v, q_blocks and qk_blocks read three B tensors (hk.qkv: b = Wq, b_k = Wk, b_v = Wv) in one
+// launch; gemm_kernel picks one per 256-column block and launch() sets the block boundaries.
+template<typename Globals>
+constexpr bool has_three_b = requires(const Globals& g) { g.b_k; g.b_v; g.q_blocks; g.qk_blocks; };
+
+// gemm_kernel is a copy of the base GEMM's micro_tk (kernels/cdna4/gemm/bf16fp32/256_256_64_32_with16x32.cpp).
+// Re-copy the loop if the base changes, then re-apply every change below:
+//   1. Templated on <Epilogue, Globals>; the accumulator type is named Accum and checked against Epilogue::apply.
+//   2. The unused debug variable `condition` is removed.
+//   3. Three-B globals: each block picks its B tensor gb and its column bcol within it before the loop.
+//   4. Every B access uses gb: prefill_swizzled_offsets, the base pointer, the row stride and the buffer resource,
+//      whose range is gb.rows() * stride instead of N * stride.
+//   5. Buffer-resource sizes are computed in unsigned 32-bit math (launch() refuses operands of 4 GiB or more).
+//   6. B loads use b_half0 / b_half1 / b_k1 (split_gate_up, split_rope_pairs above) instead of col*2 / col*2 + 1.
+//   7. The four final stores are replaced by Epilogue::apply(...).
 template<typename Epilogue = NoOpEpilogue, typename Globals = gemm_args_base>
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void gemm_kernel(const Globals g, int M, int N, int K) {
     using Accum = rt_fl<HALF_REG_BLOCK_M, HALF_REG_BLOCK_N, col_l, rt_16x16_s>[2][2];
     static_assert(requires(const Globals& gg, Accum& acc) { Epilogue::apply(gg, acc, 0,0,0,0); },
         "Epilogue must define: static apply(const Globals&, Accum (&)[2][2], int row, int col, int wr, int wc)");
+    static_assert(!(has_three_b<Globals> && splits_gate_up<Epilogue>()),
+        "split_gate_up assumes one B tensor: b_half1 uses the total N, which spans all three B tensors");
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
     using ST_A = st_bf<HALF_BLOCK_SIZE, K_STEP, st_16x32_s>;
@@ -80,7 +93,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
     // three, so the block picks its B tensor and its column within it once, here. All B addressing below uses gb.
     _gl_B gb = g.b;
     int bcol = col;
-    if constexpr (requires { g.b_k; g.b_v; g.q_blocks; g.qk_blocks; }) {
+    if constexpr (has_three_b<Globals>) {
         if (col >= g.qk_blocks)     { gb = g.b_v; bcol = col - g.qk_blocks; }
         else if (col >= g.q_blocks) { gb = g.b_k; bcol = col - g.q_blocks; }
     }
@@ -338,7 +351,7 @@ void gemm_kernel(const Globals g, int M, int N, int K) {
 // (or [M, Epilogue::out_cols(N)] for epilogues that narrow the output).
 template<typename Epilogue, typename Globals>
 void launch(Globals g, hipStream_t stream = 0) {
-    constexpr bool three_b = requires { g.b_k; g.b_v; g.q_blocks; g.qk_blocks; };
+    constexpr bool three_b = has_three_b<Globals>;
     int N = g.b.rows();
     if constexpr (three_b) N += g.b_k.rows() + g.b_v.rows();
     const int M = g.a.rows(), K = g.a.cols();

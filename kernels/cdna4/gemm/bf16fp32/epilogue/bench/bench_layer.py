@@ -12,10 +12,10 @@ Phases (HK launches): qkv (4: one hk.qkv GEMM over the three weights + 3 copies)
 gate_up (1), down (2). HK splits RMSNorm across phases: the producer GEMM (out_proj, down) emits r = 1/rms(h) and
 h * gamma, the consumer GEMM (gate_up, the next layer's qkv) multiplies h * gamma by a plain weight and applies r.
 Torch normalizes in the consumer with F.rms_norm(x, gamma). Every implementation reads the same plain [N, K] weights;
-nothing is prepared. The HK layer's inputs r_attn = 1/rms(x) and x * gamma_attn are computed once, outside timing
-(a previous layer's down phase emits both, and this layer's down phase pays for the next layer's); torch normalizes
-its input inside the timed qkv phase and also computes r_next in down, so a timed torch layer does one more RMS
-reduction than the HK layer. Per-phase times do not line up op-for-op.
+nothing is prepared. The HK layer's inputs r_attn = 1/rms(x) and x * gamma_attn are computed once, outside timing (a
+previous layer's down phase emits both, and this layer's down phase pays for the next layer's). Each timed layer does
+two RMS reductions: HK in its producers (r_mlp in out_proj, r_next in down), torch in its consumers (F.rms_norm in
+qkv and gate_up). Per-phase times do not line up op-for-op.
 
 Build first: make KERNEL=<m> in the epilogue directory for every m in MODULES, and the attention kernel per
 M with bench/build_attn.sh <H> <H_KV> <Dh> <M>...
@@ -166,9 +166,7 @@ class Layer:
         return F.silu(gu[:, :self.d_ff]) * gu[:, self.d_ff:]
 
     def t_down(self, g, h):
-        x_out = h + g @ self.W["dn"].t()
-        r_next = torch.rsqrt(torch.linalg.vector_norm(x_out, dim=-1, dtype=torch.float32).square() / self.d + common.EPS)
-        return x_out, r_next
+        return h + g @ self.W["dn"].t()                             # x_out; the next layer normalizes it in its qkv
 
     # ---- fp32 references, applied to either implementation's captured inputs ----
     def ref_qkv(self, x):
@@ -241,7 +239,7 @@ class Layer:
         o = self.t_attention(q, k, v)
         h = self.t_out_proj(o, x)
         g = self.t_gate_up(h)
-        return self.t_down(g, h)                                    # x_out, r_next
+        return self.t_down(g, h)                                    # x_out
 
     def ref_layer(self, x):
         q, k, v = self.ref_qkv(x)
@@ -278,7 +276,7 @@ def phases(L, a, b):
                          lambda: L.ref_gate_up(a["h"]), lambda: L.ref_gate_up(b["h"]), (S,), (S,),
                          lambda: L.f_gate_up(a["hg"], a["r_mlp"])),
         "down": Phase(lambda: L.hk_down(a["g"], a["h"]), L.t_down, (b["g"], b["h"]),
-                      lambda: L.ref_down_hk(a["g"], a["h"]), lambda: L.ref_down(b["g"], b["h"]), (S, S, V), (S, V),
+                      lambda: L.ref_down_hk(a["g"], a["h"]), lambda: L.ref_down(b["g"], b["h"])[:1], (S, S, V), (S,),
                       lambda: L.f_down(a["g"], a["h"])),
     }
 
@@ -338,8 +336,8 @@ def run_full(L, timer, phase_rows):
     comp = lambda: compiled(L.x)
     want = L.ref_layer(L.x)
     ok_hk, rel_hk = common.layer_check(hk_fn()[:2], want)            # x_out, r_next (xg_out: checked per phase)
-    ok_eager, rel_eager = common.layer_check(eager(), want)
-    ok_comp, rel_comp = common.layer_check(comp(), want)            # first call compiles + autotunes, untimed
+    ok_eager, rel_eager = common.layer_check((eager(),), want[:1])  # torch: x_out only
+    ok_comp, rel_comp = common.layer_check((comp(),), want[:1])     # first call compiles + autotunes, untimed
     ok = ok_hk and ok_eager and ok_comp
     row = dict(M=L.M, rel_hk=rel_hk, rel_eager=rel_eager, rel_compile=rel_comp, status="PASS" if ok else "FAIL")
     if ok:

@@ -94,16 +94,16 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
   | noop | none | 0 |
   | silu, scale, residual_add | D | 2·MN |
   | rmsnorm_scale | D, D·r | 4·MN |
-  | rmsnorm | x·r, x·r·g | 4·MK |
+  | rmsnorm | x·r, x·r·g, minus HK's producer store of x·g | 3·MK |
   | swiglu | D, silu(gate) (half width) | 3·MN |
-  | rmsnorm_swiglu | rmsnorm + swiglu | 4·MK + 3·MN |
+  | rmsnorm_swiglu | rmsnorm + swiglu | 3·MK + 3·MN |
   | rope | D, six half-width products and sums | 8·MN |
-  | rmsnorm_rope | rmsnorm + rope | 4·MK + 8·MN |
+  | rmsnorm_rope | rmsnorm + rope | 3·MK + 8·MN |
   | inv_rms | D | 2·MN − HK's fp32 partials, 2·(N/64)·M·4 |
   | residual_rms | D, second read of h (1/rms), third read of h (h·g) | 4·MN − HK's fp32 partials |
 
-  The `rmsnorm*` rows give HK `x · g` and `r` as its producer would write them; the producer's cost (the extra
-  `h · g` store) is in the `residual_rms` row, which runs the gamma-producing form.
+  The `rmsnorm*` rows give HK `x · g` and `r` as its producer would write them. The bounds are net of that
+  producer's extra `h · g` store (one MK), which eager PyTorch does not write.
 
 ## Layer phases and boundary rules
 
@@ -113,14 +113,14 @@ memory grows as H·M²: 405B at M = 16384 needs about 128 GiB for the scores alo
 | 2 | attention | `gqa_causal` on contiguous q, k, v | transposes, then SDPA |
 | 3 | out_proj | `residual_rms(o, Wo, x, gamma=g_mlp)`: 2 launches, writes h, h·g_mlp, r | `x + o @ Wo.t()` |
 | 4 | gate_up | `rmsnorm_swiglu` on h·g_mlp: 1 launch | `rms_norm(h, g_mlp)`, matmul, `silu(gate) * up` |
-| 5 | down | `residual_rms(g, Wd, h, gamma=g_attn)`: 2 launches, writes x_out, x_out·g_attn, r | `h + g @ Wd.t()`, then 1/rms for the next layer |
+| 5 | down | `residual_rms(g, Wd, h, gamma=g_attn)`: 2 launches, writes x_out, x_out·g_attn, r | `h + g @ Wd.t()` |
 
 - HK splits RMSNorm across phases: the producing GEMM emits r = 1/rms and h·gamma, the consuming GEMM applies r.
   PyTorch normalizes in the consumer, so a single phase does not compare op-for-op.
 - HK's layer inputs `r_attn` and `x · g_attn` are computed once outside timing (a previous layer's down phase
-  would emit them, as this layer's down phase emits the next layer's). PyTorch normalizes its input inside the
-  timed qkv phase and also computes `r_next` in `down`, so a timed PyTorch layer does one more RMS reduction than
-  the HK layer; in a stack of layers PyTorch would not need `r_next`.
+  would emit them, as this layer's down phase emits the next layer's). Each timed layer does two RMS reductions:
+  HK in its producers (`r_mlp` in out_proj, `r_next` in down), PyTorch in its consumers (`rms_norm` in qkv and
+  gate_up).
 - **fusion-only control (`--phases`):** for every GEMM phase, the same HK GEMM(s) with the `noop` epilogue on
   HK's own inputs, with the epilogue's work as eager PyTorch (QKV: `(x · g) · r`, one noop GEMM over the three
   weights, RoPE and the V copy; out_proj/down: residual add, `h · g` and 1/rms; gate_up: `(h · g) · r`, SwiGLU).

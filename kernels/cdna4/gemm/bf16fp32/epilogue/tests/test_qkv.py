@@ -6,9 +6,13 @@ import pytest
 import torch
 
 import hk
-from conftest import DEV, bf16_step, inputs, module
+from conftest import (DEV, assert_norm_close, bf16_step, general_gamma, inputs, module)
+from test_residual_add import residual_like
+from test_residual_rms import reference as residual_rms_reference
 from test_rmsnorm_rope import r_like
-from test_rope import cos_sin_table
+from test_rope import cos_sin_table, rotate
+
+MODULES = ("rmsnorm_rope_qkv", "rmsnorm_rope", "rmsnorm_scale")
 
 
 def weights(K, Nq, Nkv):
@@ -16,22 +20,84 @@ def weights(K, Nq, Nkv):
     return [inputs(256, N, K, "random", seed=s)[1] for s, N in ((1, Nq), (2, Nkv), (3, Nkv))]
 
 
-@pytest.mark.parametrize("M,Nq,Nkv,K", [(256, 512, 256, 128), (2048, 4096, 1024, 4096)])
-def test_matches_separate_calls(M, Nq, Nkv, K):
-    for name in ("rmsnorm_rope_qkv", "rmsnorm_rope", "rmsnorm_scale"):
-        module(name)
-    a, _ = inputs(M, 256, K, "random")
-    wq, wk, wv = weights(K, Nq, Nkv)
-    r = r_like(M)
-    cs = cos_sin_table(M, 128)                                     # one 128-wide head's table, shared
-
-    q, k, v = hk.qkv(a, wq, wk, wv, r=r, cos_sin=cs)
-
+def assert_matches_separate_calls(a, wq, wk, wv, r, cs, q, k, v):
     assert torch.equal(q, hk.matmul(a, wq, "rmsnorm_rope", r=r, cos_sin=cs))
     assert torch.equal(k, hk.matmul(a, wk, "rmsnorm_rope", r=r, cos_sin=cs))
     v_ref = hk.matmul(a, wv, "rmsnorm", r=r)
     assert ((v.float() - v_ref.float()).abs() <= bf16_step(v_ref.float())).all()
     assert all(t.is_contiguous() for t in (q, k, v))
+
+
+@pytest.mark.parametrize("M,Nq,Nkv,K,Dh", [
+    (256, 512, 256, 128, 128),
+    (2048, 4096, 1024, 4096, 128),
+    (256, 256, 256, 128, 128),            # Nq == Nkv (MHA): the Q / K block boundary is one block in
+    (512, 2048, 512, 2048, 64),           # Dh = 64 (Llama-3.2-1B): heads restart every 32 pairs
+])
+def test_matches_separate_calls(M, Nq, Nkv, K, Dh):
+    for name in MODULES:
+        module(name)
+    a, _ = inputs(M, 256, K, "random")
+    wq, wk, wv = weights(K, Nq, Nkv)
+    r, cs = r_like(M), cos_sin_table(M, Dh)
+    assert_matches_separate_calls(a, wq, wk, wv, r, cs, *hk.qkv(a, wq, wk, wv, r=r, cos_sin=cs))
+
+
+def test_side_stream():
+    """Input written on stream s, then qkv (one launch and three copies) on s with no sync in between: all four
+    must run on s."""
+    for name in MODULES:
+        module(name)
+    a0, _ = inputs(4096, 256, 4096, "random")
+    wq, wk, wv = weights(4096, 4096, 1024)
+    r, cs = r_like(4096), cos_sin_table(4096, 128)
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        a = a0 * 1                                               # written on s
+        q, k, v = hk.qkv(a, wq, wk, wv, r=r, cos_sin=cs)
+    s.synchronize()
+    assert_matches_separate_calls(a0, wq, wk, wv, r, cs, q, k, v)
+
+
+def test_graph_capture():
+    """qkv is captured into a graph and replays correctly on new inputs."""
+    for name in MODULES:
+        module(name)
+    a1, _ = inputs(256, 256, 128, "random", seed=1)
+    a2, _ = inputs(256, 256, 128, "random", seed=2)
+    wq, wk, wv = weights(128, 512, 256)
+    r, cs = r_like(256), cos_sin_table(256, 128)
+    static_a = a1.clone()
+    hk.qkv(static_a, wq, wk, wv, r=r, cos_sin=cs)                 # warm-up (loads the module's code object)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_qkv = hk.qkv(static_a, wq, wk, wv, r=r, cos_sin=cs)
+    static_a.copy_(a2)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_matches_separate_calls(a2, wq, wk, wv, r, cs, *static_qkv)
+
+
+def test_chain_gamma_into_qkv():
+    """The layer's attention input: the previous down GEMM, residual_rms(gamma=g), writes hg = h * g; qkv multiplies
+    hg by the PLAIN weights and applies r. Must match RoPE(rmsnorm(h, g) @ W.t()) from h, g and an fp64 r."""
+    module("residual_rms_gamma"), module("rms_reduce"), module("rmsnorm_rope_qkv")
+    a, b = inputs(256, 256, 128, "random")
+    res = residual_like(256, 256, 1.0)
+    g = general_gamma(256, seed=13)
+    out = hk.residual_rms(a, b, res, gamma=g)
+    wq, wk, wv = weights(256, 512, 256)
+    cs = cos_sin_table(256, 128)
+    q, k, v = hk.qkv(out.hg, wq, wk, wv, r=out.r, cos_sin=cs)
+    h_ref, r_ref = residual_rms_reference(a, b, res)
+    xn = h_ref.double() * r_ref[:, None] * g.double()[None, :]
+    for got, w, rotated in ((q, wq, True), (k, wk, True), (v, wv, False)):
+        want = xn @ w.double().T
+        if rotated:
+            want = rotate(want.float(), cs.repeat(1, w.shape[0] // 128)).double()
+        assert_norm_close(got, want, 1e-2)
 
 
 def test_rejects_mismatched_kv():
@@ -56,3 +122,14 @@ def test_rejects_head_dim_not_dividing_split():
     wq, wk, wv = weights(128, 512, 256)
     with pytest.raises(ValueError, match="must be even and divide Nq"):
         hk.qkv(a, wq, wk, wv, r=r_like(256), cos_sin=cos_sin_table(256, 512))
+
+
+def test_rejects_misaligned_table_and_wrong_r():
+    a, _ = inputs(256, 256, 128, "random")
+    wq, wk, wv = weights(128, 512, 256)
+    cs = torch.empty(256 * 128 + 1, dtype=torch.bfloat16, device=DEV)[1:].view(256, 128)
+    cs.copy_(cos_sin_table(256, 128))
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        hk.qkv(a, wq, wk, wv, r=r_like(256), cos_sin=cs)
+    with pytest.raises(ValueError, match="r must be"):
+        hk.qkv(a, wq, wk, wv, r=r_like(256).bfloat16(), cos_sin=cos_sin_table(256, 128))

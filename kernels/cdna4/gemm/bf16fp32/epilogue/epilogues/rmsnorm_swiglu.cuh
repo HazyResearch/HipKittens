@@ -4,9 +4,9 @@
 #include "activations.cuh"
 
 // RMSNorm + SwiGLU (dim-reducing): out = silu(gate) * value, where [gate | value] = r[:, None] * (A @ B^T).
-// r is the precomputed per-row 1/rms. The caller folds the norm's per-feature gamma into B's rows
-// (rmsnorm(x, gamma) @ W == r * (x @ (gamma-folded W))). b is otherwise the natural W_gate_up operand;
-// split_gate_up pairs gate and value in registers as for SwiGLU (epilogues/swiglu.cuh).
+// r is the precomputed per-row 1/rms. A is the RMSNorm input already times the norm's gamma (hg, written by the
+// producing residual_rms_gamma GEMM), so rmsnorm(x, gamma) @ W.t() == r * ((x * gamma) @ W.t()). B is the plain
+// [N, K] W_gate_up; split_gate_up pairs gate and value in registers as for SwiGLU (epilogues/swiglu.cuh).
 struct RmsnormSwigluGlobals {
     _gl_A a; _gl_B b; _gl_C c;
     gl<float, -1, -1, -1, -1> r;  // [M] fp32; as a 4-D gl: [1, 1, 1, M]

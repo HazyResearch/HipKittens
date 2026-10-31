@@ -1,19 +1,12 @@
 #include <cstdint>
 #include "gemm_base.cuh"
 #include "rope.cuh"
+#include "rope_args.cuh"
 #include "pyutils/pyutils.cuh"
 #include "checked_bind.cuh"
 
 void dispatch(RopeGlobals g, hipStream_t stream) {
-    const int N = g.b.rows(), dh = g.cos_sin.cols();
-    if (g.cos_sin.rows() != g.a.rows() || dh <= 0 || dh % 2 || N % dh)
-        throw std::runtime_error("rope: cos_sin must be [M, Dh] with Dh even and N % Dh == 0 (M = a.rows(), N = b.rows())");
-    if (g.rope_cols < 0 || g.rope_cols > N || g.rope_cols % BLOCK_SIZE)
-        throw std::runtime_error("rope: rope_cols must be a multiple of 256 in [0, N]");
-    if (reinterpret_cast<uintptr_t>(g.c.raw_ptr) % alignof(bf16_2) != 0)
-        throw std::runtime_error("rope: output must have 4-byte alignment");
-    if (reinterpret_cast<uintptr_t>(g.cos_sin.raw_ptr) % alignof(bf16_2) != 0)   // read as bf16x2 [cos, sin]
-        throw std::runtime_error("rope: cos_sin must have 4-byte alignment");
+    check_rope_args("rope", g, g.b.rows(), {g.b.rows()});
     launch<RopeEpilogue, RopeGlobals>(g, stream);
 }
 

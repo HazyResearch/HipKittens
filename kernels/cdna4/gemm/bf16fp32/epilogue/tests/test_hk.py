@@ -3,7 +3,8 @@ import pytest
 import torch
 
 import hk
-from conftest import DEV, assert_bitexact, gemm_exact, inputs, module, pow2_gamma, weight
+from conftest import DEV, assert_bitexact, gemm_exact, general_gamma, inputs, module, pow2_gamma, stream, weight
+from test_rope import cos_sin_table
 
 MATMUL_EPILOGUES = {"noop", "silu", "scale", "residual_add", "rmsnorm_scale", "rmsnorm", "swiglu", "rmsnorm_swiglu",
                     "rope", "rmsnorm_rope"}
@@ -12,7 +13,7 @@ MATMUL_EPILOGUES = {"noop", "silu", "scale", "residual_add", "rmsnorm_scale", "r
 def test_available():
     av = hk.available()
     assert set(av) == MATMUL_EPILOGUES
-    assert av["rmsnorm_scale"] == ["r", "gamma"] and av["rmsnorm"] == ["r"] and av["noop"] == []
+    assert av["rmsnorm_scale"] == ["r", "out_gamma"] and av["rmsnorm"] == ["r"] and av["noop"] == []
     assert av["rmsnorm_rope"] == ["r", "cos_sin"]
 
 
@@ -122,7 +123,7 @@ def test_rmsnorm_ones_made_under_capture():
     r = torch.full((256,), 0.5, device=DEV)
     want = gemm_exact(a, (b.float() * gamma.float()[None, :]).to(torch.bfloat16)) * 0.5
     ones = torch.ones(768, dtype=torch.bfloat16, device=DEV)
-    hk.matmul(a, weight(b), epilogue="rmsnorm_scale", r=r, gamma=ones)   # warm-up without making hk's ones
+    hk.matmul(a, weight(b), epilogue="rmsnorm_scale", r=r, out_gamma=ones)   # warm-up without making hk's ones
     hk._ONES.pop((768, a.device), None)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -143,11 +144,26 @@ def test_inv_rms():
     assert ((got - want).abs() <= (64 + 16 + 4) * 2.0 ** -24 * want).all()
 
 
+@pytest.mark.parametrize("module_name,args", [
+    ("noop", lambda a, w, c, t: (t, w, c)),                                   # 3-D a
+    ("residual_add", lambda a, w, c, t: (a, w, c, t)),                        # 3-D residual
+])
+def test_tk_modules_refuse_3d(module_name, args):
+    """The raw tk_* modules pad tensors to 4-D, so a 3-D [B, M, K] tensor would silently compute only slice 0:
+    every tensor argument must be 1-D or 2-D."""
+    a, b = inputs(256, 256, 256, "random")
+    c = torch.empty(256, 256, dtype=torch.bfloat16, device=DEV)
+    t = a.unsqueeze(0).expand(2, 256, 256).contiguous()
+    with pytest.raises(RuntimeError, match="must be 1-D or 2-D, got 3-D"):
+        module(module_name).dispatch(*args(a, weight(b), c, t), stream())
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
 def test_cross_device():
     """GPU 0 current, every tensor on GPU 1: hk must launch on x's GPU and its current stream. Launching on
     the current device's stream instead faults with hipErrorIllegalAddress (seen on 2x MI355X)."""
     module("noop"), module("residual_add"), module("partialrms"), module("rms_reduce")
+    module("residual_rms_gamma"), module("rmsnorm_rope_qkv")
     d0, d1 = torch.device("cuda", 0), torch.device("cuda", 1)
     with torch.cuda.device(d0):
         a, b = inputs(512, 512, 256, "random")
@@ -158,6 +174,15 @@ def test_cross_device():
             assert got.device == d1
             assert torch.equal(got.cpu(), hk.matmul(a, w0, epilogue=ep, **kw0).cpu())
         assert torch.equal(hk.inv_rms(a1, w1).cpu(), hk.inv_rms(a, w0).cpu())
+        g, g1 = general_gamma(512), general_gamma(512).to(d1)
+        for x, y in zip(hk.residual_rms(a1, w1, res1, gamma=g1), hk.residual_rms(a, w0, res, gamma=g)):
+            assert x.device == d1 and torch.equal(x.cpu(), y.cpu())
+        wq, wk = weight(b), weight(inputs(256, 256, 256, "random", seed=3)[1])
+        r, cs = torch.full((512,), 0.5, device=d0), cos_sin_table(512, 128)
+        q0 = hk.qkv(a, wq, wk, wk, r=r, cos_sin=cs)
+        q1 = hk.qkv(a1, wq.to(d1), wk.to(d1), wk.to(d1), r=r.to(d1), cos_sin=cs.to(d1))
+        for x, y in zip(q1, q0):
+            assert x.device == d1 and torch.equal(x.cpu(), y.cpu())
         with pytest.raises(ValueError, match="same device as x"):
             hk.matmul(a1, w1, epilogue="residual_add", residual=res)
         with pytest.raises(ValueError, match="same device as x"):

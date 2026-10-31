@@ -7,7 +7,8 @@ Arms (all cold cache):
                row compiles fresh instead of hitting the recompile limit and silently running eager
   fusion-only  HK noop GEMM plus the same eager torch: the same GEMM as HK, so the ratio isolates fusion
 HBM saved: one analytical formula per epilogue (saved= in make_case): the bytes of every [M, N] / [M, K]
-intermediate the eager code writes and reads back, minus HK's own fp32 partial sums. It ignores cache, so
+intermediate the eager code writes and reads back, minus HK's own fp32 partial sums and, for rmsnorm*, the producer's
+extra x * gamma store. It ignores cache, so
 it is an upper bound. Every row is checked against fp32 torch (HK and eager outputs) before timing; a
 failing row is not timed, and the script then exits 1.
 
@@ -61,7 +62,8 @@ def make_case(name, M, K, N, Dh):
     untimed here; eager and compile apply x * r * gamma per call (rms_scale); fusion-only scales HK's x * gamma by
     r eagerly. residual_rms is the producer form: it also writes h * gamma. saved = HBM bytes HK avoids: every
     [M, N] / [M, K] intermediate the eager code writes and reads back (bf16, write + read), minus HK's own fp32
-    partial-sum round trip. Vector-sized tensors are ignored. The README lists the same formulas."""
+    partial-sum round trip and, for input-RMSNorm rows, the producer's x * gamma store. Vector-sized tensors are
+    ignored. The README lists the same formulas."""
     x, W = common.activation(M, K), common.weight(K, N)
     f = lambda t: t.float()
     xw = lambda: f(x) @ f(W).t()
@@ -91,13 +93,13 @@ def make_case(name, M, K, N, Dh):
                     lambda: xw() + f(res), saved=2 * MN)
     if name == "rmsnorm_scale":                   # D, D*r
         r, gc = common.inv_rms(x), common.gamma(N)
-        return case(lambda: hk.matmul(x, W, "rmsnorm_scale", r=r, gamma=gc), ident,
+        return case(lambda: hk.matmul(x, W, "rmsnorm_scale", r=r, out_gamma=gc), ident,
                     lambda D: rms_scale(D, r, gc), lambda: xw() * r[:, None] * f(gc), saved=4 * MN)
     if name == "rmsnorm":                         # x*r, x*r*g
         r, g = common.inv_rms(x), common.gamma(K)
         xg = scaled(g)
         return case(lambda: hk.matmul(xg, W, "rmsnorm", r=r), lambda t: rms_scale(t, r, g), ident,
-                    lambda: (f(x) * r[:, None] * f(g)) @ f(W).t(), saved=4 * MK,
+                    lambda: (f(x) * r[:, None] * f(g)) @ f(W).t(), saved=3 * MK,
                     fusion=lambda: hk.matmul(row_scale(xg, r), W))
     if name == "swiglu":                          # D, silu(gate) (half width)
         return case(lambda: hk.matmul(x, W, "swiglu"), ident, swiglu, lambda: swiglu(xw()), saved=3 * MN)
@@ -105,7 +107,7 @@ def make_case(name, M, K, N, Dh):
         r, g = common.inv_rms(x), common.gamma(K)
         xg = scaled(g)
         return case(lambda: hk.matmul(xg, W, "rmsnorm_swiglu", r=r), lambda t: rms_scale(t, r, g), swiglu,
-                    lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W).t()), saved=4 * MK + 3 * MN,
+                    lambda: swiglu((f(x) * r[:, None] * f(g)) @ f(W).t()), saved=3 * MK + 3 * MN,
                     fusion=lambda: swiglu(hk.matmul(row_scale(xg, r), W)))
     if name in ("rope", "rmsnorm_rope"):          # D, six half-width products and sums
         head = common.rope_table(M, Dh)                            # one head's table [M, Dh]: every arm's operand
@@ -119,7 +121,7 @@ def make_case(name, M, K, N, Dh):
         xg = scaled(g)
         return case(lambda: hk.matmul(xg, W, "rmsnorm_rope", r=r, cos_sin=head), lambda t: rms_scale(t, r, g),
                     post, lambda: common.rope((f(x) * r[:, None] * f(g)) @ f(W).t(), f(cs)),
-                    saved=4 * MK + 8 * MN, fusion=lambda: post(hk.matmul(row_scale(xg, r), W)))
+                    saved=3 * MK + 8 * MN, fusion=lambda: post(hk.matmul(row_scale(xg, r), W)))
     if name == "inv_rms":                         # D
         return case(lambda: hk.inv_rms(x, W), ident, inv_rms_eager, lambda: common.inv_rms(xw()),
                     saved=2 * MN - partials, tol=(common.VECTOR_TOL,))
