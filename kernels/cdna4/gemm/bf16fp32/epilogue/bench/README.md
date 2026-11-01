@@ -53,7 +53,7 @@ Batch-1 causal prefill at M ∈ {2048, 4096, 8192} tokens. `CONFIGS` in `common.
 | `pr1` | PR #1's shape: Llama-2-7B widths with GQA (not a real model) | 4096 | 11008 | 32 | 8 | 128 | `build_attn.sh 32 8 128 ...` |
 
 Widths are from each model's Hugging Face `config.json`, unsharded (one layer fits on one 288 GB MI355X). The fp32
-attention reference holds `[H, M, M]` scores: 405B at M = 16384 needs about 128 GiB, plus a copy in softmax.
+attention reference is computed 1024 query rows at a time, so it never holds the full `[H, M, M]` scores.
 
 ## How timing works
 

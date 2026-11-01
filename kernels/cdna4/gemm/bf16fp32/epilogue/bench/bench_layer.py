@@ -163,15 +163,21 @@ class Layer:
         k = common.rope((xn @ W["k"].float().t()).view(M, self.H_KV, Dh), cs).reshape(M, -1)
         return q, k, xn @ W["v"].float().t()
 
-    def ref_attention(self, q, k, v):
+    def ref_attention(self, q, k, v, block=1024):
+        """fp32 causal GQA attention, BLOCK query rows at a time: scores are [H, block, end] instead of [H, M, M]
+        (405B at M = 16384 would need 128 GiB). Rows i..end see keys 0..end only, as the causal mask requires."""
         M, H, H_KV, Dh = self.M, self.H, self.H_KV, self.Dh
         G = H // H_KV
         qh = q.float().reshape(M, H, Dh).transpose(0, 1)                                   # [H, M, Dh]
         kh = k.float().reshape(M, H_KV, Dh).transpose(0, 1).repeat_interleave(G, dim=0)
         vh = v.float().reshape(M, H_KV, Dh).transpose(0, 1).repeat_interleave(G, dim=0)
-        s = (qh @ kh.transpose(1, 2)) * Dh ** -0.5
-        s.masked_fill_(torch.ones(M, M, dtype=torch.bool, device="cuda").triu(1), float("-inf"))
-        return (torch.softmax(s, dim=-1) @ vh).transpose(0, 1).reshape(M, H * Dh)
+        out = torch.empty(H, M, Dh, dtype=torch.float32, device="cuda")
+        for i in range(0, M, block):
+            end = min(i + block, M)
+            s = (qh[:, i:end] @ kh[:, :end].transpose(1, 2)) * Dh ** -0.5
+            s.masked_fill_(torch.ones(end - i, end, dtype=torch.bool, device="cuda").triu(i + 1), float("-inf"))
+            out[:, i:end] = torch.softmax(s, dim=-1) @ vh[:, :end]
+        return out.transpose(0, 1).reshape(M, H * Dh)
 
     def ref_out_proj(self, o, x):
         h = x.float() + o.float() @ self.W["o"].float().t()
