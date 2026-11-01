@@ -127,5 +127,6 @@ attention reference holds `[H, M, M]` scores: 405B at M = 16384 needs about 128 
   if supported, else KV expanded. The math backend is disabled. The backend is printed and saved in the JSON.
 - **Known PyTorch miss:** with torch 2.13 + ROCm 10 (AOTriton 0.13), flash SDPA at head dim 64 (Llama-3.2-1B)
   and M ≥ 8192 returns different outputs for identical inputs; about 1 call in 8 exceeds `STAGE_TOL`, so those
-  attention rows can read `TORCH_MISS`. Head dim 128, M ≤ 4096, the CK and math SDPA backends, and torch 2.11 +
-  ROCm 7.13 (AOTriton 0.11) are deterministic.
+  attention rows can read `TORCH_MISS`. The full layer at those shapes runs the same kernel; its normwise gate
+  passes but does not rule the misses out. Head dim 128, M ≤ 4096, the CK and math SDPA backends, and torch
+  2.11 + ROCm 7.13 (AOTriton 0.11) are deterministic.
