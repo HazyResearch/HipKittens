@@ -1,7 +1,9 @@
 # Epilogue benchmarks (gfx950)
 
 Fused GEMM-epilogue kernels vs PyTorch eager and `torch.compile`. Each script checks outputs against an
-fp32 PyTorch reference before timing, prints a table, and exits non-zero if any row fails.
+fp32 PyTorch reference before timing, prints a table, and exits non-zero if any row fails. In `bench_layer.py`
+a phase whose HK outputs pass but whose eager or compiled PyTorch output misses is still timed and marked
+`TORCH_MISS` (`ok_eager` / `ok_compile` in the JSON).
 
 | Script | Question |
 |---|---|
@@ -123,3 +125,7 @@ attention reference holds `[H, M, M]` scores: 405B at M = 16384 needs about 128 
   `compile full - phases` shows what cross-phase fusion buys PyTorch.
 - **Attention baseline:** the strongest available fused SDPA backend (flash, then memory-efficient), native GQA
   if supported, else KV expanded. The math backend is disabled. The backend is printed and saved in the JSON.
+- **Known PyTorch miss:** with torch 2.13 + ROCm 10 (AOTriton 0.13), flash SDPA at head dim 64 (Llama-3.2-1B)
+  and M ≥ 8192 returns different outputs for identical inputs; about 1 call in 8 exceeds `STAGE_TOL`, so those
+  attention rows can read `TORCH_MISS`. Head dim 128, M ≤ 4096, the CK and math SDPA backends, and torch 2.11 +
+  ROCm 7.13 (AOTriton 0.11) are deterministic.

@@ -241,6 +241,6 @@ def write_json(path, script, config, rows, extra=None):
 
 
 def exit_code(rows):
-    """0 all PASS, 2 worst RERUN, 1 any FAIL."""
+    """0 all PASS (or TORCH_MISS: HK passed, a PyTorch arm missed), 2 worst RERUN, 1 any FAIL."""
     statuses = {r["status"] for r in rows}
     return 1 if "FAIL" in statuses else 2 if "RERUN" in statuses else 0

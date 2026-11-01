@@ -281,9 +281,11 @@ def run_phases(L, timer):
         ok_fusion = True
         if p.fusion is not None:
             ok_fusion, _ = common.check(p.fusion(), p.ref_hk(), common.control_tols(p.tol_hk))
-        ok = ok_hk and ok_eager and ok_comp and ok_fusion
-        row = dict(M=L.M, phase=name, hk_launches=HK_LAUNCHES[name], rel=rel, status="PASS" if ok else "FAIL")
-        if ok:
+        ok_hk = ok_hk and ok_fusion
+        status = "PASS" if ok_hk and ok_eager and ok_comp else "TORCH_MISS" if ok_hk else "FAIL"
+        row = dict(M=L.M, phase=name, hk_launches=HK_LAUNCHES[name], rel=rel, ok_eager=ok_eager, ok_compile=ok_comp,
+                   status=status)
+        if ok_hk:   # a PyTorch miss is recorded, not a reason to drop HK's timing
             t_hk, t_eager, t_comp = timer(p.hk), timer(eager), timer(comp)
             row.update(**common.ms_fields("hk", t_hk), **common.ms_fields("eager", t_eager),
                        **common.ms_fields("compile", t_comp),
@@ -297,10 +299,14 @@ def run_phases(L, timer):
     return rows
 
 
+TIMED = ("PASS", "TORCH_MISS")
+
+
 def sum_row(M, rows):
-    ok = all(r["status"] == "PASS" for r in rows)
-    row = dict(M=M, phase="sum", hk_launches=sum(r["hk_launches"] for r in rows), status="PASS" if ok else "FAIL")
-    if ok:
+    statuses = {r["status"] for r in rows}
+    status = "FAIL" if "FAIL" in statuses else "TORCH_MISS" if "TORCH_MISS" in statuses else "PASS"
+    row = dict(M=M, phase="sum", hk_launches=sum(r["hk_launches"] for r in rows), status=status)
+    if status in TIMED:
         for arm in ("hk", "eager", "compile"):
             row[f"{arm}_ms"] = sum(r[f"{arm}_ms"] for r in rows)
         row["eager_x"] = row["eager_ms"] / row["hk_ms"]
@@ -332,7 +338,7 @@ def run_full(L, timer, phase_rows):
                    **common.ms_fields("compile", t_comp),
                    eager_x=t_eager.median / t_hk.median, compile_x=t_comp.median / t_hk.median)
         phase_sum = next(r for r in phase_rows if r["M"] == L.M and r["phase"] == "sum")
-        if phase_sum["status"] == "PASS":
+        if phase_sum["status"] in TIMED:
             row["compile_full_minus_phases_ms"] = t_comp.median - phase_sum["compile_ms"]
     print(f"  M={L.M} full layer: {row['status']}", flush=True)
     return row
