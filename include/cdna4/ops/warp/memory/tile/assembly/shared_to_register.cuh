@@ -17,18 +17,32 @@
  // possible to reduce their bank conflicts with other layouts too.
  
  /**
-  * @brief Load data from a shared tile into a register tile.
+  * @brief Compute the per-lane shared addresses for an art tile.
   *
   * @tparam RT The register tile type
   * @tparam ST The shared tile type
   * @param dst[out] The destination register tile.
   * @param src[in]  The source shared tile.
+  * @return uint2_t for the two fp8 chunks (shared tile must be 2 KiB aligned), uint32_t otherwise.
   */
  
  template<ducks::art::all RT, ducks::st::all ST>
- __device__ inline static uint32_t get_address(RT &dst, const ST &src) {
+ __device__ inline static auto get_address(RT &dst, const ST &src) {
 
-     if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {
+     if constexpr (std::is_same_v<typename RT::T, fp8e4m3>) {
+        static_assert(std::is_same_v<typename ST::dtype, typename RT::T>, "register and shared tile types must match");
+        static_assert(std::is_same_v<typename RT::layout, ducks::rt_layout::row>, "fp8 operand tiles are row layout");
+        static_assert(std::is_same_v<typename RT::shape, rt_16x128_s> && std::is_same_v<typename ST::shape, st_16x128_s>,
+                      "fp8 loads take rt_16x128 subtiles from st_16x128 shared tiles");
+        static_assert(RT::rows == ST::rows && RT::cols == ST::cols && RT::width == 1, "tile shapes must match with one column subtile");
+        constexpr int chunk_stride =
+            RT::base_tile_elements_per_stride_group * sizeof(typename ST::dtype);
+        const int laneid = kittens::laneid();
+        const uint32_t base = reinterpret_cast<uintptr_t>(
+            &src.data[(laneid % RT::base_tile_rows) * ST::underlying_cols + (laneid / RT::base_tile_rows) * 16]);
+        return uint2_t{base ^ (((base % (16 * 128)) >> 8) << 4),
+                       (base + chunk_stride) ^ ((((base + chunk_stride) % (16 * 128)) >> 8) << 4)};
+     } else if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {
  
         static_assert(RT::rows == ST::rows, "register tile and shared tile must match rows");
         static_assert(RT::cols == ST::cols,  "register tile and shared tile must match cols");
@@ -110,6 +124,31 @@
     }
  }
  
+ // Load one 16-byte chunk of an fp8 subtile using addr[CHUNK] from get_address.
+ template<int N, int M, int CHUNK, ducks::art::all RT, ducks::st::all ST>
+ requires std::is_same_v<typename RT::T, fp8e4m3>
+ __device__ inline static void load(RT &dst, const ST &src, uint32_t addr) {
+    static_assert(std::is_same_v<typename RT::T, fp8e4m3> && std::is_same_v<typename ST::dtype, typename RT::T>,
+                  "register and shared tile must both be fp8e4m3");
+    static_assert(std::is_same_v<typename RT::layout, ducks::rt_layout::row>, "fp8 operand tiles are row layout");
+    static_assert(std::is_same_v<typename RT::shape, rt_16x128_s> && std::is_same_v<typename ST::shape, st_16x128_s>,
+                  "fp8 loads take rt_16x128 subtiles from st_16x128 shared tiles");
+    static_assert(RT::rows == ST::rows && RT::cols == ST::cols, "register tile and shared tile must match");
+    static_assert(N >= 0 && N < RT::height && M == 0 && RT::width == 1 && (CHUNK == 0 || CHUNK == 1),
+                  "subtile / chunk out of range");
+    using range_type = ducks::art::get_nth_range_t<typename RT::register_ranges, N>;
+    static_assert(range_type::size == 8, "an rt_16x128 fp8 subtile occupies 8 registers");
+    constexpr int row_stride = RT::base_tile_rows * ST::underlying_cols * sizeof(typename ST::dtype);
+    macros::ds_read_b128<range_type::lo + 4 * CHUNK>(addr, N * row_stride);
+ }
+
+ template<int N, int M, ducks::art::all RT, ducks::st::all ST>
+ requires std::is_same_v<typename RT::T, fp8e4m3>
+ __device__ inline static void load(RT &dst, const ST &src, uint2_t addr) {
+    load<N, M, 0>(dst, src, addr[0]);
+    load<N, M, 1>(dst, src, addr[1]);
+ }
+
  template<int N, int M, ducks::art::all RT, ducks::st::all ST>
  __device__ inline static void load(RT &dst, const ST &src, uint32_t addr) {
  
@@ -197,7 +236,12 @@
  template<ducks::art::all RT, ducks::st::all ST>
  __device__ inline static void load(RT &dst, const ST &src) {
  
-    if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {
+    if constexpr (std::is_same_v<typename RT::T, fp8e4m3>) {
+        const auto addr = get_address(dst, src);
+        [&]<std::size_t... Ns>(std::index_sequence<Ns...>) {
+            (load<Ns, 0>(dst, src, addr), ...);
+        }(std::make_index_sequence<RT::height>{});
+    } else if constexpr (std::is_same_v<typename RT::layout, ducks::rt_layout::row>) {
         static_assert(RT::rows == ST::rows, "register tile and shared tile must match rows");
         static_assert(RT::cols == ST::cols,  "register tile and shared tile must match cols");
     
@@ -482,4 +526,4 @@
      }(std::make_index_sequence<ST::subtiles_per_col>{});
  }
  
- }
+}
