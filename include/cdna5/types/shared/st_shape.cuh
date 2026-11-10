@@ -261,9 +261,12 @@ struct st_16x32_padded {
     static constexpr int pad_interval  = PAD_INTERVAL;
     static constexpr int pad_amount    = PAD_AMOUNT;
 
+    // 1-byte (fp8/fp4), 2-byte (bf16/fp16), and 4-byte (fp32) elements all move one b128 per thread.
+    // The swizzle/padded maps below are element-size-agnostic, so 1-byte just needs this entry (cf.
+    // st_16x128, which is the other 1-byte gfx1250 shape).
     template<typename _T>
     static constexpr int bytes_per_thread() {
-        if constexpr (sizeof(_T) == 2 || sizeof(_T) == 4) {
+        if constexpr (sizeof(_T) == 1 || sizeof(_T) == 2 || sizeof(_T) == 4) {
             return 16;
         } else {
             static_assert(false, "Unsupported type");
@@ -289,9 +292,15 @@ struct st_16x32_padded {
     static constexpr int storage_elems(int total_elems) { return padded_elems(total_elems); }
 };
 
+// Extension point for out-of-library shapes. Kernels that need a bespoke container shape
+// (e.g. the fused-MoE st_flat in kernels/fused_moe/.../moe_tiles.cuh) specialize this to
+// true, so kittens::st<> and the `all` concept accept the shape without the core library naming it.
+template<class> inline constexpr bool is_ext_st_shape_v = false;
+
 template<typename T>
-concept all = std::is_same_v<T, st_16x16> || 
-              std::is_same_v<T, st_16x16_swizzled> || 
+concept all = is_ext_st_shape_v<T> ||
+              std::is_same_v<T, st_16x16> ||
+              std::is_same_v<T, st_16x16_swizzled> ||
               std::is_same_v<T, st_32x32> || 
               std::is_same_v<T, st_16x32> || 
               std::is_same_v<T, st_32x16> || 
@@ -303,7 +312,8 @@ concept all = std::is_same_v<T, st_16x16> ||
               std::is_same_v<T, st_16x32_padded<512, 8>> ||
               std::is_same_v<T, st_16x32_padded<1024, 8>> ||
               std::is_same_v<T, st_16x32_padded<64, 8>> ||
-              std::is_same_v<T, st_16x32_padded<64, 4>>;
+              std::is_same_v<T, st_16x32_padded<64, 4>> ||
+              std::is_same_v<T, st_16x32_padded<256, 16>>;   // fp8 MoE A tile (16 B every 256 B)
 
 /* ----------  SHAPE KIND  ----------
  *

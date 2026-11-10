@@ -76,6 +76,16 @@ using fp4e2m1_2 = __hip_fp4x2_e2m1;
  */
 using fp4e2m1_4 = __hip_fp4x4_e2m1;
 
+/**
+ * @brief Matrix operand register for the gfx1250 block-scaled WMMA
+ * (v_wmma_scale_f32_16x16x128_f8f6f4). DWORDS uint32 per wave-32 lane. The matrix_*_fmt
+ * immediate on the instruction selects how many dwords are consumed: FP8 -> 16, FP4 -> 8.
+ */
+template<int DWORDS>
+using wmma_scaled_vec_t = uint32_t __attribute__((__vector_size__(DWORDS * sizeof(uint32_t))));
+using wmma_scaled_a_t = wmma_scaled_vec_t<16>;   // MXFP8 A: 16 u32/lane (64 B)
+using wmma_scaled_b_t = wmma_scaled_vec_t<8>;    // MXFP4 B:  8 u32/lane (32 B)
+
 namespace ducks {
 /**
  * @namespace base_types
