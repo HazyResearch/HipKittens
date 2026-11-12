@@ -12,7 +12,7 @@ void dispatch(RmsnormSwigluGlobals g, hipStream_t stream) {
 PYBIND11_MODULE(TK_MODULE_NAME, m) {
     m.doc() = "GEMM + RMSNorm + SwiGLU: c = silu(gate) * value with [gate | value] = r[:, None] * (a @ b.T); "
               "a = [M,K] the RMSNorm input times its gamma (hg from residual_rms_gamma), b = [N,K] plain weight, "
-              "rows [gate | value] (see epilogues/rmsnorm_swiglu.cuh), "
+              "rows [0, N/2) gate and [N/2, N) value, "
               "c = [M,N/2] (bf16), r = [M] (fp32)";
     bind_checked<dispatch>(m, "dispatch", {tensor_dtype::bf16, tensor_dtype::bf16, tensor_dtype::bf16, tensor_dtype::fp32},
         &RmsnormSwigluGlobals::a, &RmsnormSwigluGlobals::b, &RmsnormSwigluGlobals::c, &RmsnormSwigluGlobals::r);
