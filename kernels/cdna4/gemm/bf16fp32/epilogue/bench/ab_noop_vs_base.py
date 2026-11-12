@@ -1,7 +1,16 @@
-"""tk_noop vs the upstream base GEMM: C must be bitwise identical.
+"""Check that the template refactor did not change the base GEMM.
 
-Arms alternate over ROUNDS rounds; time = median of round medians. noop <= 3% slower: PASS; 3-5%: RERUN
-(3 fresh processes, median of medians); > 5%: FAIL. Build: `make KERNEL=noop` here and `make` in the parent.
+For each GEMM shape in one layer of --config, plus 8192^3, runs two kernels on the same bf16 inputs:
+  tk_noop    gemm_base.cuh with NoOpEpilogue (make KERNEL=noop). All fused epilogues use this kernel.
+  tk_kernel  upstream GEMM, ../256_256_64_32_with16x32.cpp (make in the parent directory).
+C must be bitwise identical. Both are timed with a cold cache (common.Timer).
+
+Timing: each kernel is one arm. One round times both arms with common.Timer (median of --iters cold
+calls). Arm order flips each round to reduce order bias. ROUNDS = 5; an arm's time is the median of its
+5 round results.
+Status from noop/base: <= 1.03 PASS (exit 0); > 1.03 and <= 1.05 RERUN (exit 2: run the script in 3
+fresh processes and compare the medians); > 1.05 or any differing bit FAIL (exit 1).
+Build: `make KERNEL=noop` here and `make` in the parent.
 """
 import importlib
 
@@ -43,7 +52,7 @@ def main():
         run_noop()
         run_base()
         torch.cuda.synchronize()
-        same = torch.equal(c_noop, c_base)
+        same = torch.equal(c_noop.view(torch.int16), c_base.view(torch.int16))  # compare raw bf16 bits
         noop_ms, base_ms = [], []
         for i in range(ROUNDS):
             arms = [(run_noop, noop_ms), (run_base, base_ms)]

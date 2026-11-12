@@ -1,10 +1,17 @@
-"""One pre-norm GQA Transformer layer: HK vs PyTorch eager vs torch.compile (rules in README.md).
+"""One pre-norm GQA Transformer layer: HK vs PyTorch eager vs torch.compile.
 
 --phases  each phase timed alone on captured intermediates, plus a fusion-only control per GEMM phase.
 --full    the whole layer (compiled as one function), and compiled full minus the sum of compiled phases.
 
 HK launches per phase: qkv 4, attention 1, out_proj 2, gate_up 1, down 2. HK's producers emit r and h * gamma
 for the next consumer; torch normalizes in the consumer. Per-phase times do not line up op-for-op.
+
+Outside the timer: inputs, the layer's starting r_attn and x * g_attn (the previous layer's down would make
+them), and torch.compile autotuning. HK computes r_mlp (out_proj) and r_next (down) inside the timer;
+PyTorch runs rms_norm inside qkv and gate_up.
+Every arm uses the same plain [N, K] weights. Attention baseline: PyTorch flash SDPA with native GQA, the only
+SDPA backend enabled; the script stops if flash cannot run the shape.
+TORCH_MISS: HK passed, but an eager or compiled PyTorch output missed tolerance; the row is still timed.
 
 Build: make KERNEL=<m> for every m in MODULES, and bench/build_attn.sh <H> <H_KV> <Dh> <M>...
 """
@@ -14,7 +21,6 @@ import importlib
 import torch
 import torch._dynamo
 import torch.nn.functional as F
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import common
 import hk
@@ -24,25 +30,24 @@ HK_LAUNCHES = dict(qkv=4, attention=1, out_proj=2, gate_up=1, down=2)
 COMPILE = common.COMPILE
 
 
-def choose_sdpa(H, H_KV, Dh):
-    """(backend name, native GQA) of the best fused SDPA path; disables the math backend globally."""
+def use_flash_sdpa(H, H_KV, Dh):
+    """Make PyTorch's flash SDPA with native GQA the only attention backend; return the ROCm flash library
+    preference. Raises if flash cannot run this shape, so the baseline never silently changes kernel.
+
+    Flash tiles Q, K, V and keeps the [M, M] scores on chip. The math backend would write them to HBM, and the
+    memory-efficient backend is a different kernel; both are disabled. The ROCm library behind flash is a
+    preference (torch.backends.cuda.preferred_rocm_fa_library: AOTriton unless changed, e.g. by
+    TORCH_ROCM_FA_PREFER_CK=1), and PyTorch may fall back, so this records configuration, not the kernel run.
+    """
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(False)
+    torch.backends.cuda.enable_cudnn_sdp(False)
     q = torch.randn(1, H, 256, Dh, device="cuda", dtype=common.BF16)
     kv = torch.randn(1, H_KV, 256, Dh, device="cuda", dtype=common.BF16)
-    for backend in (SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION):
-        for native in (True, False):
-            k = kv if native else kv.repeat_interleave(H // H_KV, dim=1)
-            try:
-                with sdpa_kernel(backend):
-                    F.scaled_dot_product_attention(q, k, k, is_causal=True, enable_gqa=native)
-                torch.cuda.synchronize()
-            except RuntimeError:
-                continue
-            torch.backends.cuda.enable_flash_sdp(backend == SDPBackend.FLASH_ATTENTION)
-            torch.backends.cuda.enable_mem_efficient_sdp(backend == SDPBackend.EFFICIENT_ATTENTION)
-            torch.backends.cuda.enable_math_sdp(False)
-            torch.backends.cuda.enable_cudnn_sdp(False)
-            return backend.name, native
-    raise RuntimeError("no fused SDPA backend is available; refusing the math fallback")
+    F.scaled_dot_product_attention(q, kv, kv, is_causal=True, enable_gqa=True)
+    torch.cuda.synchronize()
+    return torch.backends.cuda.preferred_rocm_fa_library().name     # "Default", "AOTriton" or "Ck"
 
 
 def load_gqa(cfg, M):
@@ -63,7 +68,7 @@ def noop_qkv(x, wq, wk, wv):
 class Layer:
     """Shared weights and the five phases of each implementation."""
 
-    def __init__(self, cfg, M, gqa, native_gqa):
+    def __init__(self, cfg, M, gqa):
         self.M, self.d, self.d_ff = M, cfg["d"], cfg["d_ff"]
         self.H, self.H_KV, self.Dh = cfg["H"], cfg["H_KV"], cfg["Dh"]
         d, kv = self.d, self.H_KV * self.Dh
@@ -75,7 +80,7 @@ class Layer:
         # HK inputs a previous layer's down phase would emit.
         self.r_attn = common.inv_rms(self.x)
         self.xg = (self.x.float() * self.g_attn.float()[None, :]).to(common.BF16)
-        self.gqa, self.native_gqa = gqa, native_gqa
+        self.gqa = gqa
 
     # ---- HK phases ----
     def hk_qkv(self, xg, r):
@@ -138,10 +143,7 @@ class Layer:
 
     def t_attention(self, q, k, v):
         qh, kh, vh = (t.transpose(0, 1).unsqueeze(0) for t in (q, k, v))        # [1, heads, M, Dh]
-        if not self.native_gqa:
-            G = self.H // self.H_KV
-            kh, vh = kh.repeat_interleave(G, dim=1), vh.repeat_interleave(G, dim=1)
-        o = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True, enable_gqa=self.native_gqa)
+        o = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True, enable_gqa=True)
         return o.squeeze(0).transpose(0, 1).reshape(self.M, self.d)
 
     def t_out_proj(self, o, x):
@@ -368,25 +370,25 @@ def main():
     torch.manual_seed(0)
     torch._dynamo.config.cache_size_limit = 64
     cfg = args.cfg
-    backend, native = choose_sdpa(cfg["H"], cfg["H_KV"], cfg["Dh"])
-    print(f"SDPA baseline: {backend}, native GQA: {native}")
+    fa_pref = use_flash_sdpa(cfg["H"], cfg["H_KV"], cfg["Dh"])
+    print(f"SDPA baseline: flash, native GQA, ROCm FA preference: {fa_pref}")
     timer = common.Timer(args.warmup, args.iters)
     phase_rows, full_rows = [], []
     for M in args.M:
-        L = Layer(cfg, M, load_gqa(cfg, M), native)
+        L = Layer(cfg, M, load_gqa(cfg, M))
         phase_rows += run_phases(L, timer)
         if args.full:
             full_rows.append(run_full(L, timer, phase_rows))
         del L
         torch.cuda.empty_cache()
-    title = f"({args.config}, cold cache; SDPA {backend}, native GQA {native})"
+    title = f"({args.config}, cold cache; SDPA flash, ROCm FA preference {fa_pref})"
     if args.phases:
         common.print_table(f"Layer phases {title}", PHASE_COLUMNS, phase_rows, args.markdown)
     if args.full:
         common.print_table(f"Full layer {title}", FULL_COLUMNS, full_rows, args.markdown)
     if args.json:
         common.write_json(args.json, "bench_layer", args.config, phase_rows + full_rows,
-                          extra=dict(sdpa_backend=backend, native_gqa=native))
+                          extra=dict(sdpa_backend="FLASH_ATTENTION", rocm_fa_preference=fa_pref))
     raise SystemExit(common.exit_code(phase_rows + full_rows))
 
 

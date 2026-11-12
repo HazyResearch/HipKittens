@@ -1,8 +1,17 @@
-"""Each fused epilogue vs PyTorch eager and torch.compile on its layer GEMMs (cold cache); see README.md.
+"""Time each fused HK GEMM against the same math done by PyTorch.
 
-Arms: HK (one fused call), eager (hipBLASLt + bf16 torch), compile (eager under torch.compile, Dynamo reset per
-row), fusion-only (HK noop GEMM + eager torch). HBM saved is an analytical upper bound (saved= in make_case).
-Rows are checked against fp32 torch before timing; failing rows are not timed and the script exits 1.
+HK fuses work into the GEMM kernel: output epilogues (SiLU, scale, residual add, RMSNorm scale, SwiGLU, RoPE)
+and, for the input-RMSNorm cases, the per-row 1/rms that eager applies to x before the GEMM. Fusion removes
+the intermediate tensors eager writes to HBM and reads back; the final output is still stored. For each M,
+epilogue, and layer GEMM it belongs to (PLACEMENT), four arms are checked, then timed with a cold cache:
+  hk           one HK call, fused
+  eager        torch.matmul (hipBLASLt) plus the same work as bf16 torch ops before and after it
+  compile      eager under torch.compile, Dynamo reset per row
+  fusion-only  HK noop GEMM plus the same eager ops; fusion-only/HK is the gain from fusion alone
+Input-RMSNorm cases give HK x * gamma and r from the previous kernel, untimed; eager applies x * r * gamma.
+Each arm is checked against fp32 torch first; a failing row is not timed and the script exits 1.
+HBM saved: bytes of each [M, N] or [M, K] intermediate that eager writes and reads back (bf16, one write and
+one read each). [M] and [N] vectors and cache hits are ignored, so it is an upper bound.
 
 Build: make KERNEL=<m> for every m in MODULES.
 """
@@ -49,7 +58,8 @@ def inv_rms_eager(D):
 
 def make_case(name, M, K, N, Dh):
     """One epilogue at [M, K] x [N, K].t(): eager = post(torch.matmul(pre(x), W.t())), ref() in fp32.
-    Input-RMSNorm rows give HK untimed x * gamma and r; eager applies x * r * gamma per call. saved: see README."""
+    Input-RMSNorm rows give HK untimed x * gamma and r; eager applies x * r * gamma per call.
+    saved: HBM bytes eager moves that HK does not (see module docstring)."""
     x, W = common.activation(M, K), common.weight(K, N)
     f = lambda t: t.float()
     xw = lambda: f(x) @ f(W).t()

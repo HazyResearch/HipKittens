@@ -7,10 +7,15 @@ a phase whose HK outputs pass but whose eager or compiled PyTorch output misses 
 
 | Script | Question |
 |---|---|
-| `ab_noop_vs_base.py` | Does `tk_noop` cost anything versus the upstream base GEMM? |
+| `ab_noop_vs_base.py` | Is `tk_noop` bitwise identical to, and as fast as, the upstream base GEMM? |
 | `bench_epilogues.py` | Time and HBM traffic each fused epilogue saves versus eager and `torch.compile`. |
 | `bench_layer.py --phases` | Per layer phase: HK vs eager vs `torch.compile`, plus a fusion-only control per GEMM phase. |
 | `bench_layer.py --full` | The whole layer: HK vs eager vs `torch.compile`. |
+
+`tk_noop` is the templated GEMM in `gemm_base.cuh` built with `NoOpEpilogue` (`make KERNEL=noop`): a plain
+GEMM with no epilogue. All fused epilogues use this kernel. The upstream base GEMM is `tk_kernel`, built from
+`../256_256_64_32_with16x32.cpp` (`make -C ..`). `ab_noop_vs_base.py` checks that the template refactor did not
+change the output or slow the kernel down.
 
 ## Build
 
@@ -123,8 +128,9 @@ attention reference is computed 1024 query rows at a time, so it never holds the
 - Each phase is timed on intermediates captured from a full run of the same implementation.
 - `--phases` compiles each PyTorch phase separately; `--full` compiles the layer as one function.
   `compile full - phases` shows what cross-phase fusion buys PyTorch.
-- **Attention baseline:** the strongest available fused SDPA backend (flash, then memory-efficient), native GQA
-  if supported, else KV expanded. The math backend is disabled. The backend is printed and saved in the JSON.
+- **Attention baseline:** PyTorch flash SDPA with native GQA, the only SDPA backend enabled; the script stops if
+  flash cannot run the shape. The ROCm flash library preference (`preferred_rocm_fa_library`) is printed and
+  saved in the JSON as `rocm_fa_preference`; it is a setting, not proof of which kernel ran.
 - **Known PyTorch miss:** with torch 2.13 + ROCm 10 (AOTriton 0.13), flash SDPA at head dim 64 (Llama-3.2-1B)
   and M ≥ 8192 returns different outputs for identical inputs; about 1 call in 8 exceeds `STAGE_TOL`, so those
   attention rows can read `TORCH_MISS`. The full layer at those shapes runs the same kernel; its normwise gate
