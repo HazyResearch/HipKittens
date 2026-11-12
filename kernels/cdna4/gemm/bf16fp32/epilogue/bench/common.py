@@ -157,6 +157,16 @@ def check(outputs, refs, tols):
     return all(ok for ok, _ in results), results[0][1]
 
 
+def to_bf16_chopped(x):
+    """fp32 -> bf16 by truncation toward zero, as HK's scalar bf16 store does (torch rounds to nearest)."""
+    return (x.float().contiguous().view(torch.int32) & -65536).view(torch.float32).to(BF16)
+
+
+def as_stored_truncated(refs, outputs):
+    """refs with each bf16 output's reference truncated to bf16 like the kernel's store; fp32 outputs unchanged."""
+    return tuple(to_bf16_chopped(w) if g.dtype == BF16 else w for g, w in zip(as_tuple(outputs), as_tuple(refs)))
+
+
 def layer_check(got, want):
     """(ok, worst rel): finite and normwise rel < LAYER_REL."""
     rels = [((g.float().reshape(w.shape) - w.float()).norm() / w.float().norm()).item() for g, w in zip(got, want)]

@@ -2,6 +2,8 @@
 
 --phases  each phase timed alone on captured intermediates, plus a fusion-only control per GEMM phase.
 --full    the whole layer (compiled as one function), and compiled full minus the sum of compiled phases.
+--weights DIR --layer I  use layer I of a Hugging Face Llama checkpoint and real text instead of random values
+          (see real_llama.py); the full-layer table then also compares HK and eager against HF's own layer output.
 
 HK launches per phase: qkv 4, attention 1, out_proj 2, gate_up 1, down 2. HK's producers emit r and h * gamma
 for the next consumer; torch normalizes in the consumer. Per-phase times do not line up op-for-op.
@@ -68,15 +70,20 @@ def noop_qkv(x, wq, wk, wv):
 class Layer:
     """Shared weights and the five phases of each implementation."""
 
-    def __init__(self, cfg, M, gqa):
+    def __init__(self, cfg, M, gqa, real=None):
         self.M, self.d, self.d_ff = M, cfg["d"], cfg["d_ff"]
         self.H, self.H_KV, self.Dh = cfg["H"], cfg["H_KV"], cfg["Dh"]
         d, kv = self.d, self.H_KV * self.Dh
-        self.W = dict(q=common.weight(d, d), k=common.weight(d, kv), v=common.weight(d, kv), o=common.weight(d, d),
-                      gu=common.weight(d, 2 * self.d_ff), dn=common.weight(self.d_ff, d))
-        self.g_attn, self.g_mlp = common.gamma(d), common.gamma(d)
-        self.x = common.activation(M, d)
-        self.cs = common.rope_table(M, self.Dh)                     # [M, Dh], one head
+        if real is None:
+            self.W = dict(q=common.weight(d, d), k=common.weight(d, kv), v=common.weight(d, kv),
+                          o=common.weight(d, d), gu=common.weight(d, 2 * self.d_ff), dn=common.weight(self.d_ff, d))
+            self.g_attn, self.g_mlp = common.gamma(d), common.gamma(d)
+            self.x = common.activation(M, d)
+            self.cs = common.rope_table(M, self.Dh)                 # [M, Dh], one head
+            self.hf_out = None
+        else:
+            self.W, self.g_attn, self.g_mlp = real["W"], real["g_attn"], real["g_mlp"]
+            self.x, self.cs, self.hf_out = real["x"], real["cs"], real["hf_out"]
         # HK inputs a previous layer's down phase would emit.
         self.r_attn = common.inv_rms(self.x)
         self.xg = (self.x.float() * self.g_attn.float()[None, :]).to(common.BF16)
@@ -202,6 +209,12 @@ class Layer:
         x_out, r = self.ref_down(g, h)
         return x_out, x_out * self.g_attn.float(), r                # what HK's down writes
 
+    def ref_residual_control(self, a, w, res, gamma):
+        """What the fusion-only control of out_proj / down computes: HK's GEMM output truncated to bf16 by its
+        store, then the residual add, gamma and 1/rms in torch."""
+        h = res.float() + common.to_bf16_chopped(a.float() @ w.float().t()).float()
+        return h, h * gamma.float(), common.inv_rms(h)
+
     # ---- captured intermediates ----
     def capture_hk(self):
         x, xg, r = self.x, self.xg, self.r_attn
@@ -252,6 +265,8 @@ class Phase:
     tol_hk: tuple
     tol_torch: tuple
     fusion: object = None # () -> fusion-only control on HK-captured inputs (None for attention)
+    truncates: bool = False  # HK stores bf16 by truncation (epilogue store): compare with a truncated reference
+    ref_fusion: object = None  # () -> fp32 reference for the control when its order differs from HK's
 
 
 def phases(L, a, b):
@@ -265,13 +280,15 @@ def phases(L, a, b):
                            lambda: L.ref_attention(b["q"], b["k"], b["v"]), (S,), (S,)),
         "out_proj": Phase(lambda: L.hk_out_proj(a["o"], a["x"]), L.t_out_proj, (b["o"], b["x"]),
                           lambda: L.ref_out_proj_hk(a["o"], a["x"]), lambda: L.ref_out_proj(b["o"], b["x"])[:1],
-                          (S, S, V), (S,), lambda: L.f_out_proj(a["o"], a["x"])),
+                          (S, S, V), (S,), lambda: L.f_out_proj(a["o"], a["x"]), truncates=True,
+                          ref_fusion=lambda: L.ref_residual_control(a["o"], L.W["o"], a["x"], L.g_mlp)),
         "gate_up": Phase(lambda: L.hk_gate_up(a["hg"], a["r_mlp"]), L.t_gate_up, (b["h"],),
                          lambda: L.ref_gate_up(a["h"]), lambda: L.ref_gate_up(b["h"]), (S,), (S,),
-                         lambda: L.f_gate_up(a["hg"], a["r_mlp"])),
+                         lambda: L.f_gate_up(a["hg"], a["r_mlp"]), truncates=True),
         "down": Phase(lambda: L.hk_down(a["g"], a["h"]), L.t_down, (b["g"], b["h"]),
                       lambda: L.ref_down_hk(a["g"], a["h"]), lambda: L.ref_down(b["g"], b["h"])[:1], (S, S, V), (S,),
-                      lambda: L.f_down(a["g"], a["h"])),
+                      lambda: L.f_down(a["g"], a["h"]), truncates=True,
+                      ref_fusion=lambda: L.ref_residual_control(a["g"], L.W["dn"], a["h"], L.g_attn)),
     }
 
 
@@ -282,13 +299,15 @@ def run_phases(L, timer):
         compiled = torch.compile(p.torch_fn, **COMPILE)
         eager = lambda: p.torch_fn(*p.torch_args)
         comp = lambda: compiled(*p.torch_args)
-        ok_hk, rel = common.check(p.hk(), p.ref_hk(), p.tol_hk)
+        got = p.hk()
+        want = common.as_stored_truncated(p.ref_hk(), got) if p.truncates else p.ref_hk()
+        ok_hk, rel = common.check(got, want, p.tol_hk)
         ref_t = p.ref_torch()
         ok_eager, _ = common.check(eager(), ref_t, p.tol_torch)
         ok_comp, _ = common.check(comp(), ref_t, p.tol_torch)     # first call compiles
         ok_fusion = True
         if p.fusion is not None:
-            ok_fusion, _ = common.check(p.fusion(), p.ref_hk(), common.control_tols(p.tol_hk))
+            ok_fusion, _ = common.check(p.fusion(), (p.ref_fusion or p.ref_hk)(), common.control_tols(p.tol_hk))
         ok_hk = ok_hk and ok_fusion
         status = "PASS" if ok_hk and ok_eager and ok_comp else "TORCH_MISS" if ok_hk else "FAIL"
         row = dict(M=L.M, phase=name, hk_launches=HK_LAUNCHES[name], rel=rel, ok_eager=ok_eager, ok_compile=ok_comp,
@@ -339,7 +358,12 @@ def run_full(L, timer, phase_rows):
     ok_eager, rel_eager = common.layer_check((eager(),), want[:1])  # torch: x_out only
     ok_comp, rel_comp = common.layer_check((comp(),), want[:1])     # first call compiles
     ok = ok_hk and ok_eager and ok_comp
-    row = dict(M=L.M, rel_hk=rel_hk, rel_eager=rel_eager, rel_compile=rel_comp, status="PASS" if ok else "FAIL")
+    row = dict(M=L.M, rel_hk=rel_hk, rel_eager=rel_eager, rel_compile=rel_comp)
+    if L.hf_out is not None:                                         # real checkpoint: HF's own layer output
+        ok_hk_hf, row["rel_hk_hf"] = common.layer_check(hk_fn()[:1], (L.hf_out,))
+        ok_eager_hf, row["rel_eager_hf"] = common.layer_check((eager(),), (L.hf_out,))
+        ok = ok and ok_hk_hf and ok_eager_hf
+    row["status"] = "PASS" if ok else "FAIL"
     if ok:
         t_hk, t_eager, t_comp = timer(hk_fn), timer(eager), timer(comp)
         row.update(**common.ms_fields("hk", t_hk), **common.ms_fields("eager", t_eager),
@@ -355,13 +379,16 @@ def run_full(L, timer, phase_rows):
 FULL_COLUMNS = [("M", "M", "d"), ("HK ms", "hk_ms", ".3f"), ("eager ms", "eager_ms", ".3f"),
                 ("compile ms", "compile_ms", ".3f"), ("eager/HK", "eager_x", ".2f"), ("compile/HK", "compile_x", ".2f"),
                 ("compile full - phases ms", "compile_full_minus_phases_ms", "+.3f"),
-                ("rel HK", "rel_hk", ".1e"), ("rel compile", "rel_compile", ".1e"), ("status", "status", "")]
+                ("rel HK", "rel_hk", ".1e"), ("rel compile", "rel_compile", ".1e"),
+                ("rel HK vs HF", "rel_hk_hf", ".1e"), ("rel eager vs HF", "rel_eager_hf", ".1e"), ("status", "status", "")]
 
 
 def main():
     def flags(ap):
         ap.add_argument("--phases", action="store_true", help="per-phase table")
         ap.add_argument("--full", action="store_true", help="full-layer table")
+        ap.add_argument("--weights", default=None, help="Hugging Face Llama checkpoint directory (real values)")
+        ap.add_argument("--layer", type=int, default=0, help="decoder layer of --weights")
 
     args = common.parse_args("Forward layer: HK vs eager vs torch.compile", add=flags)
     if not (args.phases or args.full):
@@ -373,22 +400,28 @@ def main():
     fa_pref = use_flash_sdpa(cfg["H"], cfg["H_KV"], cfg["Dh"])
     print(f"SDPA baseline: flash, native GQA, ROCm FA preference: {fa_pref}")
     timer = common.Timer(args.warmup, args.iters)
+    real = None
+    if args.weights:
+        import real_llama
+        real = real_llama.RealLlama(args.weights, args.layer, cfg)
     phase_rows, full_rows = [], []
     for M in args.M:
-        L = Layer(cfg, M, load_gqa(cfg, M))
+        L = Layer(cfg, M, load_gqa(cfg, M), real.layer(M) if real else None)
         phase_rows += run_phases(L, timer)
         if args.full:
             full_rows.append(run_full(L, timer, phase_rows))
         del L
         torch.cuda.empty_cache()
-    title = f"({args.config}, cold cache; SDPA flash, ROCm FA preference {fa_pref})"
+    values = f"layer {args.layer} of {args.weights}" if args.weights else "random values"
+    title = f"({args.config}, {values}, cold cache; SDPA flash, ROCm FA preference {fa_pref})"
     if args.phases:
         common.print_table(f"Layer phases {title}", PHASE_COLUMNS, phase_rows, args.markdown)
     if args.full:
         common.print_table(f"Full layer {title}", FULL_COLUMNS, full_rows, args.markdown)
     if args.json:
         common.write_json(args.json, "bench_layer", args.config, phase_rows + full_rows,
-                          extra=dict(sdpa_backend="FLASH_ATTENTION", rocm_fa_preference=fa_pref))
+                          extra=dict(sdpa_backend="FLASH_ATTENTION", rocm_fa_preference=fa_pref,
+                                     weights=args.weights, layer=args.layer if args.weights else None))
     raise SystemExit(common.exit_code(phase_rows + full_rows))
 
 

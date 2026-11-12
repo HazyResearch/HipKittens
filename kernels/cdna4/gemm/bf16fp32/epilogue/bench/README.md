@@ -44,6 +44,16 @@ Common flags: `--config llama3-8b`, `--M 2048,4096`, `--iters 50`, `--warmup 10`
 `--markdown`. `torch.compile` autotuning varies across processes: run each script in 3 fresh processes and
 report the spread, not the best run.
 
+Values are random by default (`torch.randn` activations and weights, gains near 1), as in the other kernel
+benchmarks in this repository. `bench_layer.py --weights <HF Llama checkpoint dir> --layer <i>` runs layer `i` of
+a real checkpoint on real text (the repository's Markdown files as tokens) instead; `--config` must match the
+checkpoint. The full-layer table then adds `rel HK vs HF` and `rel eager vs HF`: normwise error against HF's own
+layer output. `real_llama.py` converts HF's RoPE layout once for every arm: unpermuted `Wq`/`Wk` rows, `-sin`
+in the table (HK rotates the other way), and frequencies from the checkpoint's own rotary embedding. Needs
+`transformers`. Real Llama layers have attention scores large enough to hit a bug in `kernels/cdna4/attn/gqa_causal`
+(lazy softmax rescale); until that fix lands upstream, `--weights` runs fail the attention phase. Random values
+are not affected.
+
 ## Config
 
 Batch-1 causal prefill at M ∈ {2048, 4096, 8192} tokens. `CONFIGS` in `common.py`:
@@ -69,7 +79,9 @@ attention reference is computed 1024 query rows at a time, so it never holds the
   every timed arm), HK's RMSNorm inputs from a previous GEMM (`r`, `x · gamma`), and `torch.compile` compilation
   and autotuning.
 - **Same plain `[N, K]` weights for every arm**, never folded, permuted, transposed or concatenated. HK reads
-  them in place (QKV via three pointers); PyTorch multiplies by the `W.t()` view.
+  them in place (QKV via three pointers); PyTorch multiplies by the `W.t()` view. With `--weights`, the HF
+  checkpoint is converted once before timing, identically for every arm: `Wq`/`Wk` rows unpermuted to interleaved
+  RoPE pairs, and gate/up stacked into the one `[2·d_ff, d]` weight the random layer also uses. QKV stay separate.
 - **RMSNorm gamma:** HK applies it in the producer (`hk.residual_rms(..., gamma=g)` writes `h · g`); PyTorch per
   call (`F.rms_norm(x, ..., g)` in the layer, `x · r · g` in `bench_epilogues.py`).
 - **One compile mode:** `torch.compile(mode="max-autotune-no-cudagraphs", dynamic=False)`. No CUDA graphs:
@@ -125,6 +137,11 @@ attention reference is computed 1024 query rows at a time, so it never holds the
 - **Control tolerance:** the control's GEMM output passes through HK's truncating bf16 store, and SwiGLU
   multiplies two such values, so its bf16 outputs are gated at `rtol 2.5e-2` (`CONTROL_TOL`) in both scripts;
   HK, eager and compiled PyTorch keep `rtol 1e-2`.
+  The out_proj and down controls add the residual after that truncating store, not before as HK does, so they
+  are checked against a reference in their own order: truncated `a @ W.T`, then the residual, gamma and 1/rms.
+- **Truncating store:** HK's epilogue store truncates fp32 to bf16 toward zero; torch rounds to nearest. In
+  `bench_layer.py`, HK's bf16 outputs of out_proj, gate_up and down are compared with the fp32 reference
+  truncated the same way. qkv (RoPE's packed store rounds to nearest) and attention use the plain reference.
 - Each phase is timed on intermediates captured from a full run of the same implementation.
 - `--phases` compiles each PyTorch phase separately; `--full` compiles the layer as one function.
   `compile full - phases` shows what cross-phase fusion buys PyTorch.
@@ -136,3 +153,6 @@ attention reference is computed 1024 query rows at a time, so it never holds the
   attention rows can read `TORCH_MISS`. The full layer at those shapes runs the same kernel; its normwise gate
   passes but does not rule the misses out. Head dim 128, M ≤ 4096, the CK and math SDPA backends, and torch
   2.11 + ROCm 7.13 (AOTriton 0.11) are deterministic.
+- **Real weights, last layer:** with `--weights` (Llama-3.1-8B, layer 31, M = 2048) the down phase reads
+  `TORCH_MISS`: HK and the control pass, and eager or compiled PyTorch misses `STAGE_TOL` on `x_out` (the JSON's
+  `ok_eager` / `ok_compile` say which). Cause not yet checked. Layers 0 and 15 pass.
