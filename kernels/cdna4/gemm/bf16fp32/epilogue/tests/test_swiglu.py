@@ -3,8 +3,8 @@ import pytest
 import torch
 
 import hk
-from conftest import (BAD_SHAPES, DEV, SHAPES, assert_within_bf16_step, gemm_exact, hk_shape_error, inputs, module,
-                      silu_kernel, weight)
+from helpers import (BAD_SHAPES, DEV, SHAPES, assert_within_bf16_step, gemm_exact, hk_shape_error, inputs, module,
+                     silu_kernel, weight)
 
 SILU_1 = 0.7310585786300049   # silu(1)
 SILU_2 = 1.7615941559557649   # silu(2)

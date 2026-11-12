@@ -3,7 +3,7 @@ import pytest
 import torch
 
 import hk
-from conftest import BAD_SHAPES, DEV, SHAPES, gemm_exact, hk_shape_error, inputs, module, pow2_gamma, stream, weight
+from helpers import BAD_SHAPES, DEV, SHAPES, gemm_exact, hk_shape_error, inputs, module, pow2_gamma, stream, weight
 from test_rope import assert_rope_close, cos_sin_table
 
 

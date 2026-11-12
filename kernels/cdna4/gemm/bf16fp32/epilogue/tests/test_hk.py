@@ -3,7 +3,7 @@ import pytest
 import torch
 
 import hk
-from conftest import DEV, assert_bitexact, gemm_exact, general_gamma, inputs, module, pow2_gamma, stream, weight
+from helpers import DEV, assert_bitexact, gemm_exact, general_gamma, inputs, module, pow2_gamma, stream, weight
 from test_rope import cos_sin_table
 
 MATMUL_EPILOGUES = {"noop", "silu", "scale", "residual_add", "rmsnorm_scale", "rmsnorm", "swiglu", "rmsnorm_swiglu",

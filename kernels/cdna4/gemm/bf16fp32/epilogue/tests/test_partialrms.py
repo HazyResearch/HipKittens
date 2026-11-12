@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from conftest import BAD_SHAPES, DEV, SHAPES, assert_rel_close, inputs, module, stream
+from helpers import BAD_SHAPES, DEV, SHAPES, assert_rel_close, inputs, module, stream
 
 REL = 64 * 2.0 ** -24
 

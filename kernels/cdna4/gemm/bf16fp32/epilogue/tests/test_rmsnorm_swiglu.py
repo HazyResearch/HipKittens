@@ -4,8 +4,8 @@ import pytest
 import torch
 
 import hk
-from conftest import (BAD_SHAPES, DEV, SHAPES, assert_within_bf16_step, gemm_exact, hk_shape_error, inputs, module,
-                      pow2_gamma, silu_kernel, weight)
+from helpers import (BAD_SHAPES, DEV, SHAPES, assert_within_bf16_step, gemm_exact, hk_shape_error, inputs, module,
+                     pow2_gamma, silu_kernel, weight)
 
 SILU_HALF = 0.31122966560092725   # silu(0.5)
 

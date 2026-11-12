@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import hk
-from conftest import (DEV, assert_norm_close, bf16_step, general_gamma, inputs, module)
+from helpers import (DEV, assert_norm_close, bf16_step, general_gamma, inputs, module)
 from test_residual_add import residual_like
 from test_residual_rms import reference as residual_rms_reference
 from test_rmsnorm_rope import r_like

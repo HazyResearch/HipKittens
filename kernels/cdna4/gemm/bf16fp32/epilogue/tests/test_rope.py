@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import hk
-from conftest import BAD_SHAPES, DEV, SHAPES, bf16_step, gemm_exact, hk_shape_error, inputs, module, stream, weight
+from helpers import BAD_SHAPES, DEV, SHAPES, bf16_step, gemm_exact, hk_shape_error, inputs, module, stream, weight
 
 
 def cos_sin_table(M, N, base=10000.0):

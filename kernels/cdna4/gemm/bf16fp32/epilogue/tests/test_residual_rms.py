@@ -4,8 +4,8 @@ import pytest
 import torch
 
 import hk
-from conftest import (BAD_SHAPES, DEV, SHAPES, assert_bitexact, assert_norm_close, assert_rel_close, gemm_exact,
-                      general_gamma, hk_shape_error, inputs, module, silu_kernel, to_bf16_chopped, weight)
+from helpers import (BAD_SHAPES, DEV, SHAPES, assert_bitexact, assert_norm_close, assert_rel_close, gemm_exact,
+                     general_gamma, hk_shape_error, inputs, module, silu_kernel, to_bf16_chopped, weight)
 from test_residual_add import residual_like
 
 EPS = 1e-5

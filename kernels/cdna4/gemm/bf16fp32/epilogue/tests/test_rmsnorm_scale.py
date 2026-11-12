@@ -4,8 +4,8 @@ import pytest
 import torch
 
 import hk
-from conftest import (BAD_SHAPES, DEV, SHAPES, assert_bitexact, gemm_exact, hk_shape_error, inputs, module,
-                      pow2_gamma, weight)
+from helpers import (BAD_SHAPES, DEV, SHAPES, assert_bitexact, gemm_exact, hk_shape_error, inputs, module,
+                     pow2_gamma, weight)
 
 
 def vectors(M, N, seed=2):

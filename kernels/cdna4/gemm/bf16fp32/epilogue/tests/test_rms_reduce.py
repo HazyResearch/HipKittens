@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import hk
-from conftest import DEV, SHAPES, assert_rel_close, inputs, module, stream, weight
+from helpers import DEV, SHAPES, assert_rel_close, inputs, module, stream, weight
 
 EPS = 1e-5
 GROUP_CASES = [(256, 4), (4096, 64), (8192, 32), (4096, 172)]   # (M, G), G = N / 64
