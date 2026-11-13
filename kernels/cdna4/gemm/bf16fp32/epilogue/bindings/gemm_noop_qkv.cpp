@@ -2,7 +2,8 @@
 #include "pyutils/pyutils.cuh"
 #include "checked_bind.cuh"
 
-// One-launch QKV GEMM over three unconcatenated weights (fusion-only control for hk.qkv).
+// Benchmark-only: the qkv fusion-only control. Same single launch over three separate weights as hk.qkv, with
+// nothing fused, so bench_layer's fusion-only/HK ratio measures fusion alone (not launch count or a concatenated W).
 struct NoopQkvGlobals {
     _gl_A a; _gl_B b; _gl_C c;          // b = Wq [Nq, K], c = [M, Nq + 2 Nkv]
     _gl_B b_k, b_v;                     // Wk, Wv [Nkv, K]

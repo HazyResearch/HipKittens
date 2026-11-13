@@ -96,6 +96,9 @@ attention reference is computed 1024 query rows at a time, so it never holds the
   limit and silently runs eager.
 - **fusion-only:** HK's `noop` GEMM, then the same eager PyTorch. `fusion-only/HK` isolates fusion;
   `eager/HK` also includes the GEMM difference.
+  Two kernels have no epilogue on purpose. `tk_noop` is the plain GEMM (`hk.matmul` with no epilogue), the
+  refactor check against upstream, and the GEMM inside every fusion-only control. `tk_noop_qkv` is benchmark-only:
+  the qkv control needs HK's single launch over three weights without fusion.
 - **HBM saved:** an analytical upper bound (`saved=` in `make_case`): each [M, N] or [M, K] intermediate the
   eager code writes and reads back, counted once per write and read. Vectors ([M], [N]) and caching (256 MiB
   Infinity Cache) are ignored. With bf16 sizes `MN = M·N·2` and `MK = M·K·2` bytes:
