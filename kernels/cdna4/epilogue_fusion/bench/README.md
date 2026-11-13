@@ -50,9 +50,9 @@ a real checkpoint on real text (the repository's Markdown files as tokens) inste
 checkpoint. The full-layer table then adds `rel HK vs HF` and `rel eager vs HF`: normwise error against HF's own
 layer output. `real_llama.py` converts HF's RoPE layout once for every arm: unpermuted `Wq`/`Wk` rows, `-sin`
 in the table (HK rotates the other way), and frequencies from the checkpoint's own rotary embedding. Needs
-`transformers`. Real Llama layers have attention scores large enough to hit a bug in `kernels/cdna4/attn/gqa_causal`
-(lazy softmax rescale); until that fix lands upstream, `--weights` runs fail the attention phase. Random values
-are not affected.
+`transformers`. Real Llama layers have attention scores large enough to hit a lazy-rescale bug in
+`kernels/cdna4/attn/gqa_causal` (HazyResearch/HipKittens#98); this branch includes the fix from #99, without which
+`--weights` runs fail the attention phase.
 
 ## Config
 
