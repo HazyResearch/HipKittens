@@ -30,7 +30,7 @@ constexpr bool splits_rope_pairs() {
 template<typename Globals>
 constexpr bool has_three_b = requires(const Globals& g) { g.b_k; g.b_v; g.q_blocks; g.qk_blocks; };
 
-// Copy of micro_tk in 256_256_64_32_with16x32.cpp, with these changes:
+// Copy of micro_tk in ../gemm/bf16fp32/256_256_64_32_with16x32.cpp, with these changes:
 //   1. Templated on <Epilogue, Globals>; Accum checked against Epilogue::apply.
 //   2. Unused `condition` removed.
 //   3. Per-block B tensor gb and column bcol (three-B globals).

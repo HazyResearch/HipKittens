@@ -12,8 +12,8 @@ import torch
 
 BENCH = pathlib.Path(__file__).resolve().parent
 EPI = BENCH.parent                 # hk.py and tk_<name> modules
-BASE = EPI.parent                  # upstream base GEMM
-REPO = EPI.parents[4]
+REPO = EPI.parents[2]
+BASE = REPO / "kernels/cdna4/gemm/bf16fp32"   # upstream base GEMM
 if str(EPI) not in sys.path:
     sys.path.insert(0, str(EPI))
 

@@ -16,8 +16,8 @@ import sys
 
 import torch
 
-EPI = pathlib.Path(__file__).resolve().parents[1]   # kernels/cdna4/gemm/bf16fp32/epilogue
-BASE = EPI.parent                                    # base GEMM
+EPI = pathlib.Path(__file__).resolve().parents[1]   # kernels/cdna4/epilogue_fusion
+BASE = EPI.parent / "gemm/bf16fp32"                 # upstream base GEMM
 DEV = "cuda"
 
 SHAPES = [(256, 256, 128), (4096, 4096, 128), (8192, 2048, 4096), (4096, 4096, 4096)]  # (M, N, K)

@@ -2,7 +2,7 @@
 
 For each GEMM shape in one layer of --config, plus 8192^3, runs two kernels on the same bf16 inputs:
   tk_noop    gemm_base.cuh with NoOpEpilogue (make KERNEL=noop). All fused epilogues use this kernel.
-  tk_kernel  upstream GEMM, ../256_256_64_32_with16x32.cpp (make in the parent directory).
+  tk_kernel  upstream GEMM, kernels/cdna4/gemm/bf16fp32/256_256_64_32_with16x32.cpp (make there).
 C must be bitwise identical. Both are timed with a cold cache (common.Timer).
 
 Timing: each kernel is one arm. One round times both arms with common.Timer (median of --iters cold
@@ -10,7 +10,7 @@ calls). Arm order flips each round to reduce order bias. ROUNDS = 5; an arm's ti
 5 round results.
 Status from noop/base: <= 1.03 PASS (exit 0); > 1.03 and <= 1.05 RERUN (exit 2: run the script in 3
 fresh processes and compare the medians); > 1.05 or any differing bit FAIL (exit 1).
-Build: `make KERNEL=noop` here and `make` in the parent.
+Build: `make KERNEL=noop` here and `make -C ../gemm/bf16fp32`.
 """
 import importlib
 

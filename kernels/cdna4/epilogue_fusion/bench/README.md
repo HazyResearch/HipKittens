@@ -14,18 +14,18 @@ a phase whose HK outputs pass but whose eager or compiled PyTorch output misses 
 
 `tk_noop` is the templated GEMM in `gemm_base.cuh` built with `NoOpEpilogue` (`make KERNEL=noop`): a plain
 GEMM with no epilogue. All fused epilogues use this kernel. The upstream base GEMM is `tk_kernel`, built from
-`../256_256_64_32_with16x32.cpp` (`make -C ..`). `ab_noop_vs_base.py` checks that the template refactor did not
-change the output or slow the kernel down.
+`../gemm/bf16fp32/256_256_64_32_with16x32.cpp` (`make -C ../gemm/bf16fp32`). `ab_noop_vs_base.py` checks that
+the template refactor did not change the output or slow the kernel down.
 
 ## Build
 
-From the epilogue directory. Building needs a gfx950 `hipcc` (no GPU); running needs a gfx950 GPU and PyTorch.
+From `kernels/cdna4/epilogue_fusion`. Building needs a gfx950 `hipcc` (no GPU); running needs a gfx950 GPU and PyTorch.
 
 ```bash
-export THUNDERKITTENS_ROOT=$(cd ../../../../.. && pwd)   # override any inherited root
+export THUNDERKITTENS_ROOT=$(cd ../../.. && pwd)          # override any inherited root
 for m in noop noop_qkv silu scale residual_add rmsnorm_scale swiglu rmsnorm_swiglu rope rmsnorm_rope \
          rmsnorm_rope_qkv partialrms residual_rms residual_rms_gamma rms_reduce; do make KERNEL=$m; done
-make -C ..                                  # base GEMM, for ab_noop_vs_base.py
+make -C ../gemm/bf16fp32                    # base GEMM, for ab_noop_vs_base.py
 bench/build_attn.sh 32 8 128 2048 4096 8192 # attention for llama3-8b / pr1 (H, H_KV, Dh, M...)
 bench/build_attn.sh 64 8 128 2048 4096 8192 # attention for llama3-70b
 ```

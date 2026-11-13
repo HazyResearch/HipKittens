@@ -9,7 +9,7 @@ if [ "$#" -lt 4 ]; then
 fi
 H=$1; H_KV=$2; DH=$3; shift 3
 BENCH=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ROOT=$(cd "$BENCH/../../../../../.." && pwd)
+ROOT=$(cd "$BENCH/../../../.." && pwd)
 export THUNDERKITTENS_ROOT="$ROOT"
 mkdir -p "$BENCH/attn_build"
 for M in "$@"; do

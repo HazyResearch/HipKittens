@@ -8,4 +8,4 @@ PYTHON     ?= python3
 EXTRA_CPPFLAGS += -I. -Iops -Iepilogues
 EXTRA_HIPFLAGS += -DTK_MODULE_NAME=$(TARGET)
 
-include ../../../../common.mk
+include ../../common.mk
