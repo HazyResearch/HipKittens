@@ -1,0 +1,3 @@
+# Build output of `make KERNEL=<name>`: tk_<name>.cpython-*.so
+*.so
+__pycache__/
