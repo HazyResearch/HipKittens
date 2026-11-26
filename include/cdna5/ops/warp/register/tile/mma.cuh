@@ -158,59 +158,6 @@ __device__ static inline void mfma323232(      float2 (&D)[8],
     );
 }
 
-__device__ static inline void mfma323264(      float2 (&D)[8],
-                                         const fp8e4m3_4 (&A)[8],
-                                         const fp8e4m3_4 (&B)[8],
-                                         const float2 (&C)[8]) {
-    typedef __attribute__((__vector_size__(8 * sizeof(int)))) int intx8_t;
-    typedef __attribute__((__vector_size__(16 * sizeof(float)))) float floatx16_t;
-
-    *(floatx16_t*)D = {__builtin_amdgcn_mfma_scale_f32_32x32x64_f8f6f4(
-        *(intx8_t*)A,
-        *(intx8_t*)B,
-        *(floatx16_t*)C,
-        0, 0, 0, 0, 0, 0
-    )};
-}
-
-__device__ static inline void mfma1616128(      float2 (&D)[2],
-                                         const fp8e4m3_4 (&A)[8],
-                                         const fp8e4m3_4 (&B)[8],
-                                         const float2 (&C)[2]) {
-    typedef __attribute__((__vector_size__(8 * sizeof(int)))) int intx8_t;
-    typedef __attribute__((__vector_size__(4 * sizeof(float)))) float floatx4_t;
-
-    *(floatx4_t*)D = {__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-        *(intx8_t*)A,
-        *(intx8_t*)B,
-        *(floatx4_t*)C,
-        0, 0, 0, 0, 0, 0
-    )};
-}
-
-template<int opsel_a, int opsel_b, int cbsz = 0, int blgp = 0>
-__device__ static inline void mfma1616128_scaled(      float2 (&D)[2],
-                                         const fp8e4m3_4 (&A)[8],
-                                         const fp8e4m3_4 (&B)[8],
-                                         const float2 (&C)[2],
-                                         const fp8e8m0_4 *scale_a,
-                                         const fp8e8m0_4 *scale_b) {
-    typedef __attribute__((__vector_size__(8 * sizeof(int)))) int intx8_t;
-    typedef __attribute__((__vector_size__(4 * sizeof(float)))) float floatx4_t;
-
-    *(floatx4_t*)D = {__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-        *(intx8_t*)A,
-        *(intx8_t*)B,
-        *(floatx4_t*)C,
-        cbsz,         // cbsz: 0=fp8(e4m3) A, 1=bf8(e5m2) A
-        blgp,         // blgp: 0=fp8(e4m3) B, 1=bf8(e5m2) B
-        opsel_a,      // opsel_a
-        *scale_a,     // scale_a
-        opsel_b,      // opsel_b
-        *scale_b      // scale_b
-    )};
-}
-
 /**
  * @brief Base matrix multiply-accumulate operation for row layout.
  *
@@ -318,10 +265,10 @@ __device__ static inline void mma_ABt_base(rt_base<float, ducks::rt_layout::col,
  * @param[in] b The second input rt_base<Operand_T, row_layout> matrix.
  * @param[in] c The input rt_base<float, col_layout> accumulator matrix.
  */
-template<int opsel_a, int opsel_b, int cbsz = 0, int blgp = 0, ducks::rt_shape::all D_shape, ducks::rt_shape::all A_shape, ducks::rt_shape::all B_shape, ducks::rt_shape::all C_shape, typename MM_Operand_T>
+template<int opsel_a, int opsel_b, int cbsz = 0, int blgp = 0, ducks::rt_shape::all D_shape, ducks::rt_shape::all A_shape, ducks::rt_shape::all B_shape, ducks::rt_shape::all C_shape, typename A_T, typename B_T>
 __device__ static inline void mma_ABt_base_scaled(rt_base<float, ducks::rt_layout::col, D_shape> &d,
-    const rt_base<MM_Operand_T, ducks::rt_layout::row, A_shape> &a,
-    const rt_base<MM_Operand_T, ducks::rt_layout::row, B_shape> &b,
+    const rt_base<A_T, ducks::rt_layout::row, A_shape> &a,
+    const rt_base<B_T, ducks::rt_layout::row, B_shape> &b,
     const rt_base<float, ducks::rt_layout::col, C_shape> &c,
     const fp8e8m0_4 *scale_a,
     const fp8e8m0_4 *scale_b) {
@@ -341,7 +288,36 @@ __device__ static inline void mma_ABt_base_scaled(rt_base<float, ducks::rt_layou
                 A_rows == 16 && A_cols == 128 &&
                 B_rows == 16 && B_cols == 128 &&
                 std::is_same_v<C_shape, typename ducks::rt_shape::rt_16x16>) {
-        mfma1616128_scaled<opsel_a, opsel_b, cbsz, blgp>(d.data, a.data, b.data, c.data, scale_a, scale_b);
+        if constexpr (std::is_same_v<A_T, fp8e4m3> && std::is_same_v<B_T, fp4e2m1>) {
+            // gfx1250 MXFP8 x MXFP4 block-scaled WMMA (v_wmma_scale_f32_16x16x128_f8f6f4): D = A*B + C
+            // with a per-16-row E8M0 block scale on each of A and B. matrix_*_fmt = VOP3P MATRIX_FMT
+            // (gfx1250 ISA): FP8 E4M3 = 0, FP4 E2M1 = 4; scale format/opsel immediates are 0 for the
+            // plain E8M0, no-opsel case. A is the worst-case 16-dword operand; B is 8 dwords widened to
+            // 16 with a zero upper half (matrix_b_fmt FP4 consumes only the low 8).
+            // Marshal the rt_base register arrays into aligned vector locals with memcpy: the WMMA
+            // operand vectors are 32B/64B-aligned but rt_base::data is only element-aligned, so a direct
+            // pointer cast + dereference would be a misaligned access (UB under optimization).
+            typedef __attribute__((__vector_size__(8 * sizeof(float)))) float floatx8_t;
+            wmma_scaled_a_t a_vec;  __builtin_memcpy(&a_vec, a.data, sizeof(a_vec));
+            wmma_scaled_b_t b_vec;  __builtin_memcpy(&b_vec, b.data, sizeof(b_vec));
+            wmma_scaled_a_t b_wide = {};
+            #pragma unroll
+            for (int i = 0; i < 8; i++) b_wide[i] = b_vec[i];
+            floatx8_t c_vec;  __builtin_memcpy(&c_vec, c.data, sizeof(c_vec));
+            floatx8_t d_vec = __builtin_amdgcn_wmma_scale_f32_16x16x128_f8f6f4(
+                /*matrix_a_fmt=*/0, a_vec,   // FP8 E4M3
+                /*matrix_b_fmt=*/4, b_wide,  // FP4 E2M1
+                /*c_mod=*/0,        c_vec,
+                /*scale_a_fmt=*/0, /*scale_a_opsel=*/0, *scale_a,
+                /*scale_b_fmt=*/0, /*scale_b_opsel=*/0, *scale_b,
+                /*matrix_a_reuse=*/0, /*matrix_b_reuse=*/0);
+            __builtin_memcpy(d.data, &d_vec, sizeof(d_vec));
+        } else {
+            // CDNA5 has no MFMA; a same-type (e.g. FP8 x FP8) scaled path would be a distinct WMMA
+            // variant, added when a gfx1250 consumer needs it.
+            static_assert(std::is_same_v<A_T, fp8e4m3> && std::is_same_v<B_T, fp4e2m1>,
+                "scaled MMA base currently supports only MXFP8(A) x MXFP4(B) on CDNA5 (gfx1250)");
+        }
     } else {
         static_assert(false, "Unsupported shape combination");
     }
@@ -612,14 +588,14 @@ __device__ static inline void mma_ABt_scaled(D &d,
     static_assert(A::cols == B::cols);
     static_assert(D::rows == C::rows && D::cols == C::cols);
 
+    // Only MXFP8(A=fp8e4m3) x MXFP4(B=fp4e2m1) -> float is implemented on CDNA5 (mma_ABt_base_scaled).
+    // Keep this in lockstep with the base; a broader permit here just defers the failure to a confusing
+    // static_assert inside the base. Add a combination here only when the base grows to support it.
     static_assert(
-        (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, bf16> &&
-            std::is_same_v<typename B::T, bf16> && std::is_same_v<typename C::T, float>) ||
-        (std::is_same_v<typename D::T, half> && std::is_same_v<typename A::T, half> &&
-            std::is_same_v<typename B::T, half> && std::is_same_v<typename C::T, half>) ||
-        (std::is_same_v<typename D::T, float> && std::is_same_v<typename A::T, fp8e4m3> &&
-            std::is_same_v<typename B::T, fp8e4m3> && std::is_same_v<typename C::T, float>)
-    );
+        std::is_same_v<typename D::T, float>   && std::is_same_v<typename A::T, fp8e4m3> &&
+        std::is_same_v<typename B::T, fp4e2m1> && std::is_same_v<typename C::T, float>,
+        "mma_ABt_scaled on CDNA5 (gfx1250) implements only MXFP8(A=fp8e4m3) x MXFP4(B=fp4e2m1) -> float; "
+        "other dtype combinations are not supported by mma_ABt_base_scaled.");
 
     [&]<std::size_t... Ns>(std::index_sequence<Ns...>) {
         ([&]<std::size_t N>() {
