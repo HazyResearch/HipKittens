@@ -173,8 +173,6 @@ void micro_tk(const micro_globals g, int M, int N, int K) {
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        st_subtile_b = subtile_inplace<HALF_REG_BLOCK_N, K_STEP>(Bs[1][0], {warp_col, 0});
-        load(B_tile_0, st_subtile_b);
         G::load(Bs[0][1], g.b, {0, 0, col*2 + 1, tile + 2}, swizzled_offsets_B, b_srsrc_base, b_base, b_lds_01);
         asm volatile("s_waitcnt vmcnt(6)");
         __builtin_amdgcn_s_barrier();
@@ -185,6 +183,8 @@ void micro_tk(const micro_globals g, int M, int N, int K) {
         __builtin_amdgcn_s_barrier();
 
 
+        st_subtile_b = subtile_inplace<HALF_REG_BLOCK_N, K_STEP>(Bs[1][0], {warp_col, 0});
+        load(B_tile_0, st_subtile_b);
         st_subtile_a = subtile_inplace<HALF_REG_BLOCK_M, K_STEP>(As[1][0], {warp_row, 0});
         load(A_tile, st_subtile_a);
         G::load(As[0][1], g.a, {0, 0, row*2 + 1, tile + 2}, swizzled_offsets_A, a_srsrc_base, a_base, a_lds_01);
