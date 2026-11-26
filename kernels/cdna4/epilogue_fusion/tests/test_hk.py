@@ -1,0 +1,183 @@
+"""hk API: refusals, stream and graph safety, inv_rms."""
+import pytest
+import torch
+
+import hk
+from helpers import DEV, assert_bitexact, gemm_exact, general_gamma, inputs, module, pow2_gamma, stream, weight
+from test_rope import cos_sin_table
+
+MATMUL_EPILOGUES = {"noop", "silu", "scale", "residual_add", "rmsnorm_scale", "rmsnorm", "swiglu", "rmsnorm_swiglu",
+                    "rope", "rmsnorm_rope"}
+
+
+def test_available():
+    av = hk.available()
+    assert set(av) == MATMUL_EPILOGUES
+    assert av["rmsnorm_scale"] == ["r", "out_gamma"] and av["rmsnorm"] == ["r"] and av["noop"] == []
+    assert av["rmsnorm_rope"] == ["r", "cos_sin"]
+
+
+def test_argument_names():
+    a, b = inputs(256, 256, 128, "random")
+    w = weight(b)
+    with pytest.raises(ValueError, match="unknown epilogue"):
+        hk.matmul(a, w, epilogue="gelu")
+    with pytest.raises(TypeError, match="takes arguments"):          # missing
+        hk.matmul(a, w, epilogue="scale")
+    with pytest.raises(TypeError, match="takes arguments"):          # extra
+        hk.matmul(a, w, epilogue="silu", alpha=1.0)
+    with pytest.raises(TypeError, match="takes arguments"):          # misspelled
+        hk.matmul(a, w, epilogue="scale", alhpa=1.0)
+
+
+def test_strict_inputs():
+    a, b = inputs(256, 256, 128, "random")
+    w = weight(b)
+    for bad in (a.float(), a.t().contiguous().t(), a.cpu()):
+        with pytest.raises(ValueError, match="must be"):
+            hk.matmul(bad, w)
+    for bad in (b.float(), b.t()):
+        with pytest.raises(ValueError, match="must be"):
+            hk.matmul(a, bad)
+    with pytest.raises(TypeError, match="alpha must be a torch.Tensor"):  # bool rejected
+        hk.matmul(a, w, epilogue="scale", alpha=True)
+
+
+@pytest.mark.skipif(torch.cuda.mem_get_info()[0] < 6 * 2**30, reason="needs 6 GiB free GPU memory")
+@pytest.mark.parametrize("big", ["a", "b"])
+def test_refuses_operand_of_4_gib(big):
+    """A 4 GiB operand (32-bit buffer addressing) is refused; only the parametrized operand is big."""
+    module("noop")
+    big_rows, K, small_rows = 2 ** 16, 2 ** 15, 256
+    M, N = (big_rows, small_rows) if big == "a" else (small_rows, big_rows)
+    a = torch.empty(M, K, dtype=torch.bfloat16, device=DEV)
+    w = torch.empty(N, K, dtype=torch.bfloat16, device=DEV)
+    with pytest.raises(RuntimeError, match="4 GiB"):
+        hk.matmul(a, w)
+
+
+def test_binding_still_checks_dtype():
+    a, b = inputs(256, 256, 128, "random")
+    c = torch.empty(256, 256, dtype=torch.bfloat16, device=DEV)
+    with pytest.raises(RuntimeError, match="must be torch"):
+        module("noop").dispatch(a.float(), b, c, torch.cuda.current_stream().cuda_stream)
+
+
+def test_scalar_alpha_number_or_tensor():
+    a, b = inputs(256, 256, 128, "random")
+    module("scale")
+    w = weight(b)
+    assert torch.equal(hk.matmul(a, w, epilogue="scale", alpha=0.5),
+                       hk.matmul(a, w, epilogue="scale", alpha=torch.full((1,), 0.5, device=DEV)))
+
+
+def test_output_shapes():
+    a, b = inputs(256, 512, 128, "random")
+    module("noop"), module("swiglu")
+    assert hk.matmul(a, weight(b)).shape == (256, 512)
+    assert hk.matmul(a, weight(b), epilogue="swiglu").shape == (256, 256)
+
+
+def test_side_stream():
+    """matmul runs on the current side stream."""
+    module("noop")
+    a0, b = inputs(4096, 4096, 4096, "random")
+    w = weight(b)
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        a = a0 * 1
+        out = hk.matmul(a, w)
+    s.synchronize()
+    assert_bitexact(out, gemm_exact(a0, b))
+
+
+def test_graph_capture():
+    """hk.matmul captures into a graph and replays on new inputs."""
+    module("noop")
+    a1, b = inputs(256, 256, 128, "random", seed=1)
+    a2, _ = inputs(256, 256, 128, "random", seed=2)
+    w = weight(b)
+    static_a = a1.clone()
+    hk.matmul(static_a, w)                                       # warm-up
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_out = hk.matmul(static_a, w)
+    static_a.copy_(a2)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_bitexact(static_out, gemm_exact(a2, b))
+
+
+def test_rmsnorm_ones_made_under_capture():
+    """"rmsnorm"'s ones vector made during capture must not be cached (filled only on replay)."""
+    module("rmsnorm_scale")
+    a, b = inputs(256, 768, 128, "random")                       # N unused elsewhere
+    gamma = pow2_gamma(128)
+    w = weight(b, gamma=gamma)
+    r = torch.full((256,), 0.5, device=DEV)
+    want = gemm_exact(a, (b.float() * gamma.float()[None, :]).to(torch.bfloat16)) * 0.5
+    ones = torch.ones(768, dtype=torch.bfloat16, device=DEV)
+    hk.matmul(a, weight(b), epilogue="rmsnorm_scale", r=r, out_gamma=ones)   # warm-up
+    hk._ONES.pop((768, a.device), None)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_out = hk.matmul(a, w, epilogue="rmsnorm", r=r)
+    assert_bitexact(hk.matmul(a, w, epilogue="rmsnorm", r=r), want)  # eager, before replay
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_bitexact(static_out, want)
+
+
+def test_inv_rms():
+    module("partialrms"), module("rms_reduce")
+    a, b = inputs(512, 1024, 256, "random")
+    h = a.double() @ b.double().T
+    want = torch.rsqrt(h.square().mean(1) + 1e-5)
+    got = hk.inv_rms(a, weight(b)).double()
+    assert ((got - want).abs() <= (64 + 16 + 4) * 2.0 ** -24 * want).all()
+
+
+@pytest.mark.parametrize("module_name,args", [
+    ("noop", lambda a, w, c, t: (t, w, c)),                                   # 3-D a
+    ("residual_add", lambda a, w, c, t: (a, w, c, t)),                        # 3-D residual
+])
+def test_tk_modules_refuse_3d(module_name, args):
+    """tk_* modules reject 3-D tensors."""
+    a, b = inputs(256, 256, 256, "random")
+    c = torch.empty(256, 256, dtype=torch.bfloat16, device=DEV)
+    t = a.unsqueeze(0).expand(2, 256, 256).contiguous()
+    with pytest.raises(RuntimeError, match="must be 1-D or 2-D, got 3-D"):
+        module(module_name).dispatch(*args(a, weight(b), c, t), stream())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+def test_cross_device():
+    """GPU 0 current, tensors on GPU 1: hk launches on x's GPU."""
+    module("noop"), module("residual_add"), module("partialrms"), module("rms_reduce")
+    module("residual_rms_gamma"), module("rmsnorm_rope_qkv")
+    d0, d1 = torch.device("cuda", 0), torch.device("cuda", 1)
+    with torch.cuda.device(d0):
+        a, b = inputs(512, 512, 256, "random")
+        res = torch.randn(512, 512, generator=torch.Generator().manual_seed(5)).to(torch.bfloat16).to(d0)
+        a1, res1, w0, w1 = a.to(d1), res.to(d1), weight(b), weight(b.to(d1))
+        for ep, kw0, kw1 in ((None, {}, {}), ("residual_add", {"residual": res}, {"residual": res1})):
+            got = hk.matmul(a1, w1, epilogue=ep, **kw1)
+            assert got.device == d1
+            assert torch.equal(got.cpu(), hk.matmul(a, w0, epilogue=ep, **kw0).cpu())
+        assert torch.equal(hk.inv_rms(a1, w1).cpu(), hk.inv_rms(a, w0).cpu())
+        g, g1 = general_gamma(512), general_gamma(512).to(d1)
+        for x, y in zip(hk.residual_rms(a1, w1, res1, gamma=g1), hk.residual_rms(a, w0, res, gamma=g)):
+            assert x.device == d1 and torch.equal(x.cpu(), y.cpu())
+        wq, wk = weight(b), weight(inputs(256, 256, 256, "random", seed=3)[1])
+        r, cs = torch.full((512,), 0.5, device=d0), cos_sin_table(512, 128)
+        q0 = hk.qkv(a, wq, wk, wk, r=r, cos_sin=cs)
+        q1 = hk.qkv(a1, wq.to(d1), wk.to(d1), wk.to(d1), r=r.to(d1), cos_sin=cs.to(d1))
+        for x, y in zip(q1, q0):
+            assert x.device == d1 and torch.equal(x.cpu(), y.cpu())
+        with pytest.raises(ValueError, match="same device as x"):
+            hk.matmul(a1, w1, epilogue="residual_add", residual=res)
+        with pytest.raises(ValueError, match="same device as x"):
+            hk.matmul(a1, w0)
